@@ -241,7 +241,7 @@ export function columnTypeToValueType(type: ColumnType): ValueType {
     case "Boolean":
       return { tag: 5 };
     case "Integer":
-      return { tag: 2 };
+      return { tag: 14 };
     case "BigInt":
       return { tag: 13 };
     case "Timestamp":
@@ -249,9 +249,13 @@ export function columnTypeToValueType(type: ColumnType): ValueType {
     case "Double":
       return { tag: 4 };
     case "Text":
-    case "Json":
     case "Enum":
       return { tag: 6 };
+    case "Json":
+      return {
+        tag: 15,
+        jsonSchema: type.schema == null ? undefined : canonicalJson(type.schema),
+      };
     case "Bytea":
       return { tag: 7 };
     case "Uuid":
@@ -261,6 +265,22 @@ export function columnTypeToValueType(type: ColumnType): ValueType {
     case "Row":
       throw new Error("Core runtime does not encode nested row columns yet");
   }
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    const encoded = JSON.stringify(value);
+    if (encoded === undefined) throw new Error("JSON Schema contains a non-JSON value");
+    return encoded;
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
+    .join(",")}}`;
 }
 
 function writePolicy(

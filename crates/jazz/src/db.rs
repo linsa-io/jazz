@@ -20,7 +20,6 @@ use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures_channel::oneshot;
 use futures_core::Stream;
 use groove::records::Value;
-use groove::schema::ColumnType as GrooveColumnType;
 use groove::storage::{OrderedKvStorage, ReopenableStorage};
 use thiserror::Error;
 use web_time::Instant;
@@ -63,7 +62,7 @@ use crate::query::{
     RelationCmpOp, RelationColumnRef, RelationExpr, RelationJoinKind, RelationPredicate,
     RelationProjectExpr, RelationRowIdRef, RelationValueRef,
 };
-use crate::schema::{JazzSchema, TableSchema};
+use crate::schema::{ColumnType, JazzSchema, TableSchema};
 use crate::time::GlobalSeq;
 use crate::tx::{DeletionEvent, DurabilityTier, Fate, RejectionReason, TxId};
 use crate::wire::{
@@ -202,12 +201,10 @@ type SharedTickScheduler = Rc<RefCell<Option<Rc<dyn TickScheduler>>>>;
 type WriteStateWaiters = Rc<RefCell<BTreeMap<TxId, Vec<WriteStateWaiter>>>>;
 type ShapeRegistrationKey = (ShapeId, ReadViewKey);
 
-fn default_cell_for_column_type(column_type: &GrooveColumnType, default: &Value) -> Value {
+fn default_cell_for_column_type(column_type: &ColumnType, default: &Value) -> Value {
     match (column_type, default) {
-        (GrooveColumnType::Nullable(_), Value::Nullable(_)) => default.clone(),
-        (GrooveColumnType::Nullable(_), default) => {
-            Value::Nullable(Some(Box::new(default.clone())))
-        }
+        (ColumnType::Nullable(_), Value::Nullable(_)) => default.clone(),
+        (ColumnType::Nullable(_), default) => Value::Nullable(Some(Box::new(default.clone()))),
         _ => default.clone(),
     }
 }
@@ -6272,7 +6269,8 @@ impl From<crate::node::Error> for Error {
             crate::node::Error::Query(_) => ErrorCode::Query,
             crate::node::Error::TableNotFound(_)
             | crate::node::Error::UnsupportedColumnType(_)
-            | crate::node::Error::InvalidMergeableCommit(_) => ErrorCode::Schema,
+            | crate::node::Error::InvalidMergeableCommit(_)
+            | crate::node::Error::InvalidJsonCell(_) => ErrorCode::Schema,
             _ => ErrorCode::Protocol,
         };
         Self::new(code, error.to_string())

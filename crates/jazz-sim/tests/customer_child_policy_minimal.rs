@@ -220,6 +220,7 @@ fn apply_event(rows: &mut BTreeSet<RowUuid>, event: SubscriptionEvent) {
                 rows.insert(row.row_uuid());
             }
         }
+        SubscriptionEvent::Rejected { .. } => {}
         SubscriptionEvent::Closed => {}
     }
 }
