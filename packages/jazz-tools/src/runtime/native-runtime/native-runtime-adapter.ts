@@ -35,12 +35,14 @@ import {
   type QueryPredicateOp,
   type ValueType,
 } from "./native-codec.js";
-import { columnTypeToValueType, columnValueType, encodeSchema } from "./schema-codec.js";
+import { encodeSchema } from "./schema-codec.js";
 import { WebSocketCarrier, wireAuthFailureReason } from "./websocket.js";
 import {
   createNativeRowValueEncoder,
   createRecord,
   createRecordValueDecoder,
+  recordColumnTypeToValueType,
+  recordColumnValueType,
 } from "./native-row-codec.js";
 import { HIDDEN_INCLUDE_COLUMN_PREFIX, hiddenIncludeColumnName } from "../select-projection.js";
 import {
@@ -3355,7 +3357,7 @@ function encodeCells(
 ): Uint8Array {
   const descriptor = [...columns]
     .sort((left, right) => left.name.localeCompare(right.name))
-    .map((column) => ({ name: column.name, valueType: columnValueType(column), column }));
+    .map((column) => ({ name: column.name, valueType: recordColumnValueType(column), column }));
   const values = descriptor.map(({ column }) =>
     encodeValue(column, valueFor(column), requireMissingDefaults),
   );
@@ -3392,7 +3394,7 @@ function encodeValue(
 ): Uint8Array {
   const resolved = value;
   if (!resolved || resolved.type === "Null") {
-    if (column.nullable) return encodeNullValue(columnValueType(column));
+    if (column.nullable) return encodeNullValue(recordColumnValueType(column));
     if (column.column_type.type === "Array") {
       return encodeNonNullValue(column.column_type, { type: "Array", value: [] });
     }
@@ -3411,7 +3413,7 @@ function encodeNonNullValue(type: ColumnType, value: Value): Uint8Array {
     case "Boolean":
       return Uint8Array.of(value.type === "Boolean" && value.value ? 1 : 0);
     case "Integer":
-      view.setUint32(0, encodeSignedI32ForCore(expectI32(value, "Integer")), true);
+      view.setInt32(0, expectI32(value, "Integer"), true);
       return new Uint8Array(view.buffer, 0, 4);
     case "Timestamp":
       view.setBigUint64(0, BigInt(expectNumber(value, type.type)), true);
@@ -3442,7 +3444,7 @@ function encodeNonNullValue(type: ColumnType, value: Value): Uint8Array {
 function encodeArrayValue(elementType: ColumnType, value: Value): Uint8Array {
   if (value.type !== "Array") throw new Error("expected Array value");
   const encoded = value.value.map((item) => encodeNonNullValue(elementType, item));
-  const elementWidth = fixedValueSize(columnTypeToValueType(elementType));
+  const elementWidth = fixedValueSize(recordColumnTypeToValueType(elementType));
   if (elementWidth != null) return concatBytes(encoded);
 
   const offsets = new PostcardWriter();
@@ -3474,6 +3476,7 @@ function fixedValueSize(valueType: ValueType): number | undefined {
     case 1:
       return 2;
     case 2:
+    case 14:
       return 4;
     case 3:
     case 13:
@@ -3514,14 +3517,6 @@ function expectI32(value: Value, type: string): number {
     throw new Error(`${type} value must be a signed 32-bit integer`);
   }
   return number;
-}
-
-function encodeSignedI32ForCore(value: number): number {
-  return (value ^ 0x80000000) >>> 0;
-}
-
-function decodeSignedI32FromCore(value: number): number {
-  return (value ^ 0x80000000) | 0;
 }
 
 function expectString(value: Value, type: string): string {
@@ -4017,7 +4012,7 @@ function decodeBytes(type: ColumnType, bytes: Uint8Array, fieldName?: string): V
     case "Boolean":
       return { type: "Boolean", value: bytes[0] !== 0 };
     case "Integer":
-      return { type: "Integer", value: decodeSignedI32FromCore(view.getUint32(0, true)) };
+      return { type: "Integer", value: view.getInt32(0, true) };
     case "BigInt":
       return { type: "BigInt", value: view.getBigInt64(0, true) };
     case "Double":
@@ -4045,7 +4040,7 @@ function decodeBytes(type: ColumnType, bytes: Uint8Array, fieldName?: string): V
 }
 
 function decodeArrayBytes(elementType: ColumnType, bytes: Uint8Array): Value[] {
-  const elementWidth = fixedValueSize(columnTypeToValueType(elementType));
+  const elementWidth = fixedValueSize(recordColumnTypeToValueType(elementType));
   if (elementWidth != null) {
     if (elementWidth === 0) return [];
     if (bytes.length % elementWidth !== 0) {
@@ -4318,7 +4313,7 @@ function createRawNativeFrameRowEncoder(
   }
   const outputDescriptor = columns.map((column) => ({
     name: column.name,
-    valueType: columnValueType(column),
+    valueType: recordColumnValueType(column),
   }));
   const decodeRecord = createRecordValueDecoder(sourceDescriptor);
   const sourceIndexesByPublicName = new Map<string, number>();
@@ -4331,7 +4326,7 @@ function createRawNativeFrameRowEncoder(
   return (raw) => {
     const values = columns.map((column) => {
       const sourceIndex = sourceIndexesByPublicName.get(column.name);
-      const outputValueType = columnValueType(column);
+      const outputValueType = recordColumnValueType(column);
       if (sourceIndex === undefined) return encodeNullValue(outputValueType);
       const decoded = decodeRecord(raw, sourceIndex);
       if (decoded == null) return encodeNullValue(outputValueType);
@@ -4358,7 +4353,7 @@ function nativeDescriptorMatchesColumns(
     const field = descriptor[index];
     return (
       field?.name === column.name &&
-      valueTypeCacheKey(field.valueType) === valueTypeCacheKey(columnValueType(column))
+      valueTypeCacheKey(field.valueType) === valueTypeCacheKey(recordColumnValueType(column))
     );
   });
 }

@@ -157,8 +157,8 @@ function writeDefaultValue(writer: PostcardWriter, columnType: ColumnType, value
       writer.bool(value.value);
       return;
     case "Integer":
-      writer.u64(2); // groove::records::Value::U32
-      writer.u64(encodeSignedI32ForCore(expectI32(value, "Integer")));
+      writer.u64(14); // groove::records::Value::I32
+      writer.i32(expectI32(value, "Integer"));
       return;
     case "BigInt":
       if (value.type !== "BigInt" && value.type !== "Integer") {
@@ -439,8 +439,8 @@ function writePolicyLiteral(writer: PostcardWriter, value: Value): void {
       writer.bool(value.value);
       return;
     case "Integer":
-      writer.u64(2); // groove::records::Value::U32
-      writer.u64(value.value);
+      writer.u64(14); // groove::records::Value::I32
+      writer.i32(expectI32(value, "Integer"));
       return;
     case "BigInt":
       writer.u64(13); // groove::records::Value::I64
@@ -1477,10 +1477,6 @@ function expectI32(value: Value, type: string): number {
     throw new Error(`${type} default must be a signed 32-bit integer`);
   }
   return number;
-}
-
-function encodeSignedI32ForCore(value: number): number {
-  return (value ^ 0x80000000) >>> 0;
 }
 
 function f64Bytes(value: number): Uint8Array {

@@ -453,8 +453,8 @@ function writeGrooveValue(writer: PostcardWriter, value: QueryLiteral): void {
     ) {
       throw new Error("Integer value must be a signed 32-bit integer");
     }
-    writer.u64(2); // groove::records::Value::U32
-    writer.u64((value.value ^ 0x80000000) >>> 0);
+    writer.u64(14); // groove::records::Value::I32
+    writer.i32(value.value);
     return;
   }
   if (value.type === "BigInt") {
@@ -539,6 +539,11 @@ export class PostcardWriter {
     const bigintValue = BigInt(value);
     const encoded = bigintValue < 0n ? (-bigintValue << 1n) - 1n : bigintValue << 1n;
     this.u64Big(encoded);
+  }
+
+  i32(value: number): void {
+    const encoded = value < 0 ? -value * 2 - 1 : value * 2;
+    this.u64(encoded);
   }
 
   private u64Big(value: bigint): void {
@@ -637,6 +642,11 @@ export class PostcardReader {
       }
       shift += 7n;
     }
+  }
+
+  i32(): number {
+    const encoded = this.u64();
+    return encoded % 2 === 0 ? encoded / 2 : -((encoded + 1) / 2);
   }
 
   string(): string {

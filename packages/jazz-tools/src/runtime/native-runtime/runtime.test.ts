@@ -1576,7 +1576,7 @@ describe("NativeRuntimeAdapter server transport", () => {
     });
   });
 
-  it("encodes negative integer query literals as signed i32 bits for core", () => {
+  it("encodes negative integer query literals as I32 values", () => {
     let preparedBytes: Uint8Array | undefined;
     const runtime = new NativeRuntimeAdapter(
       {
@@ -1628,8 +1628,8 @@ describe("NativeRuntimeAdapter server transport", () => {
     expect(readPreparedFirstLiteral(preparedBytes!)).toEqual({
       column: "priority",
       opTag: 8,
-      literalTag: 2,
-      value: 0x7fffffff,
+      literalTag: 14,
+      value: -1,
     });
   });
 
@@ -2996,8 +2996,8 @@ describe("NativeRuntimeAdapter server transport", () => {
       {
         column: "count",
         literals: [
-          { tag: 2, value: encodeSignedI32ForTest(5) },
-          { tag: 2, value: encodeSignedI32ForTest(10) },
+          { tag: 14, value: 5 },
+          { tag: 14, value: 10 },
         ],
       },
       {
@@ -4701,13 +4701,11 @@ function readPreparedNumericLiteral(reader: PostcardReader): {
       return { tag, value: reader.f64Le() };
     case 13:
       return { tag, value: reader.i64() };
+    case 14:
+      return { tag, value: reader.i32() };
     default:
       throw new Error(`expected numeric prepared literal tag, got ${tag}`);
   }
-}
-
-function encodeSignedI32ForTest(value: number): number {
-  return (value ^ 0x80000000) >>> 0;
 }
 
 function readPreparedLimit(query: Uint8Array): number | undefined {
@@ -4754,6 +4752,9 @@ function skipPreparedLiteral(reader: PostcardReader): void {
       return;
     case 13:
       reader.i64();
+      return;
+    case 14:
+      reader.i32();
       return;
     case 5:
       reader.bool();
@@ -4866,7 +4867,8 @@ function readPreparedFirstLiteral(query: Uint8Array): {
   const column = reader.string();
   expect(reader.u64()).toBe(3);
   const literalTag = reader.u64();
-  const value = literalTag === 13 ? Number(reader.i64()) : reader.u64();
+  const value =
+    literalTag === 13 ? Number(reader.i64()) : literalTag === 14 ? reader.i32() : reader.u64();
   return { column, opTag, literalTag, value };
 }
 
@@ -5286,6 +5288,9 @@ function readPolicyOperandForTest(reader: PostcardReader): TestPolicyOperand {
     if (literalTag === 13) {
       return { tag, literalTag, value: reader.i64() };
     }
+    if (literalTag === 14) {
+      return { tag, literalTag, value: reader.i32() };
+    }
     if (literalTag === 4) {
       return { tag, literalTag, value: reader.bytes() };
     }
@@ -5345,6 +5350,9 @@ function skipGrooveValue(reader: PostcardReader): void {
       return;
     case 13:
       reader.i64();
+      return;
+    case 14:
+      reader.i32();
       return;
     default:
       throw new Error(`unsupported groove value tag ${tag}`);

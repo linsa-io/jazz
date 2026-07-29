@@ -407,7 +407,7 @@ function unwrapNullable(value: Uint8Array): Uint8Array | null {
 function descriptorFromColumns(columns: readonly ColumnDescriptor[]): DescriptorField[] {
   return columns.map((column) => ({
     name: column.name,
-    valueType: columnValueType(column),
+    valueType: recordColumnValueType(column),
   }));
 }
 
@@ -416,12 +416,12 @@ function encodeValueForColumn(column: ColumnDescriptor, value: Value | undefined
     if (!column.nullable) {
       throw new Error(`missing non-nullable value for ${column.name}`);
     }
-    return encodeNullValue(columnValueType(column));
+    return encodeNullValue(recordColumnValueType(column));
   }
   const encoded = encodeNonNullValue(column.column_type, value);
   if (!column.nullable) return encoded;
-  const valueType = columnValueType(column);
-  const inner = valueType.inner ?? columnTypeToValueType(column.column_type);
+  const valueType = recordColumnValueType(column);
+  const inner = valueType.inner ?? recordColumnTypeToValueType(column.column_type);
   if (fixedSize(inner) == null) {
     return concatBytes([Uint8Array.of(1), encoded]);
   }
@@ -442,11 +442,16 @@ function encodeNonNullValue(type: ColumnType, value: Value): Uint8Array {
       if (value.type !== "Boolean") throw new Error("expected Boolean value");
       return Uint8Array.of(value.value ? 1 : 0);
     case "Integer": {
-      if (value.type !== "Integer" || !Number.isSafeInteger(value.value)) {
+      if (
+        value.type !== "Integer" ||
+        !Number.isSafeInteger(value.value) ||
+        value.value < -0x80000000 ||
+        value.value > 0x7fffffff
+      ) {
         throw new Error("expected Integer value");
       }
       const bytes = new Uint8Array(4);
-      new DataView(bytes.buffer).setUint32(0, (value.value ^ 0x80000000) >>> 0, true);
+      new DataView(bytes.buffer).setInt32(0, value.value, true);
       return bytes;
     }
     case "Timestamp": {
@@ -514,7 +519,7 @@ function encodeRowValue(
 
 function encodeArrayValue(elementType: ColumnType, values: readonly Value[]): Uint8Array {
   const encoded = values.map((value) => encodeNonNullValue(elementType, value));
-  const elementWidth = fixedSize(columnTypeToValueType(elementType));
+  const elementWidth = fixedSize(recordColumnTypeToValueType(elementType));
   if (elementWidth != null) return concatBytes(encoded);
 
   const offsets = new Uint8Array(Math.max(0, values.length - 1) * 4);
@@ -541,12 +546,12 @@ function parseUuid(value: string): Uint8Array {
   return Uint8Array.from(hex.match(/../g)!.map((byte) => Number.parseInt(byte, 16)));
 }
 
-function columnValueType(column: ColumnDescriptor): ValueType {
-  const valueType = columnTypeToValueType(column.column_type);
+export function recordColumnValueType(column: ColumnDescriptor): ValueType {
+  const valueType = recordColumnTypeToValueType(column.column_type);
   return column.nullable ? { tag: 12, inner: valueType } : valueType;
 }
 
-function columnTypeToValueType(type: ColumnType): ValueType {
+export function recordColumnTypeToValueType(type: ColumnType): ValueType {
   switch (type.type) {
     case "Boolean":
       return { tag: 5 };
@@ -567,7 +572,7 @@ function columnTypeToValueType(type: ColumnType): ValueType {
     case "Uuid":
       return { tag: 8 };
     case "Array":
-      return { tag: 11, inner: columnTypeToValueType(type.element) };
+      return { tag: 11, inner: recordColumnTypeToValueType(type.element) };
     case "Row":
       return { tag: 7 };
   }
@@ -579,7 +584,7 @@ function decodeBytes(type: ColumnType, bytes: Uint8Array): Value {
     case "Boolean":
       return { type: "Boolean", value: bytes[0] !== 0 };
     case "Integer":
-      return { type: "Integer", value: decodeSignedI32FromCore(view.getUint32(0, true)) };
+      return { type: "Integer", value: view.getInt32(0, true) };
     case "BigInt":
       return { type: "BigInt", value: view.getBigInt64(0, true) };
     case "Double":
@@ -659,7 +664,7 @@ function decodeArrayElements<T>(
   bytes: Uint8Array,
   decodeElement: (bytes: Uint8Array) => T,
 ): T[] {
-  const elementWidth = fixedSize(columnTypeToValueType(elementType));
+  const elementWidth = fixedSize(recordColumnTypeToValueType(elementType));
   if (elementWidth != null) {
     if (elementWidth === 0) return [];
     if (bytes.length % elementWidth !== 0) {
@@ -699,10 +704,6 @@ function timestampToDate(value: number, columnName?: string): Date {
     return new Date(Math.trunc(value / 1_000));
   }
   return new Date(value);
-}
-
-function decodeSignedI32FromCore(value: number): number {
-  return (value ^ 0x80000000) | 0;
 }
 
 function formatUuid(bytes: Uint8Array): string {
