@@ -4375,6 +4375,9 @@ fn coerce_literal_for_source_field(
 }
 
 fn coerce_literal_for_value_type(value: LiteralValue, value_type: &ValueType) -> LiteralValue {
+    if let Some(value) = coerce_integer_literal_for_value_type(&value, value_type) {
+        return value;
+    }
     match (value, value_type) {
         (LiteralValue::String(value), ValueType::Uuid) => uuid::Uuid::parse_str(&value)
             .map(LiteralValue::Uuid)
@@ -4406,6 +4409,99 @@ fn coerce_literal_for_value_type(value: LiteralValue, value_type: &ValueType) ->
             )
         }
         (value, _) => value,
+    }
+}
+
+fn coerce_integer_literal_for_value_type(
+    value: &LiteralValue,
+    value_type: &ValueType,
+) -> Option<LiteralValue> {
+    let value = match value {
+        LiteralValue::U8(value) => i128::from(*value),
+        LiteralValue::U16(value) => i128::from(*value),
+        LiteralValue::U32(value) => i128::from(*value),
+        LiteralValue::U64(value) => i128::from(*value),
+        LiteralValue::I32(value) => i128::from(*value),
+        LiteralValue::I64(value) => i128::from(*value),
+        _ => return None,
+    };
+    match value_type {
+        ValueType::U8 => u8::try_from(value).ok().map(LiteralValue::U8),
+        ValueType::U16 => u16::try_from(value).ok().map(LiteralValue::U16),
+        ValueType::U32 => u32::try_from(value).ok().map(LiteralValue::U32),
+        ValueType::U64 => u64::try_from(value).ok().map(LiteralValue::U64),
+        ValueType::I32 => i32::try_from(value).ok().map(LiteralValue::I32),
+        ValueType::I64 => i64::try_from(value).ok().map(LiteralValue::I64),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod integer_literal_coercion_tests {
+    use super::*;
+
+    #[test]
+    fn representable_values_are_coerced_across_core_integer_widths() {
+        // Internal coverage is necessary because this route-literal lowering
+        // boundary is not directly observable through the public query API.
+        let cases = [
+            (LiteralValue::I64(7), ValueType::U8, LiteralValue::U8(7)),
+            (
+                LiteralValue::U32(u8::MAX as u32),
+                ValueType::U8,
+                LiteralValue::U8(u8::MAX),
+            ),
+            (
+                LiteralValue::U32(u16::MAX as u32),
+                ValueType::U16,
+                LiteralValue::U16(u16::MAX),
+            ),
+            (
+                LiteralValue::U64(u32::MAX as u64),
+                ValueType::U32,
+                LiteralValue::U32(u32::MAX),
+            ),
+            (LiteralValue::I32(7), ValueType::U64, LiteralValue::U64(7)),
+            (
+                LiteralValue::I64(i32::MIN as i64),
+                ValueType::I32,
+                LiteralValue::I32(i32::MIN),
+            ),
+            (
+                LiteralValue::I64(i32::MAX as i64),
+                ValueType::I32,
+                LiteralValue::I32(i32::MAX),
+            ),
+            (LiteralValue::U32(7), ValueType::I64, LiteralValue::I64(7)),
+            (
+                LiteralValue::U64(i64::MAX as u64),
+                ValueType::I64,
+                LiteralValue::I64(i64::MAX),
+            ),
+        ];
+        for (value, value_type, expected) in cases {
+            assert_eq!(coerce_literal_for_value_type(value, &value_type), expected);
+        }
+    }
+
+    #[test]
+    fn out_of_range_values_are_preserved_to_fail_closed() {
+        let cases = [
+            (LiteralValue::I64(-1), ValueType::U8),
+            (LiteralValue::U16(u8::MAX as u16 + 1), ValueType::U8),
+            (LiteralValue::U32(u16::MAX as u32 + 1), ValueType::U16),
+            (LiteralValue::U64(u32::MAX as u64 + 1), ValueType::U32),
+            (LiteralValue::I64(-1), ValueType::U64),
+            (LiteralValue::I64(i32::MIN as i64 - 1), ValueType::I32),
+            (LiteralValue::I64(i32::MAX as i64 + 1), ValueType::I32),
+            (LiteralValue::U64(i64::MAX as u64 + 1), ValueType::I64),
+        ];
+        for (value, value_type) in cases {
+            assert_eq!(
+                coerce_literal_for_value_type(value.clone(), &value_type),
+                value
+            );
+        }
     }
 }
 

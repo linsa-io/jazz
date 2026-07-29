@@ -9693,6 +9693,9 @@ fn prepared_claim_value(path: &ClaimPath, policy: &PolicyContext) -> Result<Valu
 }
 
 fn coerce_prepared_binding_value(value: Value, column_type: &groove::schema::ColumnType) -> Value {
+    if let Some(value) = coerce_prepared_integer_value(&value, column_type) {
+        return value;
+    }
     match (value, column_type) {
         (Value::Uuid(value), groove::schema::ColumnType::String) => {
             Value::String(value.to_string())
@@ -9726,6 +9729,30 @@ fn coerce_prepared_binding_value(value: Value, column_type: &groove::schema::Col
             Value::Nullable(Some(Box::new(coerce_prepared_binding_value(value, inner))))
         }
         (value, _) => value,
+    }
+}
+
+fn coerce_prepared_integer_value(
+    value: &Value,
+    column_type: &groove::schema::ColumnType,
+) -> Option<Value> {
+    let value = match value {
+        Value::U8(value) => i128::from(*value),
+        Value::U16(value) => i128::from(*value),
+        Value::U32(value) => i128::from(*value),
+        Value::U64(value) => i128::from(*value),
+        Value::I32(value) => i128::from(*value),
+        Value::I64(value) => i128::from(*value),
+        _ => return None,
+    };
+    match column_type {
+        groove::schema::ColumnType::U8 => u8::try_from(value).ok().map(Value::U8),
+        groove::schema::ColumnType::U16 => u16::try_from(value).ok().map(Value::U16),
+        groove::schema::ColumnType::U32 => u32::try_from(value).ok().map(Value::U32),
+        groove::schema::ColumnType::U64 => u64::try_from(value).ok().map(Value::U64),
+        groove::schema::ColumnType::I32 => i32::try_from(value).ok().map(Value::I32),
+        groove::schema::ColumnType::I64 => i64::try_from(value).ok().map(Value::I64),
+        _ => None,
     }
 }
 
@@ -10675,6 +10702,73 @@ mod tests {
     use crate::schema::{JazzSchema, TableSchema};
 
     use super::*;
+
+    #[test]
+    fn prepared_binding_integer_coercion_is_checked_across_core_widths() {
+        // Internal coverage is warranted because JSON claims expose only a
+        // subset of these core widths, while prepared bindings must safely
+        // normalize every integer Value accepted by the query engine.
+        let cases = [
+            (Value::I64(7), ColumnType::U8, Value::U8(7)),
+            (
+                Value::U32(u8::MAX as u32),
+                ColumnType::U8,
+                Value::U8(u8::MAX),
+            ),
+            (
+                Value::U32(u16::MAX as u32),
+                ColumnType::U16,
+                Value::U16(u16::MAX),
+            ),
+            (
+                Value::U64(u32::MAX as u64),
+                ColumnType::U32,
+                Value::U32(u32::MAX),
+            ),
+            (Value::I32(7), ColumnType::U64, Value::U64(7)),
+            (
+                Value::I64(i32::MIN as i64),
+                ColumnType::I32,
+                Value::I32(i32::MIN),
+            ),
+            (
+                Value::I64(i32::MAX as i64),
+                ColumnType::I32,
+                Value::I32(i32::MAX),
+            ),
+            (Value::U32(7), ColumnType::I64, Value::I64(7)),
+            (
+                Value::U64(i64::MAX as u64),
+                ColumnType::I64,
+                Value::I64(i64::MAX),
+            ),
+        ];
+        for (value, column_type, expected) in cases {
+            assert_eq!(coerce_prepared_binding_value(value, &column_type), expected);
+        }
+    }
+
+    #[test]
+    fn prepared_binding_integer_coercion_preserves_out_of_range_values() {
+        // Keeping the original typed value makes an unrepresentable claim fail
+        // to match instead of truncating or wrapping into an authorized value.
+        let cases = [
+            (Value::I64(-1), ColumnType::U8),
+            (Value::U16(u8::MAX as u16 + 1), ColumnType::U8),
+            (Value::U32(u16::MAX as u32 + 1), ColumnType::U16),
+            (Value::U64(u32::MAX as u64 + 1), ColumnType::U32),
+            (Value::I64(-1), ColumnType::U64),
+            (Value::I64(i32::MIN as i64 - 1), ColumnType::I32),
+            (Value::I64(i32::MAX as i64 + 1), ColumnType::I32),
+            (Value::U64(i64::MAX as u64 + 1), ColumnType::I64),
+        ];
+        for (value, column_type) in cases {
+            assert_eq!(
+                coerce_prepared_binding_value(value.clone(), &column_type),
+                value
+            );
+        }
+    }
 
     #[test]
     fn binding_source_shape_is_descriptor_and_claim_path_identity() {
