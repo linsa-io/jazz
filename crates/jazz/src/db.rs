@@ -1357,7 +1357,7 @@ where
                     .permission_subject(identity)
                     .cells(cells.clone()),
             )
-            .map_err(Error::from)?;
+            .map_err(local_write_error)?;
         if !allowed {
             return Err(Error::new(
                 ErrorCode::WriteRejected,
@@ -1396,7 +1396,7 @@ where
                     .permission_subject(identity)
                     .cells(cells.clone()),
             )
-            .map_err(Error::from)?;
+            .map_err(local_write_error)?;
         if !allowed {
             return Err(Error::new(
                 ErrorCode::WriteRejected,
@@ -1548,7 +1548,7 @@ where
             .node
             .borrow_mut()
             .dry_run_mergeable_write_allows(dry_run)
-            .map_err(Error::from)?;
+            .map_err(local_write_error)?;
         if !allowed {
             return Err(Error::new(
                 ErrorCode::WriteRejected,
@@ -1580,7 +1580,7 @@ where
             .node
             .borrow_mut()
             .dry_run_mergeable_write_allows(dry_run)
-            .map_err(Error::from)?;
+            .map_err(local_write_error)?;
         if !allowed {
             return Err(Error::new(
                 ErrorCode::WriteRejected,
@@ -2123,7 +2123,7 @@ where
             .node
             .borrow_mut()
             .tx_write(tx_id, table, row, cells, None)
-            .map_err(Into::into)
+            .map_err(local_write_error)
     }
 
     /// Stage an update inside an owned exclusive transaction handle.
@@ -2173,24 +2173,27 @@ where
         // `tx_write` rejects a version carrying both. The layers have separate
         // winners and parent chains; see `restore`'s `local_*_winner_tx_id` pair.
         // Keep this staged form aligned with the committed restore path.
-        node.tx_write(tx_id, table, row, cells, None)?;
+        node.tx_write(tx_id, table, row, cells, None)
+            .map_err(local_write_error)?;
         node.tx_write(
             tx_id,
             table,
             row,
             BTreeMap::<String, Value>::new(),
             Some(DeletionEvent::Restored),
-        )?;
+        )
+        .map_err(local_write_error)?;
         Ok(())
     }
 
     /// Commit an owned exclusive transaction handle.
     pub fn commit_exclusive_handle(&self, open_tx_id: OpenTxId) -> Result<TxId, Error> {
-        let (tx_id, unit) = self.node.node.borrow_mut().commit_exclusive(
-            open_tx_id,
-            self.identity.author,
-            self.next_now_ms(),
-        )?;
+        let (tx_id, unit) = self
+            .node
+            .node
+            .borrow_mut()
+            .commit_exclusive(open_tx_id, self.identity.author, self.next_now_ms())
+            .map_err(local_write_error)?;
         self.finalize_local_exclusive_unit(tx_id, unit)?;
         self.refresh_subscriptions()?;
         Ok(tx_id)
@@ -2462,14 +2465,19 @@ where
             .node
             .borrow_mut()
             .dry_run_mergeable_write_allows(commit.clone())
-            .map_err(Error::from)?;
+            .map_err(local_write_error)?;
         if !allowed {
             return Err(Error::new(
                 ErrorCode::WriteRejected,
                 format!("policy denied {operation} on table {table}"),
             ));
         }
-        let tx_id = self.node.node.borrow_mut().commit_mergeable(commit)?;
+        let tx_id = self
+            .node
+            .node
+            .borrow_mut()
+            .commit_mergeable(commit)
+            .map_err(local_write_error)?;
         let local_tier = self.finalize_local_commit(tx_id)?;
         self.refresh_subscriptions()?;
         Ok(WriteHandle {
@@ -6231,6 +6239,15 @@ impl Error {
     }
 }
 
+fn local_write_error(error: crate::node::Error) -> Error {
+    match error {
+        crate::node::Error::InvalidJsonCell(message) => {
+            Error::new(ErrorCode::WriteRejected, message)
+        }
+        error => Error::from(error),
+    }
+}
+
 fn row_already_deleted(row: RowUuid) -> Error {
     Error::new(
         ErrorCode::WriteRejected,
@@ -6754,7 +6771,8 @@ where
             .node
             .node
             .borrow_mut()
-            .commit_mergeable_many(writes)?;
+            .commit_mergeable_many(writes)
+            .map_err(local_write_error)?;
         self.db.finalize_local_commit(tx_id)?;
         self.db.refresh_subscriptions()?;
         Ok(tx_id)
@@ -6862,7 +6880,7 @@ where
             .node
             .borrow_mut()
             .tx_write(self.tx_id, table, row, cells, None)
-            .map_err(Into::into)
+            .map_err(local_write_error)
     }
 
     /// Stage an update; omitted fields keep the transaction-local value.
@@ -6890,11 +6908,13 @@ where
 
     /// Commit the exclusive transaction.
     pub fn commit(self) -> Result<TxId, Error> {
-        let (tx_id, unit) = self.db.node.node.borrow_mut().commit_exclusive(
-            self.tx_id,
-            self.db.identity.author,
-            self.db.next_now_ms(),
-        )?;
+        let (tx_id, unit) = self
+            .db
+            .node
+            .node
+            .borrow_mut()
+            .commit_exclusive(self.tx_id, self.db.identity.author, self.db.next_now_ms())
+            .map_err(local_write_error)?;
         self.db.finalize_local_exclusive_unit(tx_id, unit)?;
         self.db.refresh_subscriptions()?;
         Ok(tx_id)
