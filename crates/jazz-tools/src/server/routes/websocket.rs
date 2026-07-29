@@ -16,6 +16,7 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
+use futures::SinkExt as _;
 use jazz::db::CommitUnitTrust;
 use jazz::groove::records::Value as CoreValue;
 use jazz::ids::AuthorId;
@@ -762,7 +763,7 @@ async fn send_ws_encoded_frames(
             "server websocket send batch bytes={}",
             batch.len()
         ));
-        socket.send(Message::Binary(batch)).await?;
+        socket.send(Message::Binary(batch.into())).await?;
     }
     Ok(())
 }
@@ -829,8 +830,8 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
+    use futures::StreamExt as _;
     use futures::stream::FuturesUnordered;
-    use futures::{SinkExt as _, StreamExt as _};
     use jazz::db::{
         Db, DbConfig, DbIdentity, PreparedQuery, QueryAttachment, ReadOpts, RowCells,
         SeededRowIdSource, WireTransportAdapter,
