@@ -14,3 +14,16 @@ members = [
 ]
 [patch.crates-io]
 rust-rocksdb = { git = "https://github.com/zaidoon1/rust-rocksdb.git", tag = "v0.48.0" }
+
+# LINSA FORK: keep release builds debuggable.
+#
+# The published linux binaries came back stripped ("no symbols"), so a stack taken inside
+# the sync container was a list of addresses — we had to run the darwin build on the host
+# just to get function names out of a profile. Nothing in this repo asked for stripping, so
+# it comes from the musl/zigbuild link step; say what we want explicitly instead.
+#
+# `line-tables-only` rather than full debug info: it is what a profiler and a backtrace
+# actually use, at a fraction of the size.
+[profile.release]
+strip = "none"
+debug = "line-tables-only"
