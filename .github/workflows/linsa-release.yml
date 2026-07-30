@@ -73,6 +73,19 @@ jobs:
               if (pkg.scripts) {
                 for (const k of ["prepare", "prepack", "prepublishOnly", "postinstall"]) delete pkg.scripts[k];
               }
+              // `npm pack` leaves `workspace:*` ranges as-is — only `pnpm publish` rewrites
+              // them — so a tarball packed this way is uninstallable outside the jazz
+              // monorepo ("no package named jazz-wasm is present in the workspace").
+              // Pin them to this build's version instead.
+              for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+                const deps = pkg[field];
+                if (!deps) continue;
+                for (const [name, range] of Object.entries(deps)) {
+                  if (typeof range === "string" && range.startsWith("workspace:")) {
+                    deps[name] = pkg.version;
+                  }
+                }
+              }
               fs.writeFileSync(f, JSON.stringify(pkg, null, 2) + "\n");
             ' "$dir"
             #
