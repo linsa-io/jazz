@@ -654,17 +654,6 @@ fn convert_policy(
     path: &str,
     expr: &PolicyExpr,
 ) -> Result<Query, SchemaConversionError> {
-    convert_policy_with_mode(schema, table_schema, table, path, expr, false)
-}
-
-fn convert_policy_with_mode(
-    schema: &Schema,
-    table_schema: &TableSchema,
-    table: &TableName,
-    path: &str,
-    expr: &PolicyExpr,
-    expand_inherits: bool,
-) -> Result<Query, SchemaConversionError> {
     match expr {
         PolicyExpr::And(exprs) => {
             if !exprs.iter().any(is_core_policy_clause) {
@@ -682,7 +671,6 @@ fn convert_policy_with_mode(
                     &format!("{path}.And[{index}]"),
                     query,
                     expr,
-                    expand_inherits,
                 )?;
             }
             Ok(query)
@@ -690,13 +678,12 @@ fn convert_policy_with_mode(
         PolicyExpr::Or(exprs) if exprs.iter().any(policy_requires_branch) => {
             let mut query = Query::from(table.as_str()).filter(Predicate::Any(Vec::new()));
             for (index, expr) in exprs.iter().enumerate() {
-                let branch = convert_policy_with_mode(
+                let branch = convert_policy(
                     schema,
                     table_schema,
                     table,
                     &format!("{path}.Or[{index}]"),
                     expr,
-                    expand_inherits,
                 )?;
                 for branch in PolicyBranch::alternatives_from_query(branch) {
                     query = query.policy_branch(branch);
@@ -717,7 +704,6 @@ fn convert_policy_with_mode(
             *operation,
             via_column,
             *max_depth,
-            expand_inherits,
         ),
         PolicyExpr::InheritsReferencing {
             operation,
@@ -783,7 +769,6 @@ fn append_policy_clause(
     path: &str,
     query: Query,
     expr: &PolicyExpr,
-    expand_inherits: bool,
 ) -> Result<Query, SchemaConversionError> {
     match expr {
         PolicyExpr::Inherits {
@@ -799,7 +784,6 @@ fn append_policy_clause(
             *operation,
             via_column,
             *max_depth,
-            expand_inherits,
         ),
         PolicyExpr::InheritsReferencing {
             operation,
@@ -927,13 +911,12 @@ fn append_inherited_referencing_policy(
     match source_filter {
         Ok(source_filter) => Ok(query.join_via(source_table, via_column, [source_filter])),
         Err(_) if policy_requires_branch(source_policy) => {
-            let source_query = convert_policy_with_mode(
+            let source_query = convert_policy(
                 schema,
                 source_schema,
                 &source_table_name,
                 &format!("{path}.InheritsReferencing[{source_table}]"),
                 source_policy,
-                true,
             )?;
             append_inherited_referencing_policy_branches(
                 query,
@@ -1765,7 +1748,6 @@ fn append_inherited_policy(
     operation: Operation,
     via_column: &str,
     _max_depth: Option<usize>,
-    expand_inherits: bool,
 ) -> Result<Query, SchemaConversionError> {
     let column = table_schema
         .columns
@@ -1790,31 +1772,20 @@ fn append_inherited_policy(
             format!("INHERITS via_column '{via_column}' references unknown table '{parent_table}'"),
         )
     })?;
-    let parent_policy = source_operation_policy(parent_schema, operation).ok_or_else(|| {
+    let _parent_policy = source_operation_policy(parent_schema, operation).ok_or_else(|| {
         err(
             format!("$.{}.{}", table.as_str(), path),
             format!("INHERITS via_column '{via_column}' references table '{parent_table}' without a {operation:?} policy"),
         )
     })?;
-    if expand_inherits {
-        return append_inherited_policy_expanded_fallback(
-            schema,
-            parent_schema,
-            table,
-            path,
-            query,
-            parent_table,
-            via_column,
-            parent_policy,
-        );
-    }
     // Native SELECT inherits now lowers through the derivation-collapse path
     // documented in crates/jazz/SPEC/14_lowering_to_groove.md section 14.7.
-    // Nested INHERITS_REFERENCING policies still use the expansion fallback
-    // because JoinVia cannot carry an InheritsVia atom.
+    // The expansion fallback predates that and multiplies per-derivation work;
+    // keep the helper code below as dead fallback pending removal.
     Ok(query.inherits_operation(via_column, convert_inherits_operation(operation)))
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn append_inherited_policy_expanded_fallback(
     schema: &Schema,
@@ -1836,13 +1807,12 @@ fn append_inherited_policy_expanded_fallback(
             Ok(query.join_via_row_id(parent_table.as_str(), via_column, [parent_filter]))
         }
         Err(_) if policy_requires_branch(parent_policy) => {
-            let parent_query = convert_policy_with_mode(
+            let parent_query = convert_policy(
                 schema,
                 parent_schema,
                 parent_table,
                 &format!("{path}.Inherits[{parent_table}]"),
                 parent_policy,
-                true,
             )?;
             append_inherited_policy_branches(
                 table,
