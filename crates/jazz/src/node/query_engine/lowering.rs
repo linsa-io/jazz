@@ -2780,7 +2780,11 @@ fn lower_linear_plan_steps(
                 available_route_fields.extend(introduced_route_fields);
                 if !matches!(residual, PredicateExpr::True) {
                     let predicate = lower_predicate(&residual, source, root_source, request)?;
-                    graph = graph.filter(predicate);
+                    graph = if uses_policy_value_comparison(request) {
+                        graph.policy_filter(predicate)
+                    } else {
+                        graph.filter(predicate)
+                    };
                 }
             }
             LinearStep::Join { right, mode, on } => {
@@ -2863,7 +2867,8 @@ fn lower_linear_plan_steps(
                         dedup_fields.clone(),
                         right_keys.clone(),
                     );
-                    graph = GraphBuilder::join(graph, right_reduced, left_keys, right_keys);
+                    graph =
+                        policy_join_if_needed(graph, right_reduced, left_keys, right_keys, request);
                     // Downstream steps (Project, route retention) resolve
                     // right-prefixed fields through this; the right side now
                     // carries only the dedup fields.
@@ -2883,7 +2888,8 @@ fn lower_linear_plan_steps(
                         reduced_right_fields,
                     ));
                 } else {
-                    graph = GraphBuilder::join(graph, right_graph, left_keys, right_keys);
+                    graph =
+                        policy_join_if_needed(graph, right_graph, left_keys, right_keys, request);
                     let right_fields = lowered_right.fields.clone();
                     last_join_right = Some((
                         (**right).clone(),
@@ -2918,7 +2924,8 @@ fn lower_linear_plan_steps(
                 }
             }
             LinearStep::Project(columns) => {
-                let mut unwrap_fields = BTreeSet::new();
+                let mut unwrap_fields = BTreeMap::<String, usize>::new();
+                let mut projected_nullable_field_depths = BTreeMap::<String, usize>::new();
                 let project_fields = columns
                     .iter()
                     .map(|column| {
@@ -2930,12 +2937,25 @@ fn lower_linear_plan_steps(
                             last_join_right.as_ref(),
                             request,
                         )?;
-                        unwrap_fields.extend(field.unwrap_before_project.iter().cloned());
+                        for (source, depth) in field.unwrap_before_project {
+                            unwrap_fields
+                                .entry(source)
+                                .and_modify(|existing| *existing = (*existing).max(depth))
+                                .or_insert(depth);
+                        }
+                        if let Some((output, depth)) = field.nullable_after_project {
+                            projected_nullable_field_depths
+                                .entry(output)
+                                .and_modify(|existing| *existing = (*existing).max(depth))
+                                .or_insert(depth);
+                        }
                         Ok(field.project)
                     })
                     .collect::<Result<Vec<_>, UnsupportedReason>>()?;
-                for field in unwrap_fields {
-                    graph = graph.unwrap_nullable(field);
+                for (field, depth) in unwrap_fields {
+                    for _ in 0..depth {
+                        graph = graph.unwrap_nullable(field.clone());
+                    }
                 }
                 let mut project_fields = project_fields;
                 let mut retained_route_fields = BTreeSet::new();
@@ -2978,8 +2998,8 @@ fn lower_linear_plan_steps(
                     .map(|column| column.output.name.clone())
                     .collect();
                 fields.extend(retained_route_fields.iter().cloned());
-                nullable_fields = BTreeSet::new();
-                nullable_field_depths = BTreeMap::new();
+                nullable_fields = projected_nullable_field_depths.keys().cloned().collect();
+                nullable_field_depths = projected_nullable_field_depths;
                 available_route_fields = retained_route_fields;
                 last_join_right = None;
             }
@@ -3056,6 +3076,24 @@ fn lower_linear_plan_steps(
         nullable_fields,
         nullable_field_depths,
     })
+}
+
+fn uses_policy_value_comparison(request: &QueryProgramRequest) -> bool {
+    matches!(request.policy, PolicyContext::AuthorizationSubplan { .. })
+}
+
+fn policy_join_if_needed(
+    left: GraphBuilder,
+    right: GraphBuilder,
+    left_on: impl IntoIterator<Item = impl Into<String>>,
+    right_on: impl IntoIterator<Item = impl Into<String>>,
+    request: &QueryProgramRequest,
+) -> GraphBuilder {
+    if uses_policy_value_comparison(request) {
+        GraphBuilder::policy_join(left, right, left_on, right_on)
+    } else {
+        GraphBuilder::join(left, right, left_on, right_on)
+    }
 }
 
 fn value_source_descriptor(columns: &[ValueSourceColumn]) -> RecordDescriptor {
@@ -3599,7 +3637,8 @@ fn lower_projection_field(
     )>,
     request: &QueryProgramRequest,
 ) -> Result<ProjectionFieldPlan, UnsupportedReason> {
-    let mut unwrap_before_project = BTreeSet::new();
+    let mut unwrap_before_project = BTreeMap::new();
+    let mut nullable_after_project = None;
     let project = match lower_projection_source(
         &column.value,
         plan,
@@ -3608,9 +3647,16 @@ fn lower_projection_field(
         last_join_right,
         request,
     )? {
-        ProjectionSource::Field { field, nullable } => {
-            if nullable && !matches!(column.output.ty.value_type(), ValueType::Nullable(_)) {
-                unwrap_before_project.insert(field.clone());
+        ProjectionSource::Field {
+            field,
+            nullable_depth,
+        } => {
+            if nullable_depth > 0
+                && !matches!(column.output.ty.value_type(), ValueType::Nullable(_))
+            {
+                unwrap_before_project.insert(field.clone(), nullable_depth);
+            } else if nullable_depth > 0 {
+                nullable_after_project = Some((column.output.name.clone(), nullable_depth));
             }
             ProjectField::renamed(field, column.output.name.clone())
         }
@@ -3621,19 +3667,24 @@ fn lower_projection_field(
     Ok(ProjectionFieldPlan {
         project,
         unwrap_before_project,
+        nullable_after_project,
     })
 }
 
 #[derive(Clone, Debug)]
 enum ProjectionSource {
-    Field { field: String, nullable: bool },
+    Field {
+        field: String,
+        nullable_depth: usize,
+    },
     Literal(LiteralValue),
 }
 
 #[derive(Clone, Debug)]
 struct ProjectionFieldPlan {
     project: ProjectField,
-    unwrap_before_project: BTreeSet<String>,
+    unwrap_before_project: BTreeMap<String, usize>,
+    nullable_after_project: Option<(String, usize)>,
 }
 
 fn lower_projection_source(
@@ -3650,14 +3701,17 @@ fn lower_projection_source(
     request: &QueryProgramRequest,
 ) -> Result<ProjectionSource, UnsupportedReason> {
     if let Ok(field) = lower_linear_root_key_ref(value, &plan.root, source, request) {
-        let nullable = matches!(plan.root, LinearRoot::Source { .. })
-            && source_field_is_nullable(source, &field);
+        let nullable_depth = if matches!(plan.root, LinearRoot::Source { .. }) {
+            source_field_nullable_depth(source, &field)
+        } else {
+            0
+        };
         return Ok(ProjectionSource::Field {
             field: match last_join_right {
                 Some(_) => left_field(&field),
                 None => field,
             },
-            nullable,
+            nullable_depth,
         });
     }
 
@@ -3669,15 +3723,19 @@ fn lower_projection_source(
                 Some(_) => left_field(param),
                 None => param.clone(),
             },
-            nullable: false,
+            nullable_depth: 0,
         });
     }
-    if let Some((right, nullable_fields, _, _)) = last_join_right {
+    if let Some((right, nullable_fields, nullable_field_depths, _)) = last_join_right {
         if let Some(field) = lower_relation_projection_ref(value, right, request)? {
-            let nullable = nullable_fields.contains(&field);
+            let nullable_depth = if nullable_fields.contains(&field) {
+                nullable_field_depths.get(&field).copied().unwrap_or(1)
+            } else {
+                0
+            };
             return Ok(ProjectionSource::Field {
                 field: right_field(&field),
-                nullable,
+                nullable_depth,
             });
         }
     }
@@ -3809,7 +3867,7 @@ fn lower_equality_param_filter_joins(
         if join.nullable {
             graph = graph.unwrap_nullable(join.field.clone());
         }
-        graph = GraphBuilder::join(graph, binding, [join.field], [join.param])
+        graph = policy_join_if_needed(graph, binding, [join.field], [join.param], request)
             .project_fields(projection);
         retained_route_fields.insert(route_field);
     }
