@@ -52,43 +52,50 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
+
+          # In a file rather than `node -e '...'`: an apostrophe in a JS comment
+          # ("this build's version") closed the shell quote and the rest of the script was
+          # handed to bash, which died on an unexpected '('. A quoted heredoc cannot do that.
+          cat > "$GITHUB_WORKSPACE/pack-fixup.js" <<'FIXUP'
+          const fs = require("fs");
+          const f = process.argv[2] + "/package.json";
+          const pkg = JSON.parse(fs.readFileSync(f, "utf8"));
+
+          // The artifacts arrive already built. jazz-rn's prepare runs `bob build`, which is
+          // not installed here, and --ignore-scripts did not stop npm from running it.
+          // Dropping these is right for the published manifest anyway: whoever installs a
+          // tarball has no build toolchain either.
+          if (pkg.scripts) {
+            for (const k of ["prepare", "prepack", "prepublishOnly", "postinstall"]) {
+              delete pkg.scripts[k];
+            }
+          }
+
+          // npm pack keeps `workspace:*` ranges verbatim — only pnpm publish rewrites them —
+          // so the tarball was uninstallable outside the jazz monorepo. Pin them to the
+          // version of this build.
+          for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+            const deps = pkg[field];
+            if (!deps) continue;
+            for (const [name, range] of Object.entries(deps)) {
+              if (typeof range === "string" && range.startsWith("workspace:")) {
+                deps[name] = pkg.version;
+              }
+            }
+          }
+
+          fs.writeFileSync(f, JSON.stringify(pkg, null, 2) + "\n");
+FIXUP
+
           pack() {
             local dir="$1" name="$2"
             if [ ! -f "$dir/package.json" ]; then
               echo "::error::missing package.json in $dir"
               exit 1
             fi
-            # Strip the build lifecycle scripts out of the COPY we are packing. The
-            # artifacts arrive already built — jazz-rn's `prepare` runs `bob build`, which
-            # is not installed here and would only redo what the assemble job already did
-            # (pnpm runs `prepare` for workspace packages on install). `--ignore-scripts`
-            # alone did NOT stop npm from running it, hence editing package.json instead.
-            #
-            # Dropping them from the published manifest is right anyway: a consumer
-            # installing a tarball has no build toolchain either.
-            node -e '
-              const fs = require("fs");
-              const f = process.argv[1] + "/package.json";
-              const pkg = JSON.parse(fs.readFileSync(f, "utf8"));
-              if (pkg.scripts) {
-                for (const k of ["prepare", "prepack", "prepublishOnly", "postinstall"]) delete pkg.scripts[k];
-              }
-              // `npm pack` leaves `workspace:*` ranges as-is — only `pnpm publish` rewrites
-              // them — so a tarball packed this way is uninstallable outside the jazz
-              // monorepo ("no package named jazz-wasm is present in the workspace").
-              // Pin them to this build's version instead.
-              for (const field of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
-                const deps = pkg[field];
-                if (!deps) continue;
-                for (const [name, range] of Object.entries(deps)) {
-                  if (typeof range === "string" && range.startsWith("workspace:")) {
-                    deps[name] = pkg.version;
-                  }
-                }
-              }
-              fs.writeFileSync(f, JSON.stringify(pkg, null, 2) + "\n");
-            ' "$dir"
-            #
+            # Fix up the manifest of the COPY before packing — see pack-fixup.js.
+            node "$GITHUB_WORKSPACE/pack-fixup.js" "$dir"
+
             # `npm pack` names the file from package.json; rename to a stable asset name so
             # consuming URLs do not change when a version does.
             local produced
