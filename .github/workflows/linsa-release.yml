@@ -58,12 +58,24 @@ jobs:
               echo "::error::missing package.json in $dir"
               exit 1
             fi
+            # --ignore-scripts: the artifacts are already built. jazz-rn's `prepare` runs
+            # `bob build`, which is not installed here and would only rebuild `lib/` that
+            # the assemble job already produced (pnpm runs `prepare` for workspace
+            # packages on install).
+            #
             # `npm pack` names the file from package.json; rename to a stable asset name so
             # consuming URLs do not change when a version does.
             local produced
-            produced="$(cd "$dir" && npm pack --silent --pack-destination "$GITHUB_WORKSPACE/out")"
+            produced="$(cd "$dir" && npm pack --silent --ignore-scripts --pack-destination "$GITHUB_WORKSPACE/out")"
             mv "out/$produced" "out/$name.tgz"
             echo "packed $name from $dir"
+          }
+
+          # jazz-rn's entrypoint is generated, so a tarball without it installs and then
+          # fails at import time. Catch that here rather than three steps later.
+          test -f artifacts/pkg-jazz-rn/lib/module/index.js || {
+            echo "::error::jazz-rn artifact has no built lib/ — the assemble job did not run its prepare script"
+            exit 1
           }
 
           pack artifacts/pkg-jazz-tools   jazz-tools
