@@ -58,10 +58,23 @@ jobs:
               echo "::error::missing package.json in $dir"
               exit 1
             fi
-            # --ignore-scripts: the artifacts are already built. jazz-rn's `prepare` runs
-            # `bob build`, which is not installed here and would only rebuild `lib/` that
-            # the assemble job already produced (pnpm runs `prepare` for workspace
-            # packages on install).
+            # Strip the build lifecycle scripts out of the COPY we are packing. The
+            # artifacts arrive already built — jazz-rn's `prepare` runs `bob build`, which
+            # is not installed here and would only redo what the assemble job already did
+            # (pnpm runs `prepare` for workspace packages on install). `--ignore-scripts`
+            # alone did NOT stop npm from running it, hence editing package.json instead.
+            #
+            # Dropping them from the published manifest is right anyway: a consumer
+            # installing a tarball has no build toolchain either.
+            node -e '
+              const fs = require("fs");
+              const f = process.argv[1] + "/package.json";
+              const pkg = JSON.parse(fs.readFileSync(f, "utf8"));
+              if (pkg.scripts) {
+                for (const k of ["prepare", "prepack", "prepublishOnly", "postinstall"]) delete pkg.scripts[k];
+              }
+              fs.writeFileSync(f, JSON.stringify(pkg, null, 2) + "\n");
+            ' "$dir"
             #
             # `npm pack` names the file from package.json; rename to a stable asset name so
             # consuming URLs do not change when a version does.
