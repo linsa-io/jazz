@@ -178,8 +178,24 @@ class MessageWebSocket {
 
   close(): void {}
 
-  addEventListener(type: string, listener: (event: { data: unknown }) => void): void {
-    if (type === "message") this.messageListeners.push(listener);
+  addEventListener(type: "open", listener: () => void): void;
+  addEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
+  addEventListener(type: "error", listener: (event: unknown) => void): void;
+  addEventListener(
+    type: "close",
+    listener: (event: { code: number; reason: string }) => void,
+  ): void;
+  addEventListener(
+    type: "open" | "message" | "error" | "close",
+    listener:
+      | (() => void)
+      | ((event: { data: unknown }) => void)
+      | ((event: unknown) => void)
+      | ((event: { code: number; reason: string }) => void),
+  ): void {
+    if (type === "message") {
+      this.messageListeners.push(listener as (event: { data: unknown }) => void);
+    }
   }
 
   emitMessage(data: Uint8Array): void {
