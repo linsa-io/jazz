@@ -7,11 +7,12 @@ name: Build Jazz packages
 #
 #     git show main:.github/workflows/build-jazz-packages.yml
 #
-# The x64 CLI slices (linux-x64, darwin-x64) are gone for the same reason: local Docker
-# runs linux/arm64 on Apple Silicon and nobody here has an Intel Mac, and linux-x64 was
-# the slowest job in the run at 24 minutes. THEY ARE NEEDED FOR A PRODUCTION x86 SERVER —
-# bring them back before deploying anywhere that is not an Apple Silicon machine. The
-# matrix entry, the `for bin in` list and the `chmod` list all name them.
+# darwin-x64 is gone too: no Intel Macs in dev, and prod is Linux. The remaining CLI
+# slices cover both worlds — linux-arm64 for Docker on Apple Silicon, linux-x64 for an
+# x86 server, darwin-arm64 for running the binary on a dev machine (which is how we
+# profile it with symbols). linux-x64 is the slowest job at ~24 minutes cold, but
+# Swatinem/rust-cache makes later runs much shorter, and dropping it would mean no
+# production build at all.
 #
 # and copy back the `build-rn-android` job, its entry under `assemble-packages.needs`,
 # the `jazz-rn-android-payload-*` download step, and the `cp -R dist/rn-android/jniLibs`
@@ -58,6 +59,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - target: x86_64-unknown-linux-musl
+            arch: x64
+            output: jazz-tools-linux-x64
           - target: aarch64-unknown-linux-musl
             arch: arm64
             output: jazz-tools-linux-arm64
@@ -351,14 +355,16 @@ jobs:
           mkdir -p packages/jazz-tools/bin/native
           for bin in \
             jazz-tools-darwin-arm64 \
-            jazz-tools-linux-arm64; do
+            jazz-tools-linux-arm64 \
+            jazz-tools-linux-x64; do
             SOURCE="dist/${bin}"
             test -f "${SOURCE}" || { echo "Missing release native binary ${bin}"; exit 1; }
             cp "${SOURCE}" packages/jazz-tools/bin/native/
           done
           chmod 755 \
             packages/jazz-tools/bin/native/jazz-tools-darwin-arm64 \
-            packages/jazz-tools/bin/native/jazz-tools-linux-arm64
+            packages/jazz-tools/bin/native/jazz-tools-linux-arm64 \
+            packages/jazz-tools/bin/native/jazz-tools-linux-x64
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
