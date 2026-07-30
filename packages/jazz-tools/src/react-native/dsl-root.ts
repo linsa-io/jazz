@@ -22,7 +22,22 @@ export { table, migrate, getCollectedSchema, getCollectedMigration, resetCollect
 export * from "../permissions/index.js";
 export { generateAuthSecret };
 
-export const schema = Object.assign({}, col, {
+// Annotated with a locally-nameable type, exactly as the root index does. Without it
+// declaration emit fails with TS4023: the inferred type reaches a `$JSONSchema` from
+// json-schema-to-ts that cannot be named in the output. The original pnpm patch never hit
+// this because it edited the built dist and shipped a hand-written .d.ts.
+type RuntimeSchemaNamespace = typeof col & {
+  table: typeof defineTable;
+  defineSchema: typeof defineSchema;
+  defineApp: typeof defineApp;
+  defineSliceableApp: typeof defineSliceableApp;
+  defineMigration: typeof defineMigration;
+  renameTableFrom: typeof renameTableFrom;
+  definePermissions: typeof definePermissions;
+  permissionIntrospectionColumns: typeof permissionIntrospectionColumns;
+};
+
+export const schema: RuntimeSchemaNamespace = Object.assign({}, col, {
   table: defineTable,
   defineSchema,
   defineApp,
