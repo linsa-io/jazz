@@ -16,6 +16,10 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
+      "react-native": {
+        "types": "./dist/react-native/dsl-root.d.ts",
+        "default": "./dist/react-native/dsl-root.js"
+      },
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
