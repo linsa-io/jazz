@@ -18,7 +18,7 @@ use crate::query_manager::types::{
 use crate::storage::Storage;
 
 use super::RowNode;
-use super::subgraph::SubgraphTemplate;
+use super::subgraph::{SubgraphInstance, SubgraphTemplate};
 
 /// Node that evaluates a correlated subquery for each outer row,
 /// producing an array column with the results.
@@ -41,6 +41,15 @@ use super::subgraph::SubgraphTemplate;
 /// - Memory overhead per instance
 /// - Update cost distribution (how many instances need re-settling on inner change?)
 /// - Common subgraph patterns that could benefit from memoization
+/// Hard ceiling on live subgraph instances kept per node.
+///
+/// The cache is normally bounded by the number of live outer rows, because entries are
+/// dropped with the row they belong to. This is the safety valve for a result set large
+/// enough that holding a compiled graph per row would cost more memory than the compiles
+/// it saves. Above it we evict the least recently used entry, which degrades toward the
+/// old recompile-per-row behaviour for the overflow rather than growing without bound.
+const MAX_CACHED_SUBGRAPHS: usize = 2048;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Correlate {
     /// Correlate using a column value from the outer row.
@@ -77,6 +86,27 @@ pub struct ArraySubqueryNode {
     dirty: bool,
     /// True if the inner table changed (need to reevaluate all instances).
     inner_dirty: bool,
+
+    /// Live subgraph instances, keyed by (outer row, element index).
+    ///
+    /// WHY: `instantiate` compiles a FRESH QueryGraph per outer row, and
+    /// `reevaluate_all` re-evaluates every instance whenever the inner table
+    /// changes. Measured on a real store, one incoming row update produced ~147
+    /// full `try_compile_with_schema_context` calls, i.e. ~177/s on an otherwise
+    /// idle server. The compiled shape is identical across re-evaluations — only
+    /// the correlation binding differs — so keeping the settled instance and
+    /// re-settling it removes the compile entirely. Results are read from
+    /// `current_output_tuples()` (full state, not a delta), so reuse is sound.
+    subgraph_cache: AHashMap<(ObjectId, usize), CachedSubgraph>,
+    /// Monotonic tick used to order cache entries by last use.
+    subgraph_cache_clock: u64,
+}
+
+#[derive(Debug)]
+struct CachedSubgraph {
+    correlation_value: Value,
+    instance: SubgraphInstance,
+    last_used: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -144,12 +174,49 @@ impl ArraySubqueryNode {
             current_tuples: AHashSet::new(),
             dirty: true,
             inner_dirty: false,
+            subgraph_cache: AHashMap::new(),
+            subgraph_cache_clock: 0,
+        }
+    }
+
+    /// Drop every cached subgraph belonging to an outer row.
+    ///
+    /// Called when the row leaves the result set, so the cache tracks live rows rather
+    /// than every row ever seen. Without this the cache is what grows without bound —
+    /// the capacity ceiling is only a backstop.
+    fn forget_cached_subgraphs(&mut self, outer_id: ObjectId) {
+        self.subgraph_cache.retain(|(id, _), _| *id != outer_id);
+    }
+
+    /// Make room for one new entry, evicting the least recently used one if needed.
+    fn evict_subgraphs_over_capacity(&mut self, incoming: &(ObjectId, usize)) {
+        if self.subgraph_cache.len() < MAX_CACHED_SUBGRAPHS
+            || self.subgraph_cache.contains_key(incoming)
+        {
+            return;
+        }
+        // Linear scan is fine: it only runs at the ceiling, over a bounded map.
+        if let Some(victim) = self
+            .subgraph_cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used)
+            .map(|(key, _)| *key)
+        {
+            self.subgraph_cache.remove(&victim);
         }
     }
 
     /// Mark this node as needing re-evaluation due to inner table changes.
     pub fn mark_inner_dirty(&mut self) {
         self.inner_dirty = true;
+    }
+
+    /// How many compiled subgraphs this node is holding.
+    ///
+    /// Exposed so the memory cost of the cache can be attributed: RSS alone cannot say
+    /// how much of it is ours, but RSS delta divided by this count can.
+    pub fn cached_subgraph_count(&self) -> usize {
+        self.subgraph_cache.len()
     }
 
     /// Check if the inner table changed (need to reevaluate all instances).
@@ -173,6 +240,7 @@ impl ArraySubqueryNode {
         for tuple in input.removed {
             if let Some(outer_id) = tuple.first_id() {
                 let state = self.instances.remove(&outer_id);
+                self.forget_cached_subgraphs(outer_id);
                 let old_array = state
                     .as_ref()
                     .map(|state| state.array_result.clone())
@@ -209,7 +277,7 @@ impl ArraySubqueryNode {
                 if let Some(correlation_value) = self.extract_correlation_value(&tuple) {
                     // Evaluate subgraph for this correlation value
                     let (array_result, provenance, batch_provenance) =
-                        self.evaluate_subgraph(&correlation_value, io, &mut row_loader);
+                        self.evaluate_subgraph(outer_id, &correlation_value, io, &mut row_loader);
 
                     // Store instance state
                     self.instances.insert(
@@ -243,6 +311,11 @@ impl ArraySubqueryNode {
             let old_outer_id = old_tuple.first_id();
             let new_outer_id = new_tuple.first_id();
             let old_state = old_outer_id.and_then(|outer_id| self.instances.remove(&outer_id));
+            if let Some(outer_id) = old_outer_id {
+                if Some(outer_id) != new_outer_id {
+                    self.forget_cached_subgraphs(outer_id);
+                }
+            }
 
             let old_array = old_state
                 .as_ref()
@@ -280,7 +353,16 @@ impl ArraySubqueryNode {
                             .unwrap_or_default(),
                     )
                 } else if let Some(ref new_corr) = new_correlation {
-                    self.evaluate_subgraph(new_corr, io, &mut row_loader)
+                    match new_outer_id.or(old_outer_id) {
+                        Some(outer_id) => {
+                            self.evaluate_subgraph(outer_id, new_corr, io, &mut row_loader)
+                        }
+                        None => (
+                            Value::Array(vec![]),
+                            TupleProvenance::default(),
+                            TupleBatchProvenance::default(),
+                        ),
+                    }
                 } else {
                     (
                         Value::Array(vec![]),
@@ -362,7 +444,8 @@ impl ArraySubqueryNode {
     /// Evaluate the subgraph for a given correlation value.
     /// Uses trait object to avoid recursion limit with nested generics.
     fn evaluate_subgraph(
-        &self,
+        &mut self,
+        outer_id: ObjectId,
         correlation_value: &Value,
         io: &dyn Storage,
         row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
@@ -373,9 +456,9 @@ impl ArraySubqueryNode {
             let mut materialized = Vec::new();
             let mut provenance = TupleProvenance::default();
             let mut batch_provenance = TupleBatchProvenance::default();
-            for element in elements {
+            for (idx, element) in elements.iter().enumerate() {
                 let (nested_value, nested_provenance, nested_batch_provenance) =
-                    self.evaluate_subgraph_for_single(element, io, row_loader);
+                    self.evaluate_subgraph_for_single((outer_id, idx), element, io, row_loader);
                 let Value::Array(mut nested) = nested_value else {
                     continue;
                 };
@@ -390,29 +473,72 @@ impl ArraySubqueryNode {
             return (Value::Array(materialized), provenance, batch_provenance);
         }
 
-        self.evaluate_subgraph_for_single(correlation_value, io, row_loader)
+        self.evaluate_subgraph_for_single((outer_id, 0), correlation_value, io, row_loader)
     }
 
     fn evaluate_subgraph_for_single(
-        &self,
+        &mut self,
+        cache_key: (ObjectId, usize),
         correlation_value: &Value,
         io: &dyn Storage,
         row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
     ) -> (Value, TupleProvenance, TupleBatchProvenance) {
-        let instance = self
-            .subgraph_template
-            .instantiate(correlation_value.clone(), &self.schema);
-        let mut instance = match instance {
-            Some(i) => i,
-            None => {
-                return (
-                    Value::Array(vec![]),
-                    TupleProvenance::default(),
-                    TupleBatchProvenance::default(),
-                );
-            }
-        };
+        let output_desc = self.subgraph_template.output_descriptor().clone();
 
+        // Reuse the settled instance when the correlation binding is unchanged; only
+        // a new binding needs a compile.
+        let reusable = matches!(
+            self.subgraph_cache.get(&cache_key),
+            Some(cached) if &cached.correlation_value == correlation_value
+        );
+        if !reusable {
+            match self
+                .subgraph_template
+                .instantiate(correlation_value.clone(), &self.schema)
+            {
+                Some(fresh) => {
+                    self.evict_subgraphs_over_capacity(&cache_key);
+                    self.subgraph_cache_clock += 1;
+                    self.subgraph_cache.insert(
+                        cache_key,
+                        CachedSubgraph {
+                            correlation_value: correlation_value.clone(),
+                            instance: fresh,
+                            last_used: self.subgraph_cache_clock,
+                        },
+                    );
+                }
+                None => {
+                    self.subgraph_cache.remove(&cache_key);
+                    return (
+                        Value::Array(vec![]),
+                        TupleProvenance::default(),
+                        TupleBatchProvenance::default(),
+                    );
+                }
+            }
+        }
+        let reused = reusable;
+        self.subgraph_cache_clock += 1;
+        let clock = self.subgraph_cache_clock;
+        let Some(cached) = self.subgraph_cache.get_mut(&cache_key) else {
+            return (
+                Value::Array(vec![]),
+                TupleProvenance::default(),
+                TupleBatchProvenance::default(),
+            );
+        };
+        cached.last_used = clock;
+        let instance = &mut cached.instance;
+
+        if reused {
+            // A freshly compiled graph starts with every node dirty. A reused one does
+            // not, and its scan nodes have no idea the inner table moved — that is what
+            // made three array_subquery tests return stale arrays. Marking all dirty
+            // restores exactly the fresh-graph semantics; the saving is the compile, not
+            // the scan.
+            instance.graph.mark_all_dirty();
+        }
         let _row_delta = instance
             .graph
             .settle(io, &mut |id, hint| row_loader(id, hint));
@@ -433,8 +559,7 @@ impl ArraySubqueryNode {
                         )
                         .and_then(|flattened| flattened.to_single_row())
                 }?;
-                let output_desc = self.subgraph_template.output_descriptor();
-                let values = decode_row(output_desc, &row.data).ok()?;
+                let values = decode_row(&output_desc, &row.data).ok()?;
                 for scoped_object in tuple.provenance().iter().copied() {
                     provenance.insert(scoped_object);
                 }
@@ -537,7 +662,7 @@ impl ArraySubqueryNode {
         for (outer_id, old_state) in instances_snapshot {
             // Re-evaluate subgraph
             let (new_array, new_provenance, new_batch_provenance) =
-                self.evaluate_subgraph(&old_state.correlation_value, io, row_loader);
+                self.evaluate_subgraph(outer_id, &old_state.correlation_value, io, row_loader);
 
             if old_state.array_result != new_array
                 || old_state.provenance != new_provenance
@@ -824,4 +949,97 @@ mod tests {
         let correlation = node.extract_correlation_value(&user_tuple);
         assert_eq!(correlation, Some(Value::Uuid(row_id)));
     }
+
+    /// Build a node whose subgraph cache can be populated directly.
+    fn cache_test_node() -> ArraySubqueryNode {
+        let schema = test_schema();
+        let outer_descriptor = TupleDescriptor::single_with_materialization(
+            "users",
+            schema
+                .get(&TableName::new("users"))
+                .unwrap()
+                .columns
+                .clone(),
+            true,
+        );
+        let template = SubgraphBuilder::new("posts")
+            .correlate("author_id")
+            .select(&["id", "title"])
+            .build(&schema)
+            .unwrap();
+        ArraySubqueryNode::new(
+            outer_descriptor,
+            template,
+            Correlate::Col(0),
+            ArraySubqueryRequirement::Optional,
+            "posts".to_string(),
+            schema,
+        )
+    }
+
+    fn seed_cache_entry(node: &mut ArraySubqueryNode, key: (ObjectId, usize), last_used: u64) {
+        let correlation_value = Value::Integer(key.1 as i32);
+        let instance = node
+            .subgraph_template
+            .instantiate(correlation_value.clone(), &node.schema)
+            .expect("subgraph instantiates");
+        node.subgraph_cache.insert(
+            key,
+            CachedSubgraph {
+                correlation_value,
+                instance,
+                last_used,
+            },
+        );
+    }
+
+    #[test]
+    fn forgetting_an_outer_row_drops_only_its_subgraphs() {
+        let mut node = cache_test_node();
+        let kept = ObjectId::new();
+        let dropped = ObjectId::new();
+        seed_cache_entry(&mut node, (kept, 0), 1);
+        seed_cache_entry(&mut node, (dropped, 0), 2);
+        // A UUID[] forward include caches one subgraph per array element.
+        seed_cache_entry(&mut node, (dropped, 1), 3);
+        assert_eq!(node.subgraph_cache.len(), 3);
+
+        node.forget_cached_subgraphs(dropped);
+
+        assert_eq!(node.subgraph_cache.len(), 1);
+        assert!(node.subgraph_cache.contains_key(&(kept, 0)));
+    }
+
+    #[test]
+    fn eviction_removes_the_least_recently_used_entry() {
+        let mut node = cache_test_node();
+        let oldest = ObjectId::new();
+        let newer = ObjectId::new();
+        let newest = ObjectId::new();
+        seed_cache_entry(&mut node, (oldest, 0), 1);
+        seed_cache_entry(&mut node, (newer, 0), 5);
+        seed_cache_entry(&mut node, (newest, 0), 9);
+
+        // Pretend the map is at capacity so one insert has to make room.
+        while node.subgraph_cache.len() < MAX_CACHED_SUBGRAPHS {
+            seed_cache_entry(&mut node, (ObjectId::new(), 0), 100);
+        }
+        node.evict_subgraphs_over_capacity(&(ObjectId::new(), 0));
+
+        assert!(!node.subgraph_cache.contains_key(&(oldest, 0)));
+        assert!(node.subgraph_cache.contains_key(&(newer, 0)));
+        assert!(node.subgraph_cache.contains_key(&(newest, 0)));
+    }
+
+    #[test]
+    fn eviction_is_a_noop_below_capacity() {
+        let mut node = cache_test_node();
+        let only = ObjectId::new();
+        seed_cache_entry(&mut node, (only, 0), 1);
+
+        node.evict_subgraphs_over_capacity(&(ObjectId::new(), 0));
+
+        assert_eq!(node.subgraph_cache.len(), 1);
+    }
+
 }
