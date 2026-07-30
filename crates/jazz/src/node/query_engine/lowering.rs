@@ -4406,6 +4406,9 @@ fn non_null_value_type(mut value_type: &ValueType) -> &ValueType {
 }
 
 fn coerce_literal_for_value_type(value: LiteralValue, value_type: &ValueType) -> LiteralValue {
+    if let Some(value) = coerce_integer_literal_for_value_type(&value, value_type) {
+        return value;
+    }
     match (value, value_type) {
         (LiteralValue::String(value), ValueType::Uuid) => uuid::Uuid::parse_str(&value)
             .map(LiteralValue::Uuid)
@@ -4437,6 +4440,30 @@ fn coerce_literal_for_value_type(value: LiteralValue, value_type: &ValueType) ->
             )
         }
         (value, _) => value,
+    }
+}
+
+fn coerce_integer_literal_for_value_type(
+    value: &LiteralValue,
+    value_type: &ValueType,
+) -> Option<LiteralValue> {
+    let value = match value {
+        LiteralValue::U8(value) => i128::from(*value),
+        LiteralValue::U16(value) => i128::from(*value),
+        LiteralValue::U32(value) => i128::from(*value),
+        LiteralValue::U64(value) => i128::from(*value),
+        LiteralValue::I32(value) => i128::from(*value),
+        LiteralValue::I64(value) => i128::from(*value),
+        _ => return None,
+    };
+    match value_type {
+        ValueType::U8 => u8::try_from(value).ok().map(LiteralValue::U8),
+        ValueType::U16 => u16::try_from(value).ok().map(LiteralValue::U16),
+        ValueType::U32 => u32::try_from(value).ok().map(LiteralValue::U32),
+        ValueType::U64 => u64::try_from(value).ok().map(LiteralValue::U64),
+        ValueType::I32 => i32::try_from(value).ok().map(LiteralValue::I32),
+        ValueType::I64 => i64::try_from(value).ok().map(LiteralValue::I64),
+        _ => None,
     }
 }
 

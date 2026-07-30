@@ -2496,6 +2496,9 @@ fn contains_needle_type(
 }
 
 fn coerce_literal_for_column_type(value: Value, column_type: &ColumnType) -> Value {
+    if let Some(value) = coerce_integer_for_column_type(&value, column_type) {
+        return value;
+    }
     match (value, column_type) {
         (Value::Uuid(value), ColumnType::String) => Value::String(value.to_string()),
         (Value::String(value), ColumnType::Uuid) => uuid::Uuid::parse_str(&value)
@@ -2524,6 +2527,27 @@ fn coerce_literal_for_column_type(value: Value, column_type: &ColumnType) -> Val
         ))),
         (value, ColumnType::Nullable(inner)) => coerce_literal_for_column_type(value, inner),
         (value, _) => value,
+    }
+}
+
+fn coerce_integer_for_column_type(value: &Value, column_type: &ColumnType) -> Option<Value> {
+    let value = match value {
+        Value::U8(value) => i128::from(*value),
+        Value::U16(value) => i128::from(*value),
+        Value::U32(value) => i128::from(*value),
+        Value::U64(value) => i128::from(*value),
+        Value::I32(value) => i128::from(*value),
+        Value::I64(value) => i128::from(*value),
+        _ => return None,
+    };
+    match column_type {
+        ColumnType::U8 => u8::try_from(value).ok().map(Value::U8),
+        ColumnType::U16 => u16::try_from(value).ok().map(Value::U16),
+        ColumnType::U32 => u32::try_from(value).ok().map(Value::U32),
+        ColumnType::U64 => u64::try_from(value).ok().map(Value::U64),
+        ColumnType::I32 => i32::try_from(value).ok().map(Value::I32),
+        ColumnType::I64 => i64::try_from(value).ok().map(Value::I64),
+        _ => None,
     }
 }
 
@@ -9692,6 +9716,9 @@ fn prepared_claim_value(path: &ClaimPath, policy: &PolicyContext) -> Result<Valu
 }
 
 fn coerce_prepared_binding_value(value: Value, column_type: &ColumnType) -> Value {
+    if let Some(value) = coerce_integer_for_column_type(&value, column_type) {
+        return value;
+    }
     match (value, column_type) {
         (Value::Uuid(value), ColumnType::String | ColumnType::Json { .. }) => {
             Value::String(value.to_string())
