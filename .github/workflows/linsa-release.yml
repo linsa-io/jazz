@@ -1,0 +1,99 @@
+name: Linsa release
+
+# Builds every jazz package from this fork and publishes them as tarballs on a GitHub
+# Release, so consumers can install them by URL:
+#
+#   "jazz-tools-v2": "https://github.com/linsa-io/jazz/releases/download/<tag>/jazz-tools.tgz"
+#
+# Release assets rather than Actions artifacts on purpose: artifacts expire (90 days by
+# default) and need a token to download even on a public repo, so a dependency pointing at
+# one breaks a few months later. Release assets are permanent and anonymous.
+#
+# Package versions are NOT rewritten. Every consumer references these by URL, and the tag
+# in that URL is what identifies the build as ours — rewriting versions would mean
+# rewriting the inter-package dependency ranges too, which is a lot of fragility for a
+# string that nobody resolves.
+#
+# NOTE: jazz-napi's platform packages must be published and overridden as well. The loader
+# declares them as optionalDependencies by version, so without overrides a consumer
+# silently pulls the UPSTREAM (unpatched) native binaries from npm while everything else
+# comes from here.
+
+on:
+  push:
+    tags:
+      - "linsa-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to create the release under (e.g. linsa-v1)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-jazz-packages.yml
+
+  release:
+    name: Pack and publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
+        with:
+          path: artifacts
+
+      - name: Pack every package
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          pack() {
+            local dir="$1" name="$2"
+            if [ ! -f "$dir/package.json" ]; then
+              echo "::error::missing package.json in $dir"
+              exit 1
+            fi
+            # `npm pack` names the file from package.json; rename to a stable asset name so
+            # consuming URLs do not change when a version does.
+            local produced
+            produced="$(cd "$dir" && npm pack --silent --pack-destination "$GITHUB_WORKSPACE/out")"
+            mv "out/$produced" "out/$name.tgz"
+            echo "packed $name from $dir"
+          }
+
+          pack artifacts/pkg-jazz-tools   jazz-tools
+          pack artifacts/pkg-jazz-wasm    jazz-wasm
+          pack artifacts/pkg-jazz-napi    jazz-napi
+          pack artifacts/pkg-jazz-rn      jazz-rn
+
+          # Platform-specific napi packages live under npm/<platform>/ inside the loader.
+          for platform in artifacts/pkg-jazz-napi/npm/*/; do
+            [ -f "$platform/package.json" ] || continue
+            pack "$platform" "jazz-napi-$(basename "$platform")"
+          done
+
+          ls -lh out
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" out/*.tgz \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "Patched jazz build from the \`linsa\` branch of this fork.
+
+          Install by URL, for example:
+
+              \"jazz-tools-v2\": \"https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/jazz-tools.tgz\"
+
+          Remember to override the \`@garden-co/jazz-napi-*\` platform packages as well —
+          without that the unpatched upstream binaries are pulled from npm." \
+            || gh release upload "$TAG" out/*.tgz --repo "$GITHUB_REPOSITORY" --clobber
