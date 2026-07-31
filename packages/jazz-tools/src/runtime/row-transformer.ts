@@ -53,13 +53,20 @@ function toByteArray(value: unknown): Uint8Array {
   }
 
   if (Array.isArray(value)) {
-    const bytes = value.map((entry) => {
+    // Indexed loop, validating as it copies: this runs once per byte of every Bytea
+    // read on React Native (rows arrive as JSON arrays of integers there), so the
+    // `.map()` version's per-element closure call and intermediate array were the
+    // dominant cost of megabyte reads.
+    const length = value.length;
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i++) {
+      const entry: unknown = value[i];
       if (typeof entry !== "number" || !Number.isInteger(entry) || entry < 0 || entry > 255) {
         throw new Error("Invalid Bytea array value. Expected integers in range 0..255.");
       }
-      return entry;
-    });
-    return new Uint8Array(bytes);
+      bytes[i] = entry;
+    }
+    return bytes;
   }
 
   throw new Error("Invalid Bytea value. Expected Uint8Array or byte array.");

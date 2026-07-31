@@ -63,6 +63,26 @@ describe("unwrapValue", () => {
     expect(Array.from(unwrapped as Uint8Array)).toEqual([0, 1, 255]);
   });
 
+  it("unwraps a large Bytea byte array without corruption", () => {
+    // Sized past any chunking a fast path might introduce, patterned so an
+    // off-by-one cannot cancel out.
+    const source = Array.from({ length: 100_000 }, (_, i) => (i * 31 + (i >> 8)) & 255);
+    const v = { type: "Bytea", value: source } as unknown as WasmValue;
+    const unwrapped = unwrapValue(v) as Uint8Array;
+    expect(unwrapped).toBeInstanceOf(Uint8Array);
+    expect(unwrapped).toHaveLength(source.length);
+    expect(unwrapped[0]).toBe(source[0]!);
+    expect(unwrapped[65_537]).toBe(source[65_537]!);
+    expect(unwrapped[99_999]).toBe(source[99_999]!);
+  });
+
+  it("rejects Bytea arrays holding non-byte entries", () => {
+    for (const bad of [[0, 256], [-1], [1.5], ["7f"], [null], [0, undefined]]) {
+      const v = { type: "Bytea", value: bad } as unknown as WasmValue;
+      expect(() => unwrapValue(v)).toThrow(/range 0\.\.255/);
+    }
+  });
+
   it("unwraps Null to null", () => {
     const v: WasmValue = { type: "Null" };
     expect(unwrapValue(v)).toBeNull();
