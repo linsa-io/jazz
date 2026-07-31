@@ -1673,6 +1673,41 @@ pub trait Storage {
         Ok(())
     }
 
+    /// Whether the index holds an entry for exactly `(value, row_id)` — a point read on
+    /// the same raw table the scan methods traverse, so it can never disagree with
+    /// them. Powers the incremental index scan's per-row membership checks.
+    fn index_contains(
+        &self,
+        table: &str,
+        column: &str,
+        branch: &str,
+        value: &Value,
+        row_id: ObjectId,
+    ) -> Result<bool, StorageError> {
+        let raw_table = key_codec::index_raw_table(table, column, branch);
+        // Mirror `index_lookup`'s special case: 0.0 and -0.0 encode differently but
+        // compare equal.
+        if is_double_zero(value) {
+            for zero in &[Value::Double(0.0), Value::Double(-0.0)] {
+                let key = match key_codec::index_entry_key(table, column, branch, zero, row_id) {
+                    Ok(key) => key,
+                    Err(StorageError::IndexKeyTooLarge { .. }) => continue,
+                    Err(error) => return Err(error),
+                };
+                if self.raw_table_get(&raw_table, &key)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let key = match key_codec::index_entry_key(table, column, branch, value, row_id) {
+            Ok(key) => key,
+            Err(StorageError::IndexKeyTooLarge { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(self.raw_table_get(&raw_table, &key)?.is_some())
+    }
+
     fn index_lookup(
         &self,
         table: &str,
@@ -2289,6 +2324,17 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         mutations: &[IndexMutation<'_>],
     ) -> Result<(), StorageError> {
         (**self).apply_index_mutations(mutations)
+    }
+
+    fn index_contains(
+        &self,
+        table: &str,
+        column: &str,
+        branch: &str,
+        value: &Value,
+        row_id: ObjectId,
+    ) -> Result<bool, StorageError> {
+        (**self).index_contains(table, column, branch, value, row_id)
     }
 
     fn index_lookup(

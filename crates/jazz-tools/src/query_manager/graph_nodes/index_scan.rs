@@ -29,7 +29,29 @@ pub struct IndexScanNode {
     last_scanned_ids: AHashSet<ObjectId>,
     /// Whether this node needs reprocessing.
     dirty: bool,
+    /// Rows known to have changed since the last scan, delivered by
+    /// [`Self::note_rows_changed`]. When the next settle finds ONLY these (no
+    /// `needs_full`, empty overlay, baseline present), `scan` re-evaluates just these
+    /// rows instead of rescanning the whole index — the full rescan made every
+    /// write-tick cost O(result set) rather than O(delta).
+    pending_changed_rows: AHashSet<ObjectId>,
+    /// Forces the next scan to be a full rescan. Set initially, by any table-level
+    /// dirty, and on pending-set overflow. Deliberately one-directional per cycle:
+    /// row notes never clear it.
+    ///
+    /// Dirty sources that bypass this node entirely (graph-level `mark_all_dirty`,
+    /// direct `mark_dirty(node_id)`, policy graphs) leave `pending_changed_rows`
+    /// empty — and an empty pending set also falls through to the full rescan, so an
+    /// unknown dirty source can never be served a stale incremental no-op.
+    needs_full: bool,
+    /// Whether at least one full scan has completed. Incremental deltas can only be
+    /// applied on top of an exact baseline.
+    has_scanned: bool,
 }
+
+/// Above this many accumulated changed rows a full rescan is cheaper and the set is
+/// dropped. Also bounds the memory a long-unsettled graph can pin.
+const MAX_PENDING_CHANGED_ROWS: usize = 4096;
 
 impl IndexScanNode {
     /// Create a new index scan node.
@@ -52,7 +74,33 @@ impl IndexScanNode {
             current_tuples: AHashSet::new(),
             last_scanned_ids: AHashSet::new(),
             dirty: true,
+            pending_changed_rows: AHashSet::new(),
+            needs_full: true,
+            has_scanned: false,
         }
+    }
+
+    /// Record that exactly `ids` changed in this node's table since the last scan.
+    ///
+    /// Never downgrades a required full rescan: once row information was lost for this
+    /// cycle, only a full rescan restores an exact baseline.
+    pub fn note_rows_changed<'a>(&mut self, ids: impl IntoIterator<Item = &'a ObjectId>) {
+        self.dirty = true;
+        if self.needs_full {
+            return;
+        }
+        self.pending_changed_rows.extend(ids.into_iter().copied());
+        if self.pending_changed_rows.len() > MAX_PENDING_CHANGED_ROWS {
+            self.pending_changed_rows.clear();
+            self.needs_full = true;
+        }
+    }
+
+    /// Record a table-level change with no row information: the next scan is full.
+    pub fn note_table_dirty(&mut self) {
+        self.dirty = true;
+        self.pending_changed_rows.clear();
+        self.needs_full = true;
     }
 
     /// Create a new index scan node on the default "main" branch.
@@ -95,6 +143,88 @@ impl IndexScanNode {
         let column_index = self.row_descriptor.column_index(self.column.as_str())?;
         let values = decode_row(&self.row_descriptor, data).ok()?;
         values.get(column_index).cloned()
+    }
+
+    /// Whether this node's condition admits per-row membership checks against the
+    /// index itself. Only shapes answerable by an exact index-key point read qualify —
+    /// reading the same raw table the full scan traverses is what makes the
+    /// incremental path immune to row-encoding and schema-variant concerns.
+    fn supports_incremental_membership(&self) -> bool {
+        match &self.condition {
+            ScanCondition::Empty | ScanCondition::Eq(_) => true,
+            // An `All` scan over the `_id` index: a row's entry value is its own id.
+            ScanCondition::All => self.column.as_str() == "_id",
+            ScanCondition::Range { .. } => false,
+        }
+    }
+
+    /// Per-row membership straight from the index — the exact raw table the full scan
+    /// reads, via a point read. Only called for conditions where
+    /// [`Self::supports_incremental_membership`] holds.
+    fn index_row_membership(&self, ctx: &SourceContext, row_id: ObjectId) -> bool {
+        match &self.condition {
+            ScanCondition::Empty => false,
+            ScanCondition::Eq(value) => ctx
+                .storage
+                .index_contains(
+                    self.table.as_str(),
+                    self.column.as_str(),
+                    &self.branch,
+                    value,
+                    row_id,
+                )
+                .unwrap_or(false),
+            ScanCondition::All => ctx
+                .storage
+                .index_contains(
+                    self.table.as_str(),
+                    self.column.as_str(),
+                    &self.branch,
+                    &Value::Uuid(row_id),
+                    row_id,
+                )
+                .unwrap_or(false),
+            ScanCondition::Range { .. } => false,
+        }
+    }
+
+    /// The full-scan membership computation, factored out so the incremental path can
+    /// assert parity against it in debug builds.
+    fn full_scan_ids(&self, ctx: &SourceContext) -> AHashSet<ObjectId> {
+        let mut new_ids: AHashSet<ObjectId> = match &self.condition {
+            ScanCondition::Empty => AHashSet::new(),
+            ScanCondition::All => ctx
+                .storage
+                .index_scan_all(self.table.as_str(), self.column.as_str(), &self.branch)
+                .into_iter()
+                .collect(),
+            ScanCondition::Eq(value) => ctx
+                .storage
+                .index_lookup(
+                    self.table.as_str(),
+                    self.column.as_str(),
+                    &self.branch,
+                    value,
+                )
+                .into_iter()
+                .collect(),
+            ScanCondition::Range { min, max } => {
+                let start = min.as_ref();
+                let end = max.as_ref();
+                ctx.storage
+                    .index_range(
+                        self.table.as_str(),
+                        self.column.as_str(),
+                        &self.branch,
+                        start,
+                        end,
+                    )
+                    .into_iter()
+                    .collect()
+            }
+        };
+        self.apply_local_overlay_rows(ctx, &mut new_ids);
+        new_ids
     }
 
     fn apply_local_overlay_rows(&self, ctx: &SourceContext, new_ids: &mut AHashSet<ObjectId>) {
@@ -179,39 +309,81 @@ fn bound_matches(bound: &Bound<Value>, value: &Value, is_lower: bool) -> bool {
 
 impl SourceNode for IndexScanNode {
     fn scan(&mut self, ctx: &SourceContext) -> TupleDelta {
-        let mut new_ids: AHashSet<ObjectId> = match &self.condition {
-            ScanCondition::Empty => AHashSet::new(),
-            ScanCondition::All => ctx
-                .storage
-                .index_scan_all(self.table.as_str(), self.column.as_str(), &self.branch)
-                .into_iter()
-                .collect(),
-            ScanCondition::Eq(value) => ctx
-                .storage
-                .index_lookup(
-                    self.table.as_str(),
-                    self.column.as_str(),
-                    &self.branch,
-                    value,
-                )
-                .into_iter()
-                .collect(),
-            ScanCondition::Range { min, max } => {
-                let start = min.as_ref();
-                let end = max.as_ref();
-                ctx.storage
-                    .index_range(
-                        self.table.as_str(),
-                        self.column.as_str(),
-                        &self.branch,
-                        start,
-                        end,
-                    )
-                    .into_iter()
-                    .collect()
+        // Incremental path: an exact baseline exists, nothing demanded a full rescan,
+        // and this cycle's changes are known row by row. Only while the local overlay
+        // is empty — overlay rows override storage state with an independent
+        // lifecycle, so any overlay presence falls back to the full rescan that
+        // handles it today.
+        let changed = std::mem::take(&mut self.pending_changed_rows);
+        let overlay_is_empty = ctx
+            .local_overlay_rows
+            .map(|rows| rows.is_empty())
+            .unwrap_or(true);
+        if !self.needs_full
+            && self.has_scanned
+            && overlay_is_empty
+            && !changed.is_empty()
+            && self.supports_incremental_membership()
+        {
+            let branch = BranchName::new(&self.branch);
+            let mut added: Vec<ObjectId> = Vec::new();
+            let mut removed: Vec<ObjectId> = Vec::new();
+            for row_id in changed {
+                let is_member = self.index_row_membership(ctx, row_id);
+                let was_member = self.last_scanned_ids.contains(&row_id);
+                match (was_member, is_member) {
+                    (false, true) => {
+                        self.last_scanned_ids.insert(row_id);
+                        self.current_tuples.insert(Tuple::from_scoped_id(row_id, branch));
+                        added.push(row_id);
+                    }
+                    (true, false) => {
+                        self.last_scanned_ids.remove(&row_id);
+                        self.current_tuples
+                            .remove(&Tuple::from_scoped_id(row_id, branch));
+                        removed.push(row_id);
+                    }
+                    _ => {}
+                }
             }
-        };
-        self.apply_local_overlay_rows(ctx, &mut new_ids);
+
+            // Parity harness: in debug builds every incremental result is checked
+            // against the full rescan, so the entire test suite exercises the
+            // equivalence continuously.
+            #[cfg(debug_assertions)]
+            {
+                let full = self.full_scan_ids(ctx);
+                debug_assert_eq!(
+                    full, self.last_scanned_ids,
+                    "incremental index scan diverged from full rescan (table {}, column {}, branch {})",
+                    self.table, self.column, self.branch,
+                );
+            }
+
+            tracing::trace!(
+                table = %self.table,
+                branch = %self.branch,
+                added = added.len(),
+                removed = removed.len(),
+                "IndexScan incremental results"
+            );
+
+            self.dirty = false;
+            return TupleDelta {
+                added: added
+                    .into_iter()
+                    .map(|id| Tuple::from_scoped_id(id, branch))
+                    .collect(),
+                removed: removed
+                    .into_iter()
+                    .map(|id| Tuple::from_scoped_id(id, branch))
+                    .collect(),
+                moved: vec![],
+                updated: vec![],
+            };
+        }
+
+        let new_ids = self.full_scan_ids(ctx);
 
         // Diff against last scan
         let added: Vec<ObjectId> = new_ids
@@ -241,6 +413,8 @@ impl SourceNode for IndexScanNode {
             .map(|&id| Tuple::from_scoped_id(id, branch))
             .collect();
         self.dirty = false;
+        self.has_scanned = true;
+        self.needs_full = false;
 
         TupleDelta {
             added: added

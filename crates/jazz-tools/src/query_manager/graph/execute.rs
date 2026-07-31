@@ -54,9 +54,41 @@ impl QueryGraph {
             .map(|(node_id, _, _)| *node_id)
             .collect();
         for node_id in affected {
+            if let Some(GraphNode::IndexScan(node)) = self.get_node_mut(node_id) {
+                node.note_table_dirty();
+            }
             self.mark_dirty(node_id);
             self.mark_downstream_dirty(node_id);
         }
+    }
+
+    /// Row-precise variant of [`Self::mark_dirty_for_table`]: scans learn exactly
+    /// which rows changed and the next settle re-evaluates only those instead of
+    /// rescanning the whole index. Every non-scan dependent (array subqueries, policy
+    /// filters, magic columns, recursive relations) is dirtied exactly as the
+    /// table-level path does.
+    pub fn mark_rows_changed_for_table(&mut self, table: &str, ids: &AHashSet<ObjectId>) {
+        let affected_index_scans: Vec<NodeId> = self
+            .index_scan_nodes
+            .iter()
+            .filter_map(|(node_id, t, _)| {
+                if t.as_str() == table {
+                    Some(*node_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for node_id in affected_index_scans {
+            if let Some(GraphNode::IndexScan(node)) = self.get_node_mut(node_id) {
+                node.note_rows_changed(ids.iter());
+            }
+            self.mark_dirty(node_id);
+            self.mark_downstream_dirty(node_id);
+        }
+
+        self.mark_table_dependents_dirty(table);
     }
 
     /// Mark all index scan nodes for a table dirty.
@@ -77,9 +109,19 @@ impl QueryGraph {
             .collect();
 
         for node_id in affected_index_scans {
+            if let Some(GraphNode::IndexScan(node)) = self.get_node_mut(node_id) {
+                node.note_table_dirty();
+            }
             self.mark_dirty(node_id);
             self.mark_downstream_dirty(node_id);
         }
+
+        self.mark_table_dependents_dirty(table);
+    }
+
+    /// The non-scan tail shared by [`Self::mark_dirty_for_table`] and
+    /// [`Self::mark_rows_changed_for_table`].
+    fn mark_table_dependents_dirty(&mut self, table: &str) {
         // Mark array subquery nodes whose inner table changed
         // Collect node_ids first to avoid borrow conflict
         let affected_array_subqueries: Vec<NodeId> = self
