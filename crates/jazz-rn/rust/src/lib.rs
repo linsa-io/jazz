@@ -120,6 +120,10 @@ enum FfiJsonValue {
     Timestamp(u64),
     Uuid(ObjectId),
     Bytea(String),
+    /// Index into the sidecar `blobs` argument of the `*_with_blobs` methods. Exists so
+    /// multi-megabyte payloads cross the FFI as raw bytes instead of hex-in-JSON — the
+    /// hex round-trip measured ~0.5 s of JS-thread time per MiB on device.
+    BlobRef(usize),
     Array(Vec<FfiJsonValue>),
     Row(FfiJsonRow),
     Null,
@@ -138,7 +142,7 @@ fn ffi_json_err(message: impl Into<String>) -> JazzRnError {
     }
 }
 
-fn decode_ffi_json_value(value: FfiJsonValue) -> Result<Value, JazzRnError> {
+fn decode_ffi_json_value(value: FfiJsonValue, blobs: &[Vec<u8>]) -> Result<Value, JazzRnError> {
     match value {
         FfiJsonValue::Integer(value) => Ok(Value::Integer(value)),
         FfiJsonValue::BigInt(value) => Ok(Value::BigInt(value)),
@@ -150,27 +154,101 @@ fn decode_ffi_json_value(value: FfiJsonValue) -> Result<Value, JazzRnError> {
         FfiJsonValue::Bytea(value) => hex::decode(value)
             .map(Value::Bytea)
             .map_err(|error| ffi_json_err(format!("invalid Bytea hex payload: {error}"))),
+        // Clone, not take: the originals stay untouched in `blobs` so the return path can
+        // recognize them by content and echo a BlobRef instead of the bytes.
+        FfiJsonValue::BlobRef(index) => blobs
+            .get(index)
+            .cloned()
+            .map(Value::Bytea)
+            .ok_or_else(|| {
+                ffi_json_err(format!(
+                    "BlobRef {index} out of range: {} blob(s) provided",
+                    blobs.len()
+                ))
+            }),
         FfiJsonValue::Array(values) => values
             .into_iter()
-            .map(decode_ffi_json_value)
+            .map(|value| decode_ffi_json_value(value, blobs))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
         FfiJsonValue::Row(row) => row
             .values
             .into_iter()
-            .map(decode_ffi_json_value)
+            .map(|value| decode_ffi_json_value(value, blobs))
             .collect::<Result<Vec<_>, _>>()
             .map(|values| Value::Row { id: row.id, values }),
         FfiJsonValue::Null => Ok(Value::Null),
     }
 }
 
-fn decode_ffi_json_record(values_json: &str) -> Result<HashMap<String, Value>, JazzRnError> {
+fn decode_ffi_json_record_with_blobs(
+    values_json: &str,
+    blobs: &[Vec<u8>],
+) -> Result<HashMap<String, Value>, JazzRnError> {
     let values: HashMap<String, FfiJsonValue> =
         serde_json::from_str(values_json).map_err(json_err)?;
     values
         .into_iter()
-        .map(|(key, value)| decode_ffi_json_value(value).map(|value| (key, value)))
+        .map(|(key, value)| decode_ffi_json_value(value, blobs).map(|value| (key, value)))
+        .collect()
+}
+
+fn decode_ffi_json_record(values_json: &str) -> Result<HashMap<String, Value>, JazzRnError> {
+    decode_ffi_json_record_with_blobs(values_json, &[])
+}
+
+/// Serialize returned row values for a `*_with_blobs` call. Bytea payloads that are
+/// byte-identical to an input blob come back as `BlobRef` so the megabyte the caller just
+/// handed over is never re-encoded and re-parsed; any other Bytea (possible on restore,
+/// which can resurrect columns absent from the input) is hex, which the adapter's decoder
+/// understands. Non-Bytea values serialize exactly as the legacy methods do, via
+/// `Value`'s own human-readable serde.
+fn encode_return_value_with_blob_refs(value: &Value, blobs: &[Vec<u8>]) -> serde_json::Value {
+    match value {
+        Value::Bytea(bytes) => {
+            let matched = blobs
+                .iter()
+                .position(|blob| blob.len() == bytes.len() && blob == bytes);
+            match matched {
+                Some(index) => serde_json::json!({ "type": "BlobRef", "value": index }),
+                None => serde_json::json!({ "type": "Bytea", "value": hex::encode(bytes) }),
+            }
+        }
+        Value::Array(values) => serde_json::json!({
+            "type": "Array",
+            "value": values
+                .iter()
+                .map(|value| encode_return_value_with_blob_refs(value, blobs))
+                .collect::<Vec<_>>(),
+        }),
+        Value::Row { id, values } => {
+            let mut row = serde_json::Map::new();
+            if let Some(id) = id {
+                row.insert("id".into(), serde_json::json!(id));
+            }
+            row.insert(
+                "values".into(),
+                serde_json::Value::Array(
+                    values
+                        .iter()
+                        .map(|value| encode_return_value_with_blob_refs(value, blobs))
+                        .collect(),
+                ),
+            );
+            serde_json::json!({ "type": "Row", "value": row })
+        }
+        other => serde_json::to_value(other)
+            .expect("scalar Value serialization to JSON cannot fail"),
+    }
+}
+
+fn encode_return_values_with_blob_refs(
+    values: &[Value],
+    blobs: &[Vec<u8>],
+) -> Vec<serde_json::Value> {
+    values
+        .iter()
+        .map(|value| encode_return_value_with_blob_refs(value, blobs))
         .collect()
 }
 
@@ -630,6 +708,139 @@ impl RnRuntime {
         })
     }
 
+    /// `insert` with Bytea payloads passed as raw bytes instead of hex-in-JSON.
+    ///
+    /// `values_json` refers to entries of `blobs` via `{"type":"BlobRef","value":<idx>}`.
+    /// The returned row encodes any Bytea that is byte-identical to an input blob as the
+    /// same `BlobRef`, so a megabyte chunk is neither hex-encoded on the way in nor
+    /// serialized back on the way out. See `FfiJsonValue::BlobRef`.
+    pub fn insert_with_blobs(
+        &self,
+        table: String,
+        values_json: String,
+        blobs: Vec<Vec<u8>>,
+        write_context_json: Option<String>,
+        object_id: Option<String>,
+    ) -> Result<String, JazzRnError> {
+        with_panic_boundary("insert_with_blobs", || {
+            let named_values = decode_ffi_json_record_with_blobs(&values_json, &blobs)?;
+            let write_context = parse_write_context(write_context_json)?;
+            let object_id = parse_external_object_id(object_id.as_deref())
+                .map_err(|message| JazzRnError::InvalidUuid { message })?;
+            let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {
+                message: "lock poisoned".into(),
+            })?;
+            let ((id, row_values), batch_id) = core
+                .insert_with_id(&table, named_values, object_id, write_context.as_ref())
+                .map_err(runtime_err)?;
+            serde_json::to_string(&serde_json::json!({
+                "id": id.uuid().to_string(),
+                "values": encode_return_values_with_blob_refs(&row_values, &blobs),
+                "batchId": batch_id.to_string(),
+            }))
+            .map_err(|e| JazzRnError::Internal {
+                message: format!("insert_with_blobs serialization failed: {e}"),
+            })
+        })
+    }
+
+    /// `restore` with Bytea payloads passed as raw bytes. See [`Self::insert_with_blobs`].
+    pub fn restore_with_blobs(
+        &self,
+        table: String,
+        object_id: String,
+        values_json: String,
+        blobs: Vec<Vec<u8>>,
+        write_context_json: Option<String>,
+    ) -> Result<String, JazzRnError> {
+        with_panic_boundary("restore_with_blobs", || {
+            let uuid = uuid::Uuid::parse_str(&object_id).map_err(|e| JazzRnError::InvalidUuid {
+                message: e.to_string(),
+            })?;
+            let oid = ObjectId::from_uuid(uuid);
+            let named_values = decode_ffi_json_record_with_blobs(&values_json, &blobs)?;
+            let write_context = parse_write_context(write_context_json)?;
+            let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {
+                message: "lock poisoned".into(),
+            })?;
+            let ((id, row_values), batch_id) = core
+                .restore(&table, oid, named_values, write_context.as_ref())
+                .map_err(runtime_err)?;
+            serde_json::to_string(&serde_json::json!({
+                "id": id.uuid().to_string(),
+                "values": encode_return_values_with_blob_refs(&row_values, &blobs),
+                "batchId": batch_id.to_string(),
+            }))
+            .map_err(|e| JazzRnError::Internal {
+                message: format!("restore_with_blobs serialization failed: {e}"),
+            })
+        })
+    }
+
+    /// `update` with Bytea payloads passed as raw bytes. See [`Self::insert_with_blobs`].
+    pub fn update_with_blobs(
+        &self,
+        object_id: String,
+        values_json: String,
+        blobs: Vec<Vec<u8>>,
+        write_context_json: Option<String>,
+    ) -> Result<String, JazzRnError> {
+        with_panic_boundary("update_with_blobs", || {
+            let uuid = uuid::Uuid::parse_str(&object_id).map_err(|e| JazzRnError::InvalidUuid {
+                message: e.to_string(),
+            })?;
+            let oid = ObjectId::from_uuid(uuid);
+            let updates: Vec<(String, Value)> =
+                decode_ffi_json_record_with_blobs(&values_json, &blobs)?
+                    .into_iter()
+                    .collect();
+            let write_context = parse_write_context(write_context_json)?;
+            let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {
+                message: "lock poisoned".into(),
+            })?;
+            let batch_id = core
+                .update(oid, updates, write_context.as_ref())
+                .map_err(runtime_err)?;
+            serde_json::to_string(&serde_json::json!({
+                "batchId": batch_id.to_string(),
+            }))
+            .map_err(|e| JazzRnError::Internal {
+                message: format!("update_with_blobs serialization failed: {e}"),
+            })
+        })
+    }
+
+    /// `upsert` with Bytea payloads passed as raw bytes. See [`Self::insert_with_blobs`].
+    pub fn upsert_with_blobs(
+        &self,
+        table: String,
+        object_id: String,
+        values_json: String,
+        blobs: Vec<Vec<u8>>,
+        write_context_json: Option<String>,
+    ) -> Result<String, JazzRnError> {
+        with_panic_boundary("upsert_with_blobs", || {
+            let uuid = uuid::Uuid::parse_str(&object_id).map_err(|e| JazzRnError::InvalidUuid {
+                message: e.to_string(),
+            })?;
+            let oid = ObjectId::from_uuid(uuid);
+            let named_values = decode_ffi_json_record_with_blobs(&values_json, &blobs)?;
+            let write_context = parse_write_context(write_context_json)?;
+            let mut core = self.core.lock().map_err(|_| JazzRnError::Internal {
+                message: "lock poisoned".into(),
+            })?;
+            let batch_id = core
+                .upsert(&table, oid, named_values, write_context.as_ref())
+                .map_err(runtime_err)?;
+            serde_json::to_string(&serde_json::json!({
+                "batchId": batch_id.to_string(),
+            }))
+            .map_err(|e| JazzRnError::Internal {
+                message: format!("upsert_with_blobs serialization failed: {e}"),
+            })
+        })
+    }
+
     pub fn restore(
         &self,
         table: String,
@@ -1077,6 +1288,94 @@ struct RnTickNotifier {
 impl jazz_tools::transport_manager::TickNotifier for RnTickNotifier {
     fn notify(&self) {
         self.scheduler.schedule_batched_tick();
+    }
+}
+
+#[cfg(test)]
+mod blob_codec_tests {
+    use super::*;
+
+    fn record(json: &str, blobs: &[Vec<u8>]) -> HashMap<String, Value> {
+        decode_ffi_json_record_with_blobs(json, blobs).expect("record should decode")
+    }
+
+    #[test]
+    fn blob_ref_decodes_to_the_referenced_bytes() {
+        let blobs = vec![vec![1u8, 2, 3], vec![0xff; 4]];
+        let values = record(
+            r#"{"a":{"type":"BlobRef","value":0},"b":{"type":"BlobRef","value":1}}"#,
+            &blobs,
+        );
+        assert_eq!(values["a"], Value::Bytea(vec![1, 2, 3]));
+        assert_eq!(values["b"], Value::Bytea(vec![0xff; 4]));
+    }
+
+    #[test]
+    fn blob_ref_decodes_inside_nested_arrays() {
+        let blobs = vec![vec![7u8, 8]];
+        let values = record(
+            r#"{"a":{"type":"Array","value":[{"type":"BlobRef","value":0}]}}"#,
+            &blobs,
+        );
+        assert_eq!(values["a"], Value::Array(vec![Value::Bytea(vec![7, 8])]));
+    }
+
+    #[test]
+    fn blob_ref_out_of_range_is_an_error() {
+        let result = decode_ffi_json_record_with_blobs(
+            r#"{"a":{"type":"BlobRef","value":1}}"#,
+            &[vec![1u8]],
+        );
+        assert!(matches!(result, Err(JazzRnError::InvalidJson { .. })));
+    }
+
+    #[test]
+    fn hex_bytea_still_decodes_alongside_blob_refs() {
+        let values = record(r#"{"a":{"type":"Bytea","value":"0aff"}}"#, &[]);
+        assert_eq!(values["a"], Value::Bytea(vec![0x0a, 0xff]));
+    }
+
+    #[test]
+    fn legacy_record_decoder_rejects_blob_refs() {
+        let result = decode_ffi_json_record(r#"{"a":{"type":"BlobRef","value":0}}"#);
+        assert!(matches!(result, Err(JazzRnError::InvalidJson { .. })));
+    }
+
+    #[test]
+    fn return_encoding_swaps_matching_bytes_for_blob_refs() {
+        let blobs = vec![vec![9u8; 16]];
+        let encoded = encode_return_value_with_blob_refs(&Value::Bytea(vec![9u8; 16]), &blobs);
+        assert_eq!(encoded, serde_json::json!({"type": "BlobRef", "value": 0}));
+    }
+
+    #[test]
+    fn return_encoding_falls_back_to_hex_for_unknown_bytes() {
+        let blobs = vec![vec![9u8; 16]];
+        let encoded = encode_return_value_with_blob_refs(&Value::Bytea(vec![1u8, 2]), &blobs);
+        assert_eq!(encoded, serde_json::json!({"type": "Bytea", "value": "0102"}));
+    }
+
+    #[test]
+    fn return_encoding_matches_legacy_serde_for_non_bytea_values() {
+        // The adapter parses both legacy and blob returns with the same decoder, so every
+        // non-Bytea value must keep the exact legacy wire shape.
+        let samples = vec![
+            Value::Integer(41),
+            Value::Text("hello".into()),
+            Value::Timestamp(1_700_000_000_000),
+            Value::Boolean(true),
+            Value::Null,
+            Value::Array(vec![Value::Integer(1), Value::Text("x".into())]),
+            Value::Row {
+                id: None,
+                values: vec![Value::Integer(5)],
+            },
+        ];
+        for value in samples {
+            let legacy = serde_json::to_value(&value).expect("legacy serialization");
+            let with_blobs = encode_return_value_with_blob_refs(&value, &[]);
+            assert_eq!(with_blobs, legacy, "shape diverged for {value:?}");
+        }
     }
 }
 

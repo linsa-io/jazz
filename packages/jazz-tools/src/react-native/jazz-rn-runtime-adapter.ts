@@ -6,7 +6,11 @@ import type {
   MutationErrorEvent,
   Runtime,
 } from "../runtime/client.js";
-import { encodeFFIRecordToJson } from "../runtime/ffi-value.js";
+import {
+  encodeFFIRecordToJson,
+  encodeFFIRecordWithBlobs,
+  resolveReturnedFFIValuesWithBlobs,
+} from "../runtime/ffi-value.js";
 
 export type JazzRnErrorTag =
   | "InvalidJson"
@@ -48,6 +52,38 @@ export interface JazzRnRuntimeBinding {
     valuesJson: string,
     writeContextJson: string | undefined,
   ): string;
+  // Blob-sidecar variants: Bytea crosses the FFI as raw buffers referenced from the JSON
+  // by `BlobRef` markers, skipping the hex round-trip. Optional because an older jazz-rn
+  // may not have them — the adapter feature-detects and falls back to the hex methods.
+  // ArrayBuffer, not Uint8Array: uniffi-bindgen-react-native's bytes converter is
+  // FfiConverterArrayBuffer.
+  insertWithBlobs?(
+    table: string,
+    valuesJson: string,
+    blobs: ArrayBuffer[],
+    writeContextJson: string | undefined,
+    objectId: string | undefined,
+  ): string;
+  restoreWithBlobs?(
+    table: string,
+    objectId: string,
+    valuesJson: string,
+    blobs: ArrayBuffer[],
+    writeContextJson: string | undefined,
+  ): string;
+  updateWithBlobs?(
+    objectId: string,
+    valuesJson: string,
+    blobs: ArrayBuffer[],
+    writeContextJson: string | undefined,
+  ): string;
+  upsertWithBlobs?(
+    table: string,
+    objectId: string,
+    valuesJson: string,
+    blobs: ArrayBuffer[],
+    writeContextJson: string | undefined,
+  ): string;
   beginBatch(batchMode: BatchMode): string;
   rollbackBatch(batchId: string): boolean;
   waitForBatch(batchId: string, tier: string): Promise<void>;
@@ -75,6 +111,18 @@ export interface JazzRnRuntimeBinding {
   update(objectId: string, valuesJson: string, writeContextJson: string | undefined): string;
   commitBatch(batchId: string): void;
   uniffiDestroy?(): void;
+}
+
+/**
+ * The uniffi bytes converter takes ArrayBuffers. A full-view Uint8Array hands over its
+ * buffer without copying; a partial view (offset or shorter than its buffer) must be
+ * sliced, otherwise bytes outside the view would leak across the FFI.
+ */
+function blobArrayBuffer(blob: Uint8Array): ArrayBuffer {
+  if (blob.byteOffset === 0 && blob.byteLength === blob.buffer.byteLength) {
+    return blob.buffer as ArrayBuffer;
+  }
+  return blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength) as ArrayBuffer;
 }
 
 function swallowCallbackError(context: string, error: unknown): void {
@@ -181,6 +229,19 @@ export class JazzRnRuntimeAdapter implements Runtime {
     object_id?: string | null,
   ): DirectInsertResult {
     try {
+      if (this.binding.insertWithBlobs !== undefined) {
+        const { json, blobs } = encodeFFIRecordWithBlobs(values);
+        const rowJson = this.binding.insertWithBlobs(
+          table,
+          json,
+          blobs.map(blobArrayBuffer),
+          write_context_json ?? undefined,
+          object_id ?? undefined,
+        );
+        const row = JSON.parse(rowJson) as DirectInsertResult;
+        resolveReturnedFFIValuesWithBlobs(row.values as unknown[], blobs);
+        return row;
+      }
       const rowJson = this.binding.insert(
         table,
         encodeFFIRecordToJson(values),
@@ -200,6 +261,19 @@ export class JazzRnRuntimeAdapter implements Runtime {
     write_context_json?: string | null,
   ): DirectInsertResult {
     try {
+      if (this.binding.restoreWithBlobs !== undefined) {
+        const { json, blobs } = encodeFFIRecordWithBlobs(values);
+        const rowJson = this.binding.restoreWithBlobs(
+          table,
+          object_id,
+          json,
+          blobs.map(blobArrayBuffer),
+          write_context_json ?? undefined,
+        );
+        const row = JSON.parse(rowJson) as DirectInsertResult;
+        resolveReturnedFFIValuesWithBlobs(row.values as unknown[], blobs);
+        return row;
+      }
       const rowJson = this.binding.restore(
         table,
         object_id,
@@ -218,6 +292,16 @@ export class JazzRnRuntimeAdapter implements Runtime {
     write_context_json?: string | null,
   ): DirectMutationResult {
     try {
+      if (this.binding.updateWithBlobs !== undefined) {
+        const { json, blobs } = encodeFFIRecordWithBlobs(values);
+        const resultJson = this.binding.updateWithBlobs(
+          object_id,
+          json,
+          blobs.map(blobArrayBuffer),
+          write_context_json ?? undefined,
+        );
+        return JSON.parse(resultJson) as DirectMutationResult;
+      }
       const resultJson = this.binding.update(
         object_id,
         encodeFFIRecordToJson(values),
@@ -236,6 +320,17 @@ export class JazzRnRuntimeAdapter implements Runtime {
     write_context_json?: string | null,
   ): DirectMutationResult {
     try {
+      if (this.binding.upsertWithBlobs !== undefined) {
+        const { json, blobs } = encodeFFIRecordWithBlobs(values);
+        const resultJson = this.binding.upsertWithBlobs(
+          table,
+          object_id,
+          json,
+          blobs.map(blobArrayBuffer),
+          write_context_json ?? undefined,
+        );
+        return JSON.parse(resultJson) as DirectMutationResult;
+      }
       const resultJson = this.binding.upsert(
         table,
         object_id,

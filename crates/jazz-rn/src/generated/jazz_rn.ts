@@ -46,6 +46,8 @@ import {
   type UniffiReferenceHolder,
   type UniffiRustCallStatus,
   AbstractFfiConverterByteArray,
+  FfiConverterArray,
+  FfiConverterArrayBuffer,
   FfiConverterBool,
   FfiConverterCallback,
   FfiConverterInt32,
@@ -790,6 +792,21 @@ export interface RnRuntimeInterface {
     objectId: string | undefined
   ) /*throws*/ : string;
   /**
+   * `insert` with Bytea payloads passed as raw bytes instead of hex-in-JSON.
+   *
+   * `values_json` refers to entries of `blobs` via `{"type":"BlobRef","value":<idx>}`.
+   * The returned row encodes any Bytea that is byte-identical to an input blob as the
+   * same `BlobRef`, so a megabyte chunk is neither hex-encoded on the way in nor
+   * serialized back on the way out. See `FfiJsonValue::BlobRef`.
+   */
+  insertWithBlobs(
+    table: string,
+    valuesJson: string,
+    blobs: Array<ArrayBuffer>,
+    writeContextJson: string | undefined,
+    objectId: string | undefined
+  ) /*throws*/ : string;
+  /**
    * Register a callback that fires when the transport receives an auth
    * rejection from the server during the WS handshake.
    */
@@ -824,6 +841,16 @@ export interface RnRuntimeInterface {
     valuesJson: string,
     writeContextJson: string | undefined
   ) /*throws*/ : string;
+  /**
+   * `restore` with Bytea payloads passed as raw bytes. See [`Self::insert_with_blobs`].
+   */
+  restoreWithBlobs(
+    table: string,
+    objectId: string,
+    valuesJson: string,
+    blobs: Array<ArrayBuffer>,
+    writeContextJson: string | undefined
+  ) /*throws*/ : string;
   rollbackBatch(batchId: string) /*throws*/ : boolean;
   unsubscribe(handle: /*u64*/ bigint) /*throws*/ : void;
   update(
@@ -835,10 +862,29 @@ export interface RnRuntimeInterface {
    * Push updated auth credentials into the live transport.
    */
   updateAuth(authJson: string) /*throws*/ : void;
+  /**
+   * `update` with Bytea payloads passed as raw bytes. See [`Self::insert_with_blobs`].
+   */
+  updateWithBlobs(
+    objectId: string,
+    valuesJson: string,
+    blobs: Array<ArrayBuffer>,
+    writeContextJson: string | undefined
+  ) /*throws*/ : string;
   upsert(
     table: string,
     objectId: string,
     valuesJson: string,
+    writeContextJson: string | undefined
+  ) /*throws*/ : string;
+  /**
+   * `upsert` with Bytea payloads passed as raw bytes. See [`Self::insert_with_blobs`].
+   */
+  upsertWithBlobs(
+    table: string,
+    objectId: string,
+    valuesJson: string,
+    blobs: Array<ArrayBuffer>,
     writeContextJson: string | undefined
   ) /*throws*/ : string;
   /**
@@ -1113,6 +1159,42 @@ export class RnRuntime
   }
 
   /**
+   * `insert` with Bytea payloads passed as raw bytes instead of hex-in-JSON.
+   *
+   * `values_json` refers to entries of `blobs` via `{"type":"BlobRef","value":<idx>}`.
+   * The returned row encodes any Bytea that is byte-identical to an input blob as the
+   * same `BlobRef`, so a megabyte chunk is neither hex-encoded on the way in nor
+   * serialized back on the way out. See `FfiJsonValue::BlobRef`.
+   */
+  insertWithBlobs(
+    table: string,
+    valuesJson: string,
+    blobs: Array<ArrayBuffer>,
+    writeContextJson: string | undefined,
+    objectId: string | undefined
+  ): string /*throws*/ {
+    return FfiConverterString.lift(
+      uniffiCaller.rustCallWithError(
+        /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+          FfiConverterTypeJazzRnError
+        ),
+        /*caller:*/ (callStatus) => {
+          return nativeModule().ubrn_uniffi_jazz_rn_fn_method_rnruntime_insert_with_blobs(
+            uniffiTypeRnRuntimeObjectFactory.clonePointer(this),
+            FfiConverterString.lower(table),
+            FfiConverterString.lower(valuesJson),
+            FfiConverterArrayArrayBuffer.lower(blobs),
+            FfiConverterOptionalString.lower(writeContextJson),
+            FfiConverterOptionalString.lower(objectId),
+            callStatus
+          );
+        },
+        /*liftString:*/ FfiConverterString.lift
+      )
+    );
+  }
+
+  /**
    * Register a callback that fires when the transport receives an auth
    * rejection from the server during the WS handshake.
    */
@@ -1248,6 +1330,37 @@ export class RnRuntime
     );
   }
 
+  /**
+   * `restore` with Bytea payloads passed as raw bytes. See [`Self::insert_with_blobs`].
+   */
+  restoreWithBlobs(
+    table: string,
+    objectId: string,
+    valuesJson: string,
+    blobs: Array<ArrayBuffer>,
+    writeContextJson: string | undefined
+  ): string /*throws*/ {
+    return FfiConverterString.lift(
+      uniffiCaller.rustCallWithError(
+        /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+          FfiConverterTypeJazzRnError
+        ),
+        /*caller:*/ (callStatus) => {
+          return nativeModule().ubrn_uniffi_jazz_rn_fn_method_rnruntime_restore_with_blobs(
+            uniffiTypeRnRuntimeObjectFactory.clonePointer(this),
+            FfiConverterString.lower(table),
+            FfiConverterString.lower(objectId),
+            FfiConverterString.lower(valuesJson),
+            FfiConverterArrayArrayBuffer.lower(blobs),
+            FfiConverterOptionalString.lower(writeContextJson),
+            callStatus
+          );
+        },
+        /*liftString:*/ FfiConverterString.lift
+      )
+    );
+  }
+
   rollbackBatch(batchId: string): boolean /*throws*/ {
     return FfiConverterBool.lift(
       uniffiCaller.rustCallWithError(
@@ -1325,6 +1438,35 @@ export class RnRuntime
     );
   }
 
+  /**
+   * `update` with Bytea payloads passed as raw bytes. See [`Self::insert_with_blobs`].
+   */
+  updateWithBlobs(
+    objectId: string,
+    valuesJson: string,
+    blobs: Array<ArrayBuffer>,
+    writeContextJson: string | undefined
+  ): string /*throws*/ {
+    return FfiConverterString.lift(
+      uniffiCaller.rustCallWithError(
+        /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+          FfiConverterTypeJazzRnError
+        ),
+        /*caller:*/ (callStatus) => {
+          return nativeModule().ubrn_uniffi_jazz_rn_fn_method_rnruntime_update_with_blobs(
+            uniffiTypeRnRuntimeObjectFactory.clonePointer(this),
+            FfiConverterString.lower(objectId),
+            FfiConverterString.lower(valuesJson),
+            FfiConverterArrayArrayBuffer.lower(blobs),
+            FfiConverterOptionalString.lower(writeContextJson),
+            callStatus
+          );
+        },
+        /*liftString:*/ FfiConverterString.lift
+      )
+    );
+  }
+
   upsert(
     table: string,
     objectId: string,
@@ -1342,6 +1484,37 @@ export class RnRuntime
             FfiConverterString.lower(table),
             FfiConverterString.lower(objectId),
             FfiConverterString.lower(valuesJson),
+            FfiConverterOptionalString.lower(writeContextJson),
+            callStatus
+          );
+        },
+        /*liftString:*/ FfiConverterString.lift
+      )
+    );
+  }
+
+  /**
+   * `upsert` with Bytea payloads passed as raw bytes. See [`Self::insert_with_blobs`].
+   */
+  upsertWithBlobs(
+    table: string,
+    objectId: string,
+    valuesJson: string,
+    blobs: Array<ArrayBuffer>,
+    writeContextJson: string | undefined
+  ): string /*throws*/ {
+    return FfiConverterString.lift(
+      uniffiCaller.rustCallWithError(
+        /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+          FfiConverterTypeJazzRnError
+        ),
+        /*caller:*/ (callStatus) => {
+          return nativeModule().ubrn_uniffi_jazz_rn_fn_method_rnruntime_upsert_with_blobs(
+            uniffiTypeRnRuntimeObjectFactory.clonePointer(this),
+            FfiConverterString.lower(table),
+            FfiConverterString.lower(objectId),
+            FfiConverterString.lower(valuesJson),
+            FfiConverterArrayArrayBuffer.lower(blobs),
             FfiConverterOptionalString.lower(writeContextJson),
             callStatus
           );
@@ -1485,6 +1658,11 @@ const FfiConverterOptionalTypeBatchedTickCallback = new FfiConverterOptional(
 // FfiConverter for string | undefined
 const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 
+// FfiConverter for Array<ArrayBuffer>
+const FfiConverterArrayArrayBuffer = new FfiConverterArray(
+  FfiConverterArrayBuffer
+);
+
 /**
  * This should be called before anything else.
  *
@@ -1612,6 +1790,14 @@ function uniffiEnsureInitialized() {
     );
   }
   if (
+    nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_insert_with_blobs() !==
+    16759
+  ) {
+    throw new UniffiInternalError.ApiChecksumMismatch(
+      'uniffi_jazz_rn_checksum_method_rnruntime_insert_with_blobs'
+    );
+  }
+  if (
     nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_on_auth_failure() !==
     50366
   ) {
@@ -1652,6 +1838,14 @@ function uniffiEnsureInitialized() {
     );
   }
   if (
+    nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_restore_with_blobs() !==
+    13623
+  ) {
+    throw new UniffiInternalError.ApiChecksumMismatch(
+      'uniffi_jazz_rn_checksum_method_rnruntime_restore_with_blobs'
+    );
+  }
+  if (
     nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_rollback_batch() !==
     18093
   ) {
@@ -1684,11 +1878,27 @@ function uniffiEnsureInitialized() {
     );
   }
   if (
+    nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_update_with_blobs() !==
+    24341
+  ) {
+    throw new UniffiInternalError.ApiChecksumMismatch(
+      'uniffi_jazz_rn_checksum_method_rnruntime_update_with_blobs'
+    );
+  }
+  if (
     nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_upsert() !==
     13386
   ) {
     throw new UniffiInternalError.ApiChecksumMismatch(
       'uniffi_jazz_rn_checksum_method_rnruntime_upsert'
+    );
+  }
+  if (
+    nativeModule().ubrn_uniffi_jazz_rn_checksum_method_rnruntime_upsert_with_blobs() !==
+    3830
+  ) {
+    throw new UniffiInternalError.ApiChecksumMismatch(
+      'uniffi_jazz_rn_checksum_method_rnruntime_upsert_with_blobs'
     );
   }
   if (

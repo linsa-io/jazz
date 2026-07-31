@@ -103,6 +103,15 @@ interface NativeModuleInterface {
     objectId: Uint8Array,
     uniffi_out_err: UniffiRustCallStatus
   ): Uint8Array;
+  ubrn_uniffi_jazz_rn_fn_method_rnruntime_insert_with_blobs(
+    ptr: bigint,
+    table: Uint8Array,
+    valuesJson: Uint8Array,
+    blobs: Uint8Array,
+    writeContextJson: Uint8Array,
+    objectId: Uint8Array,
+    uniffi_out_err: UniffiRustCallStatus
+  ): Uint8Array;
   ubrn_uniffi_jazz_rn_fn_method_rnruntime_on_auth_failure(
     ptr: bigint,
     callback: bigint,
@@ -133,6 +142,15 @@ interface NativeModuleInterface {
     writeContextJson: Uint8Array,
     uniffi_out_err: UniffiRustCallStatus
   ): Uint8Array;
+  ubrn_uniffi_jazz_rn_fn_method_rnruntime_restore_with_blobs(
+    ptr: bigint,
+    table: Uint8Array,
+    objectId: Uint8Array,
+    valuesJson: Uint8Array,
+    blobs: Uint8Array,
+    writeContextJson: Uint8Array,
+    uniffi_out_err: UniffiRustCallStatus
+  ): Uint8Array;
   ubrn_uniffi_jazz_rn_fn_method_rnruntime_rollback_batch(
     ptr: bigint,
     batchId: Uint8Array,
@@ -155,11 +173,28 @@ interface NativeModuleInterface {
     authJson: Uint8Array,
     uniffi_out_err: UniffiRustCallStatus
   ): void;
+  ubrn_uniffi_jazz_rn_fn_method_rnruntime_update_with_blobs(
+    ptr: bigint,
+    objectId: Uint8Array,
+    valuesJson: Uint8Array,
+    blobs: Uint8Array,
+    writeContextJson: Uint8Array,
+    uniffi_out_err: UniffiRustCallStatus
+  ): Uint8Array;
   ubrn_uniffi_jazz_rn_fn_method_rnruntime_upsert(
     ptr: bigint,
     table: Uint8Array,
     objectId: Uint8Array,
     valuesJson: Uint8Array,
+    writeContextJson: Uint8Array,
+    uniffi_out_err: UniffiRustCallStatus
+  ): Uint8Array;
+  ubrn_uniffi_jazz_rn_fn_method_rnruntime_upsert_with_blobs(
+    ptr: bigint,
+    table: Uint8Array,
+    objectId: Uint8Array,
+    valuesJson: Uint8Array,
+    blobs: Uint8Array,
     writeContextJson: Uint8Array,
     uniffi_out_err: UniffiRustCallStatus
   ): Uint8Array;
@@ -337,16 +372,20 @@ interface NativeModuleInterface {
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_execute_subscription(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_get_schema_hash(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_insert(): number;
+  ubrn_uniffi_jazz_rn_checksum_method_rnruntime_insert_with_blobs(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_on_auth_failure(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_on_batched_tick_needed(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_on_mutation_error(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_query(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_restore(): number;
+  ubrn_uniffi_jazz_rn_checksum_method_rnruntime_restore_with_blobs(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_rollback_batch(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_unsubscribe(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_update(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_update_auth(): number;
+  ubrn_uniffi_jazz_rn_checksum_method_rnruntime_update_with_blobs(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_upsert(): number;
+  ubrn_uniffi_jazz_rn_checksum_method_rnruntime_upsert_with_blobs(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_wait_for_batch(): number;
   ubrn_uniffi_jazz_rn_checksum_constructor_rnruntime_new(): number;
   ubrn_uniffi_jazz_rn_checksum_method_authfailurecallback_on_failure(): number;

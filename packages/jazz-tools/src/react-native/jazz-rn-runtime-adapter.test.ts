@@ -156,6 +156,135 @@ describe("JazzRnRuntimeAdapter", () => {
     );
   });
 
+  it("routes inserts through the blob sidecar when the binding supports it", () => {
+    const payload = new Uint8Array(1024).fill(0xab);
+    const insertWithBlobs = vi.fn((_table, valuesJson, _blobs, _wc, _oid) => {
+      expect(JSON.parse(valuesJson)).toEqual({
+        idx: { type: "Integer", value: 3 },
+        data: { type: "BlobRef", value: 0 },
+      });
+      return JSON.stringify({
+        id: "row-1",
+        values: [
+          { type: "Integer", value: 3 },
+          { type: "BlobRef", value: 0 },
+        ],
+        batchId: "batch-1",
+      });
+    });
+    const binding = createBinding({ insertWithBlobs });
+    const adapter = new JazzRnRuntimeAdapter(binding, {});
+
+    const row = adapter.insert("file_parts", {
+      idx: { type: "Integer", value: 3 },
+      data: { type: "Bytea", value: payload },
+    });
+
+    expect(insertWithBlobs).toHaveBeenCalledTimes(1);
+    expect(binding.insert).not.toHaveBeenCalled();
+    // The blob crosses as the very same underlying buffer — no copies, no hex.
+    const sentBlobs = insertWithBlobs.mock.calls[0]![2] as ArrayBuffer[];
+    expect(sentBlobs).toHaveLength(1);
+    expect(sentBlobs[0]).toBe(payload.buffer);
+    // And the echoed BlobRef resolves back to the original Uint8Array.
+    expect(row.values[1]).toEqual({ type: "Bytea", value: payload });
+    expect((row.values[1] as { value: Uint8Array }).value).toBe(payload);
+  });
+
+  it("slices partial Uint8Array views instead of leaking their whole buffer", () => {
+    const backing = new Uint8Array([1, 2, 3, 4, 5, 6]);
+    const view = backing.subarray(2, 5);
+    const insertWithBlobs = vi.fn(
+      (_table: string, _valuesJson: string, _blobs: ArrayBuffer[], _wc?: string, _oid?: string) =>
+        JSON.stringify({ id: "row-1", values: [], batchId: "batch-1" }),
+    );
+    const binding = createBinding({ insertWithBlobs });
+    const adapter = new JazzRnRuntimeAdapter(binding, {});
+
+    adapter.insert("files", { data: { type: "Bytea", value: view } });
+
+    const sent = insertWithBlobs.mock.calls[0]![2] as unknown as ArrayBuffer[];
+    expect(sent[0]!.byteLength).toBe(3);
+    expect(Array.from(new Uint8Array(sent[0]!))).toEqual([3, 4, 5]);
+    expect(sent[0]).not.toBe(backing.buffer);
+  });
+
+  it("indexes multiple blobs in traversal order, including nested ones", () => {
+    const a = new Uint8Array([1]);
+    const b = new Uint8Array([2, 2]);
+    const insertWithBlobs = vi.fn(
+      (_table: string, valuesJson: string, _blobs: ArrayBuffer[], _wc?: string, _oid?: string) => {
+        expect(JSON.parse(valuesJson)).toEqual({
+          data: { type: "BlobRef", value: 0 },
+          chunks: { type: "Array", value: [{ type: "BlobRef", value: 1 }] },
+        });
+        return JSON.stringify({ id: "row-1", values: [], batchId: "batch-1" });
+      },
+    );
+    const binding = createBinding({ insertWithBlobs });
+    const adapter = new JazzRnRuntimeAdapter(binding, {});
+
+    adapter.insert("files", {
+      data: { type: "Bytea", value: a },
+      chunks: { type: "Array", value: [{ type: "Bytea", value: b }] },
+    });
+
+    expect(insertWithBlobs.mock.calls[0]![2]).toEqual([a.buffer, b.buffer]);
+  });
+
+  it("decodes hex Bytea in a blob-path return that did not come from the input", () => {
+    // Restore can resurrect columns absent from the input; those come back as hex.
+    const restoreWithBlobs = vi.fn(() =>
+      JSON.stringify({
+        id: "row-1",
+        values: [{ type: "Bytea", value: "0aff" }],
+        batchId: "batch-restore-1",
+      }),
+    );
+    const binding = createBinding({ restoreWithBlobs });
+    const adapter = new JazzRnRuntimeAdapter(binding, {});
+
+    const row = adapter.restore("files", "row-1", {});
+    expect(row.values[0]).toEqual({ type: "Bytea", value: new Uint8Array([0x0a, 0xff]) });
+  });
+
+  it("routes update and upsert through their blob variants when available", () => {
+    const payload = new Uint8Array([9, 9, 9]);
+    const updateWithBlobs = vi.fn(
+      (_objectId: string, _valuesJson: string, _blobs: ArrayBuffer[], _wc?: string) =>
+        JSON.stringify({ batchId: "batch-update-1" }),
+    );
+    const upsertWithBlobs = vi.fn(() => JSON.stringify({ batchId: "batch-upsert-1" }));
+    const binding = createBinding({ updateWithBlobs, upsertWithBlobs });
+    const adapter = new JazzRnRuntimeAdapter(binding, {});
+
+    adapter.update("row-1", { data: { type: "Bytea", value: payload } });
+    adapter.upsert("files", "row-1", { data: { type: "Bytea", value: payload } });
+
+    expect(updateWithBlobs).toHaveBeenCalledTimes(1);
+    expect(upsertWithBlobs).toHaveBeenCalledTimes(1);
+    expect(binding.update).not.toHaveBeenCalled();
+    expect(binding.upsert).not.toHaveBeenCalled();
+    expect(updateWithBlobs.mock.calls[0]![1]).toBe(
+      JSON.stringify({ data: { type: "BlobRef", value: 0 } }),
+    );
+    expect(updateWithBlobs.mock.calls[0]![2]).toEqual([payload.buffer]);
+  });
+
+  it("throws on an out-of-range BlobRef in a blob-path return", () => {
+    const insertWithBlobs = vi.fn(() =>
+      JSON.stringify({
+        id: "row-1",
+        values: [{ type: "BlobRef", value: 5 }],
+        batchId: "batch-1",
+      }),
+    );
+    const binding = createBinding({ insertWithBlobs });
+    const adapter = new JazzRnRuntimeAdapter(binding, {});
+
+    expect(() => adapter.insert("files", {})).toThrow(/Invalid BlobRef/);
+  });
+
   it("round-trips Bytea values through the RN FFI JSON codec", () => {
     const encoded = JSON.parse(
       encodeFFIRecordToJson({
