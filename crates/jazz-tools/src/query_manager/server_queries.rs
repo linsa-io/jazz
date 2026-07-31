@@ -13,6 +13,7 @@ use crate::sync_manager::{
     ClientId, ClientRole, DurabilityTier, PendingPermissionCheck, SyncPayload,
 };
 
+use super::authz_cache::{AuthzMarker, AuthzSessionKey};
 use super::manager::{QueryManager, SchemaWarningAccumulator, ServerQuerySubscription};
 use super::policy::{ComplexClause, Operation, PolicyExpr};
 use super::policy_graph::{PolicyGraph, PolicyGraphBuildOptions};
@@ -529,6 +530,79 @@ impl QueryManager {
         auth_context: &crate::schema_manager::SchemaContext,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
     ) -> bool {
+        // Cross-tick verdict cache: without it every write-tick re-authorized every
+        // row of every affected subscription's result set — a storage load plus a
+        // policy evaluation per row, making write cost proportional to subscribed
+        // result sizes. Invalidation happens where visibility effects are applied
+        // (changed rows, policy-dependency tables, schema/mode changes).
+        let marker = AuthzMarker {
+            schema_hash: auth_context.current_hash,
+            auth_generation: self.authz_schema_generation,
+            mode: self.row_policy_mode,
+        };
+        let session_key = AuthzSessionKey::for_session(session);
+        if let Some(cached) = self
+            .authz_verdicts
+            .get(marker, object_id, branch_name, session_key)
+        {
+            // Parity harness: in debug builds every hit is re-verified against a fresh
+            // evaluation, so the whole test suite continuously checks the cache's
+            // invalidation for staleness.
+            #[cfg(debug_assertions)]
+            {
+                let (fresh, _) = self.evaluate_provenance_row_select_policy(
+                    storage,
+                    settlement_eval_cache,
+                    object_id,
+                    branch_name,
+                    session,
+                    auth_schema,
+                    auth_context,
+                    source_branch_schema_map,
+                );
+                debug_assert_eq!(
+                    fresh, cached,
+                    "authz verdict cache diverged from fresh evaluation for row {object_id} on {branch_name:?}",
+                );
+            }
+            return cached;
+        }
+
+        let (verdict, table) = self.evaluate_provenance_row_select_policy(
+            storage,
+            settlement_eval_cache,
+            object_id,
+            branch_name,
+            session,
+            auth_schema,
+            auth_context,
+            source_branch_schema_map,
+        );
+        if let Some(table) = table {
+            self.authz_verdicts.store(
+                marker,
+                object_id,
+                branch_name,
+                table,
+                session_key,
+                verdict,
+                auth_schema,
+            );
+        }
+        verdict
+    }
+
+    fn evaluate_provenance_row_select_policy(
+        &mut self,
+        storage: &dyn Storage,
+        settlement_eval_cache: &mut SettlementEvalCache,
+        object_id: ObjectId,
+        branch_name: BranchName,
+        session: Option<&Session>,
+        auth_schema: &Schema,
+        auth_context: &crate::schema_manager::SchemaContext,
+        source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
+    ) -> (bool, Option<TableName>) {
         let branches = vec![branch_name.as_str().to_string()];
         let Some((table, row)) = self.load_best_visible_row_batch(
             storage,
@@ -538,33 +612,35 @@ impl QueryManager {
             auth_context,
             source_branch_schema_map,
         ) else {
-            return false;
+            // No row to attribute the verdict to — not cacheable.
+            return (false, None);
         };
+        let table_name = TableName::new(&table);
         if row.is_hard_deleted() {
-            return false;
+            return (false, Some(table_name));
         }
 
         let tip_content = row.data.clone();
         let tip_provenance = row.row_provenance();
 
-        let table_name = TableName::new(&table);
         let Some(select_policy) = auth_schema
             .get(&table_name)
             .and_then(|table_schema| table_schema.policies.select_policy())
         else {
-            return !self.row_policy_mode.denies_missing_explicit_policy()
+            let verdict = !self.row_policy_mode.denies_missing_explicit_policy()
                 && auth_schema.contains_key(&table_name);
+            return (verdict, Some(table_name));
         };
         let Some(session) = session else {
-            return false;
+            return (false, Some(table_name));
         };
 
-        self.evaluate_authorization_policy(
+        let verdict = self.evaluate_authorization_policy(
             storage,
             AuthorizationPolicyRequest {
                 object_id,
                 branch_name,
-                table_name,
+                table_name: table_name.clone(),
                 policy: select_policy,
                 content: &tip_content,
                 provenance: &tip_provenance,
@@ -575,7 +651,8 @@ impl QueryManager {
                 operation: Operation::Select,
                 settlement_eval_cache: Some(settlement_eval_cache),
             },
-        )
+        );
+        (verdict, Some(table_name))
     }
 
     fn authorized_tuples_from_graph_result(

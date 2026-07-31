@@ -493,6 +493,12 @@ pub struct QueryManager {
     pub(super) authorization_schema: Option<Arc<Schema>>,
     pub(super) authorization_schema_required: bool,
     pub(super) authorization_context_cache: HashMap<(String, String), Arc<SchemaContext>>,
+    /// Cross-tick row-authorization verdicts. See `authz_cache`.
+    pub(super) authz_verdicts: super::authz_cache::AuthzVerdictCache,
+    /// Bumped on every authorization-schema assignment; part of the verdict-cache
+    /// marker so republished permissions invalidate cached verdicts even when the
+    /// data-schema hash is unchanged.
+    pub(super) authz_schema_generation: u64,
 
     /// Pending catalogue updates (schemas/lenses received via sync).
     /// SchemaManager should call take_pending_catalogue_updates() to process these.
@@ -646,6 +652,8 @@ impl QueryManager {
             authorization_schema: None,
             authorization_schema_required: false,
             authorization_context_cache: HashMap::new(),
+            authz_verdicts: super::authz_cache::AuthzVerdictCache::default(),
+            authz_schema_generation: 0,
             pending_catalogue_updates: Vec::new(),
             subscriptions: HashMap::new(),
             next_subscription_id: 0,
@@ -702,6 +710,7 @@ impl QueryManager {
         } else {
             None
         };
+        self.authz_schema_generation += 1;
         self.authorization_context_cache.clear();
         self.authorization_schema_required = false;
         self.write_table_cache.clear();
@@ -716,8 +725,15 @@ impl QueryManager {
         self.mark_schema_catalogue_dirty(self.schema_context.current_hash);
     }
 
+    /// How many row-authorization verdicts were served from the cross-tick cache.
+    /// Exposed for tests and diagnostics.
+    pub fn authz_cache_hit_count(&self) -> u64 {
+        self.authz_verdicts.hit_count()
+    }
+
     pub fn set_authorization_schema(&mut self, schema: Schema) {
         self.authorization_schema = Some(Arc::new(schema));
+        self.authz_schema_generation += 1;
         self.authorization_context_cache.clear();
         self.row_policy_mode = RowPolicyMode::Enforcing;
         self.authorization_schema_required = true;
@@ -2225,11 +2241,57 @@ impl QueryManager {
             return;
         }
 
+        // Authorization verdicts must drop before any settle can read them: for the
+        // changed rows themselves, and for every row whose table's policy reads one of
+        // the changed tables.
+        self.authz_verdicts.invalidate(
+            effects
+                .remote_dirty_tables
+                .iter()
+                .chain(effects.local_dirty_tables.iter())
+                .map(String::as_str),
+            effects
+                .remote_updated
+                .values()
+                .chain(effects.local_updated.values())
+                .chain(effects.remote_deleted.values())
+                .chain(effects.local_deleted.values())
+                .flat_map(|ids| ids.iter().copied()),
+        );
+
+        // Every effect that marks a table dirty also records its row id in one of the
+        // updated/deleted maps (see `BatchedSubscriptionVisibilityEffects::push`), so
+        // dirty tables can be delivered to the scans row-precisely — the next settle
+        // re-evaluates only the changed rows instead of rescanning the whole index.
+        // Should the row coverage be missing anyway, fall back to the table-level full
+        // rescan rather than risk a stale scan.
+        fn changed_rows_for(
+            table: &str,
+            updated: &HashMap<String, ahash::AHashSet<ObjectId>>,
+            deleted: &HashMap<String, ahash::AHashSet<ObjectId>>,
+        ) -> ahash::AHashSet<ObjectId> {
+            let mut rows = updated.get(table).cloned().unwrap_or_default();
+            if let Some(ids) = deleted.get(table) {
+                rows.extend(ids.iter().copied());
+            }
+            rows
+        }
+
         for table in &effects.remote_dirty_tables {
-            self.mark_subscriptions_dirty(table);
+            let rows = changed_rows_for(table, &effects.remote_updated, &effects.remote_deleted);
+            if rows.is_empty() {
+                self.mark_subscriptions_dirty(table);
+            } else {
+                self.mark_subscriptions_rows_changed(table, &rows, false);
+            }
         }
         for table in &effects.local_dirty_tables {
-            self.mark_subscriptions_dirty_local(table);
+            let rows = changed_rows_for(table, &effects.local_updated, &effects.local_deleted);
+            if rows.is_empty() {
+                self.mark_subscriptions_dirty_local(table);
+            } else {
+                self.mark_subscriptions_rows_changed(table, &rows, true);
+            }
         }
 
         for (table, ids) in &effects.remote_updated {
@@ -2262,6 +2324,29 @@ impl QueryManager {
         for server_sub in self.server_subscriptions.values_mut() {
             if Self::subscription_involves_table(&server_sub.graph, table) {
                 server_sub.graph.mark_dirty_for_table(table);
+            }
+        }
+    }
+
+    /// Row-precise sibling of [`Self::mark_subscriptions_dirty_with_origin`].
+    fn mark_subscriptions_rows_changed(
+        &mut self,
+        table: &str,
+        rows: &ahash::AHashSet<ObjectId>,
+        local_update: bool,
+    ) {
+        for subscription in self.subscriptions.values_mut() {
+            if Self::subscription_involves_table(&subscription.graph, table) {
+                subscription.graph.mark_rows_changed_for_table(table, rows);
+                if local_update {
+                    subscription.has_pending_local_updates = true;
+                }
+            }
+        }
+
+        for server_sub in self.server_subscriptions.values_mut() {
+            if Self::subscription_involves_table(&server_sub.graph, table) {
+                server_sub.graph.mark_rows_changed_for_table(table, rows);
             }
         }
     }

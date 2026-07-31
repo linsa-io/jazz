@@ -1,3 +1,4 @@
+pub mod authz_cache;
 pub mod bindings;
 pub mod encoding;
 pub mod graph;
