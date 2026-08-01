@@ -265,7 +265,7 @@ fn app_id() -> AppId {
     AppId::from_string(APP_ID_STR).expect("parse app id")
 }
 
-async fn publish_schema(server: &ServerProcess) {
+async fn publish_schema(server: &ServerProcess, schema: &jazz_tools::Schema) {
     let response = reqwest::Client::new()
         .post(format!(
             "{}/apps/{}/admin/schemas",
@@ -273,7 +273,7 @@ async fn publish_schema(server: &ServerProcess) {
             APP_ID_STR
         ))
         .header("X-Jazz-Admin-Secret", ADMIN_SECRET)
-        .json(&json!({ "schema": parts_schema(), "permissions": null }))
+        .json(&json!({ "schema": schema, "permissions": null }))
         .send()
         .await
         .expect("publish schema");
@@ -282,15 +282,19 @@ async fn publish_schema(server: &ServerProcess) {
         "schema publish failed: {}",
         response.status()
     );
-    publish_allow_all_permissions(&server.base_url(), app_id(), ADMIN_SECRET, &parts_schema())
-        .await;
+    publish_allow_all_permissions(&server.base_url(), app_id(), ADMIN_SECRET, schema).await;
 }
 
-async fn make_client(server: &ServerProcess, user_id: &str) -> JazzClient {
+async fn make_client(
+    server: &ServerProcess,
+    user_id: &str,
+    schema: jazz_tools::Schema,
+    ready_table: &str,
+) -> JazzClient {
     let context = AppContext {
         app_id: app_id(),
         client_id: None,
-        schema: parts_schema(),
+        schema,
         server_url: server.base_url(),
         data_dir: TempDir::new().expect("client dir").keep(),
         // Persistent, like a device: the client's own store must survive its
@@ -302,12 +306,12 @@ async fn make_client(server: &ServerProcess, user_id: &str) -> JazzClient {
         sync_tracer: None,
     };
     let client = JazzClient::connect(context).await.expect("connect client");
-    wait_for_ready(&client, user_id).await;
+    wait_for_ready(&client, user_id, ready_table).await;
     client
 }
 
-async fn wait_for_ready(client: &JazzClient, who: &str) {
-    let query = QueryBuilder::new("parts").build();
+async fn wait_for_ready(client: &JazzClient, who: &str, table: &str) {
+    let query = QueryBuilder::new(table).build();
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
         if tokio::time::Instant::now() > deadline {
@@ -374,10 +378,10 @@ async fn live_subscriptions_survive_sigkill_restart() {
     let data_dir = TempDir::new().expect("server data dir");
 
     let server1 = ServerProcess::start(0, data_dir.path(), &jwks.endpoint()).await;
-    publish_schema(&server1).await;
+    publish_schema(&server1, &parts_schema()).await;
 
-    let writer = make_client(&server1, "kill9-writer").await;
-    let reader = make_client(&server1, "kill9-reader").await;
+    let writer = make_client(&server1, "kill9-writer", parts_schema(), "parts").await;
+    let reader = make_client(&server1, "kill9-reader", parts_schema(), "parts").await;
 
     // The two production subscription shapes, registered before any data.
     let eq_query = QueryBuilder::new("parts")
@@ -403,8 +407,8 @@ async fn live_subscriptions_survive_sigkill_restart() {
     let port = server1.kill_hard();
     let server2 = ServerProcess::start(port, data_dir.path(), &jwks.endpoint()).await;
 
-    wait_for_ready(&writer, "writer after restart").await;
-    wait_for_ready(&reader, "reader after restart").await;
+    wait_for_ready(&writer, "writer after restart", "parts").await;
+    wait_for_ready(&reader, "reader after restart", "parts").await;
 
     let mut after: BTreeSet<ObjectId> = BTreeSet::new();
     for idx in 10..13 {
@@ -455,10 +459,10 @@ async fn sigkill_mid_ingest_replays_unconfirmed_batches() {
     let data_dir = TempDir::new().expect("server data dir");
 
     let server1 = ServerProcess::start(0, data_dir.path(), &jwks.endpoint()).await;
-    publish_schema(&server1).await;
+    publish_schema(&server1, &parts_schema()).await;
 
-    let writer = make_client(&server1, "midkill-writer").await;
-    let reader = make_client(&server1, "midkill-reader").await;
+    let writer = make_client(&server1, "midkill-writer", parts_schema(), "parts").await;
+    let reader = make_client(&server1, "midkill-reader", parts_schema(), "parts").await;
 
     let eq_query = QueryBuilder::new("parts")
         .filter_eq("file_id", Value::Text("file-under-test".into()))
@@ -481,8 +485,8 @@ async fn sigkill_mid_ingest_replays_unconfirmed_batches() {
     }
 
     let server2 = ServerProcess::start(port, data_dir.path(), &jwks.endpoint()).await;
-    wait_for_ready(&writer, "writer after mid-ingest kill").await;
-    wait_for_ready(&reader, "reader after mid-ingest kill").await;
+    wait_for_ready(&writer, "writer after mid-ingest kill", "parts").await;
+    wait_for_ready(&reader, "reader after mid-ingest kill", "parts").await;
 
     // Post-restart traffic on top, then the full-set assertion.
     for idx in 25..30 {
@@ -495,6 +499,282 @@ async fn sigkill_mid_ingest_replays_unconfirmed_batches() {
         "live subscription after mid-ingest SIGKILL (incl. outage-window writes)",
     )
     .await;
+
+    writer.shutdown().await.expect("shutdown writer");
+    reader.shutdown().await.expect("shutdown reader");
+    drop(server2);
+}
+
+// ── include-tree subscriptions (the production list shape) ──────────────────
+
+fn chat_schema() -> jazz_tools::Schema {
+    // Correlation columns are REAL foreign keys, like the production schema —
+    // the subscription include path resolves inner rows through FK indexes.
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("messages")
+                .column("chat_id", ColumnType::Text)
+                .column("body", ColumnType::Text)
+                .column("created_at", ColumnType::Integer),
+        )
+        .table(
+            TableSchema::builder("attachments")
+                .fk_column("message_id", "messages")
+                .column("kind", ColumnType::Text),
+        )
+        .table(
+            TableSchema::builder("variants")
+                .fk_column("attachment_id", "attachments")
+                .column("tier", ColumnType::Text),
+        )
+        .build()
+}
+
+/// The production message-list shape: filtered, ordered, limited, with a
+/// two-level include tree (messages → attachments → variants).
+fn include_list_query(required: bool) -> jazz_tools::query_manager::query::Query {
+    let builder = QueryBuilder::new("messages")
+        .filter_eq("chat_id", Value::Text("chat-under-test".into()))
+        .order_by_desc("created_at")
+        .limit(50)
+        .with_array("attachments", move |sub| {
+            let sub = sub
+                .from("attachments")
+                .correlate("message_id", "messages.id")
+                .with_array("variants", |nested| {
+                    nested
+                        .from("variants")
+                        .correlate("attachment_id", "attachments.id")
+                });
+            if required { sub.require_result() } else { sub }
+        });
+    builder.build()
+}
+
+/// Drain everything currently queued on `stream` for up to `window`,
+/// accumulating per-id event sets. Removals are the flap detector: this suite
+/// never deletes rows, so ANY removal is the production bug shape (row sets
+/// oscillating full → empty → full).
+#[derive(Default)]
+struct DeltaLog {
+    added: BTreeSet<ObjectId>,
+    updated: BTreeSet<ObjectId>,
+    removed: BTreeSet<ObjectId>,
+}
+
+async fn drain_into(
+    stream: &mut jazz_tools::SubscriptionStream,
+    log: &mut DeltaLog,
+    window: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Err(_) => return,
+            Ok(None) => return,
+            Ok(Some(delta)) => {
+                for added in &delta.added {
+                    log.added.insert(added.id);
+                }
+                for updated in &delta.updated {
+                    log.updated.insert(updated.id);
+                }
+                for removed in &delta.removed {
+                    log.removed.insert(removed.id);
+                }
+            }
+        }
+    }
+}
+
+async fn drain_until_added(
+    stream: &mut jazz_tools::SubscriptionStream,
+    log: &mut DeltaLog,
+    expected: &BTreeSet<ObjectId>,
+    what: &str,
+) {
+    let deadline = tokio::time::Instant::now() + DELIVERY_DEADLINE;
+    while !expected.is_subset(&log.added) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let missing: Vec<_> = expected.difference(&log.added).collect();
+            panic!("{what}: never delivered {missing:?} (added so far {:?})", log.added);
+        }
+        drain_into(stream, log, remaining.min(Duration::from_millis(500))).await;
+    }
+}
+
+async fn insert_row(
+    client: &JazzClient,
+    table: &str,
+    values: std::collections::HashMap<String, Value>,
+) -> ObjectId {
+    let (id, _, batch_id) = client.insert(table, values).expect("insert row");
+    client
+        .wait_for_batch(batch_id, DurabilityTier::EdgeServer)
+        .await
+        .expect("row reaches the server");
+    id
+}
+
+/// Include-tree subscriptions across a SIGKILL restart, with the flap
+/// detector armed: rows may appear and update, but must NEVER be removed.
+///
+/// Field shape this corners (2026-08-01, linsa): the flapping production
+/// subscriptions were exactly this query form — filtered + ordered + limited
+/// with a multi-level include — emitting full → partial → empty row sets in
+/// a loop while flat queries stayed sane.
+#[tokio::test]
+async fn include_subscriptions_survive_sigkill_and_do_not_flap() {
+    let jwks = JwksServer::start().await;
+    let data_dir = TempDir::new().expect("server data dir");
+
+    let server1 = ServerProcess::start(0, data_dir.path(), &jwks.endpoint()).await;
+    publish_schema(&server1, &chat_schema()).await;
+
+    let writer = make_client(&server1, "include-writer", chat_schema(), "messages").await;
+    let reader = make_client(&server1, "include-reader", chat_schema(), "messages").await;
+
+    let mut list_sub = reader
+        .subscribe(include_list_query(false))
+        .await
+        .expect("list subscription");
+    let mut req_sub = reader
+        .subscribe(include_list_query(true))
+        .await
+        .expect("required subscription");
+    let mut list_log = DeltaLog::default();
+    let mut req_log = DeltaLog::default();
+
+    // m1 with attachment + variant; m2 with NO attachment.
+    let m1 = insert_row(
+        &writer,
+        "messages",
+        row_input!("chat_id" => "chat-under-test", "body" => "m1", "created_at" => 1),
+    )
+    .await;
+    let a1 = insert_row(
+        &writer,
+        "attachments",
+        row_input!("message_id" => Value::Uuid(m1), "kind" => "photo"),
+    )
+    .await;
+    insert_row(
+        &writer,
+        "variants",
+        row_input!("attachment_id" => Value::Uuid(a1), "tier" => "display"),
+    )
+    .await;
+    let m2 = insert_row(
+        &writer,
+        "messages",
+        row_input!("chat_id" => "chat-under-test", "body" => "m2", "created_at" => 2),
+    )
+    .await;
+    // Noise in another chat: the filter must keep it out.
+    insert_row(
+        &writer,
+        "messages",
+        row_input!("chat_id" => "other-chat", "body" => "noise", "created_at" => 3),
+    )
+    .await;
+
+    drain_until_added(
+        &mut list_sub,
+        &mut list_log,
+        &BTreeSet::from([m1, m2]),
+        "pre-kill list include",
+    )
+    .await;
+    drain_until_added(
+        &mut req_sub,
+        &mut req_log,
+        &BTreeSet::from([m1]),
+        "pre-kill required include (m1 has an attachment)",
+    )
+    .await;
+    // Grace drain, then the negative check: m2 has no attachment, so the
+    // required subscription must not have added it.
+    drain_into(&mut req_sub, &mut req_log, Duration::from_millis(1500)).await;
+    assert!(
+        !req_log.added.contains(&m2),
+        "required include delivered a message with no attachment"
+    );
+
+    // ── SIGKILL and restart on the same dir/port ───────────────────────────
+    let port = server1.kill_hard();
+    let server2 = ServerProcess::start(port, data_dir.path(), &jwks.endpoint()).await;
+    wait_for_ready(&writer, "writer after include kill", "messages").await;
+    wait_for_ready(&reader, "reader after include kill", "messages").await;
+
+    // Post-restart: m3 (with attachment) and the late attachment for m2 —
+    // which must PROMOTE m2 into the required subscription via an include-only
+    // change (no write to the outer row).
+    let m3 = insert_row(
+        &writer,
+        "messages",
+        row_input!("chat_id" => "chat-under-test", "body" => "m3", "created_at" => 4),
+    )
+    .await;
+    insert_row(
+        &writer,
+        "attachments",
+        row_input!("message_id" => Value::Uuid(m3), "kind" => "photo"),
+    )
+    .await;
+    insert_row(
+        &writer,
+        "attachments",
+        row_input!("message_id" => Value::Uuid(m2), "kind" => "document"),
+    )
+    .await;
+
+    drain_until_added(
+        &mut list_sub,
+        &mut list_log,
+        &BTreeSet::from([m3]),
+        "post-kill list include",
+    )
+    .await;
+    drain_until_added(
+        &mut req_sub,
+        &mut req_log,
+        &BTreeSet::from([m3, m2]),
+        "post-kill required include (incl. late-attachment promotion)",
+    )
+    .await;
+
+    // A fresh include subscription over the recovered store sees the full set.
+    let mut fresh = reader
+        .subscribe(include_list_query(false))
+        .await
+        .expect("fresh include subscription");
+    let mut fresh_log = DeltaLog::default();
+    drain_until_added(
+        &mut fresh,
+        &mut fresh_log,
+        &BTreeSet::from([m1, m2, m3]),
+        "fresh include subscription over recovered store",
+    )
+    .await;
+
+    // The flap detector: nothing was ever deleted, so nothing may ever have
+    // been removed from any of the three subscriptions.
+    for (name, log) in [
+        ("list", &list_log),
+        ("required", &req_log),
+        ("fresh", &fresh_log),
+    ] {
+        assert!(
+            log.removed.is_empty(),
+            "{name} include subscription removed rows without any delete: {:?}",
+            log.removed
+        );
+    }
 
     writer.shutdown().await.expect("shutdown writer");
     reader.shutdown().await.expect("shutdown reader");
