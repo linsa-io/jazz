@@ -139,8 +139,9 @@ fn authz_cache_serves_hits_and_tracks_policy_dep_writes() {
         .schema_manager_mut()
         .query_manager_mut()
         .authz_cache_hit_count();
-    // Skipped when the kill switch is on — used to baseline behavior without the cache.
-    if std::env::var_os("JAZZ_AUTHZ_CACHE_DISABLE").is_none() {
+    // The cache is opt-in (off by default since the linsa-v5 verdict-flap incident), so
+    // hits accrue only when the test process runs with JAZZ_AUTHZ_CACHE_ENABLE set.
+    if std::env::var_os("JAZZ_AUTHZ_CACHE_ENABLE").is_some() {
         assert!(
             hits_after > hits_before,
             "the unchanged team's verdict should have been served from the cache \
@@ -160,7 +161,7 @@ fn authz_cache_serves_hits_and_tracks_policy_dep_writes() {
     // Revocation through the dependency table. The subscription's maintained result
     // set only refreshes on a settle, and an edge delete alone does not force one —
     // that is upstream behavior, the same with this cache disabled
-    // (JAZZ_AUTHZ_CACHE_DISABLE=1). What the cache must guarantee: at the NEXT settle
+    // (cache left at its default: disabled). What the cache must guarantee: at the NEXT settle
     // the dropped edge is reflected — a stale verdict here would both fail this
     // assertion and trip the debug parity assert.
     core.delete(edge1, None).unwrap();

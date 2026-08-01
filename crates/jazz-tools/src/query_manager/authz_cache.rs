@@ -224,6 +224,37 @@ pub(super) struct AuthzVerdictCache {
     hits: u64,
 }
 
+
+// OFF by default, opt-in via JAZZ_AUTHZ_CACHE_ENABLE. Field evidence (linsa-v5): with
+// the cache on, subscription row sets flapped (full → empty → full on every settle
+// wave), which kept clients re-rendering and re-syncing until iOS killed the app at its
+// per-process memory limit. The embedded mobile runtime cannot set environment
+// variables, so the safe state must be the default. Re-enable only after the
+// verdict-flap bug is found and covered by a regression test.
+//
+// 0 = uninitialised, 1 = enabled, 2 = disabled. A relaxed atomic (not OnceLock) so
+// tests can force a deterministic state regardless of execution order.
+static CACHE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn cache_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match CACHE_STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let enabled = std::env::var_os("JAZZ_AUTHZ_CACHE_ENABLE").is_some();
+            CACHE_STATE.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
+            enabled
+        }
+    }
+}
+
+/// Test hook: force the cache on/off for this process, bypassing the env lookup.
+#[cfg(any(test, feature = "test"))]
+pub fn set_cache_enabled_for_tests(enabled: bool) {
+    CACHE_STATE.store(if enabled { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl AuthzVerdictCache {
     fn ensure_marker(&mut self, marker: AuthzMarker) {
         if self.marker != Some(marker) {
@@ -241,10 +272,7 @@ impl AuthzVerdictCache {
         session: AuthzSessionKey,
     ) -> Option<bool> {
         self.ensure_marker(marker);
-        // Operational kill switch: with the cache disabled every check falls back to a
-        // fresh evaluation. Read once — this sits on a per-row hot path.
-        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *DISABLED.get_or_init(|| std::env::var_os("JAZZ_AUTHZ_CACHE_DISABLE").is_some()) {
+        if !cache_enabled() {
             return None;
         }
         let verdict = self
@@ -445,6 +473,7 @@ mod tests {
         let row_a = ObjectId::new();
         let row_b = ObjectId::new();
 
+        set_cache_enabled_for_tests(true);
         let mut cache = AuthzVerdictCache::default();
         cache.store(marker, row_a, branch, TableName::new("docs"), session, true, &schema);
         cache.store(marker, row_b, branch, TableName::new("docs"), session, false, &schema);
@@ -479,6 +508,7 @@ mod tests {
         let branch = BranchName::new("main");
         let row = ObjectId::new();
 
+        set_cache_enabled_for_tests(true);
         let mut cache = AuthzVerdictCache::default();
         cache.store(marker, row, branch, TableName::new("docs"), session, true, &schema);
         let other_marker = AuthzMarker {
