@@ -846,13 +846,36 @@ where
 /// longer has. Backends without raw-table support fall back to a fresh id
 /// per process — the pre-existing behavior.
 #[cfg(feature = "transport")]
+const WIRE_CLIENT_ID_TABLE: &str = "__jazz_meta";
+#[cfg(feature = "transport")]
+const WIRE_CLIENT_ID_KEY: &str = "wire_client_id";
+
+/// Pin the store's wire ClientId, replacing any existing one.
+///
+/// Callers that already own an identity (an explicit `AppContext::client_id`,
+/// a restored backup) use this before connecting.
+#[cfg(feature = "transport")]
+pub fn seed_wire_client_id<S: crate::storage::Storage + ?Sized>(
+    storage: &mut S,
+    client_id: crate::sync_manager::ClientId,
+) {
+    if let Err(error) = storage.raw_table_put(
+        WIRE_CLIENT_ID_TABLE,
+        WIRE_CLIENT_ID_KEY,
+        client_id.to_string().as_bytes(),
+    ) {
+        tracing::debug!(?error, "could not seed wire client id");
+    }
+}
+
+#[cfg(feature = "transport")]
 fn stable_wire_client_id<S: crate::storage::Storage>(
     storage: &mut S,
 ) -> crate::sync_manager::ClientId {
     use crate::sync_manager::ClientId;
 
-    const META_TABLE: &str = "__jazz_meta";
-    const META_KEY: &str = "wire_client_id";
+    const META_TABLE: &str = WIRE_CLIENT_ID_TABLE;
+    const META_KEY: &str = WIRE_CLIENT_ID_KEY;
 
     if let Ok(Some(bytes)) = storage.raw_table_get(META_TABLE, META_KEY)
         && let Ok(text) = std::str::from_utf8(&bytes)

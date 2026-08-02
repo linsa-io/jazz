@@ -243,10 +243,15 @@ impl JazzClient {
         // runtime's storage (`__jazz_meta`/`wire_client_id`), so persistent
         // clients keep a stable identity across restarts and the server's
         // per-client delivery frontier survives an app relaunch.
-        let storage: DynStorage = match context.storage {
+        let mut storage: DynStorage = match context.storage {
             ClientStorage::Persistent => open_persistent_storage(&context.data_dir).await?,
             ClientStorage::Memory => Box::new(MemoryStorage::new()),
         };
+
+        // An explicit `AppContext::client_id` seeds that identity.
+        if let Some(client_id) = context.client_id {
+            crate::runtime_core::seed_wire_client_id(storage.as_mut(), client_id);
+        }
 
         let schema_manager = build_schema_manager(&storage, &context)?;
 

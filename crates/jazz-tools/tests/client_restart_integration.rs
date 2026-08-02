@@ -785,3 +785,50 @@ async fn persistent_client_keeps_wire_client_id_across_restarts() {
     second.shutdown().await.expect("shutdown second launch");
     server.shutdown().await;
 }
+
+// An explicit `AppContext::client_id` must become the wire identity the
+// server sees. Callers that own an identity — a restored backup, a test
+// fixture pinning a known id — depend on it; silently minting a different
+// one would make the server treat them as an unrelated device and replay
+// the full visible dataset.
+#[tokio::test]
+async fn explicit_context_client_id_becomes_the_wire_identity() {
+    let schema = test_schema();
+    let server = JazzServer::start_with_schema(schema.clone()).await;
+    let client_dir = TempDir::new().expect("client dir");
+    let pinned = ClientId::new();
+    let context = AppContext {
+        app_id: server.app_id(),
+        client_id: Some(pinned),
+        schema,
+        server_url: server.base_url(),
+        data_dir: client_dir.path().to_path_buf(),
+        storage: ClientStorage::Persistent,
+        jwt_token: Some(TestJwtIssuer::jwt_for_user("pinned-identity")),
+        backend_secret: None,
+        admin_secret: None,
+        sync_tracer: None,
+    };
+
+    let client = JazzClient::connect(context.clone())
+        .await
+        .expect("connect with pinned client id");
+    assert_eq!(
+        client.client_id(),
+        Some(pinned),
+        "an explicit AppContext::client_id must be the wire identity"
+    );
+    client.shutdown().await.expect("shutdown pinned client");
+
+    // And it must survive a restart like any other persisted identity.
+    let restarted = JazzClient::connect(context)
+        .await
+        .expect("reconnect with pinned client id");
+    assert_eq!(
+        restarted.client_id(),
+        Some(pinned),
+        "the pinned identity must persist across restarts"
+    );
+    restarted.shutdown().await.expect("shutdown restarted");
+    server.shutdown().await;
+}
