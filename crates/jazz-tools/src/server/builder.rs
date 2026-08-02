@@ -27,6 +27,7 @@ use crate::transport_manager::TransportRetryConfig;
 #[cfg(feature = "rocksdb")]
 const STORAGE_CACHE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CLIENT_TTL: Duration = Duration::from_secs(300);
 const EDGE_UPSTREAM_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const EDGE_UPSTREAM_AUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -71,6 +72,7 @@ pub struct ServerBuilder {
     sync_tracer: Option<crate::sync_tracer::SyncTracer>,
     upstream_url: Option<String>,
     shutdown_timeout: Duration,
+    client_ttl: Duration,
 }
 
 impl ServerBuilder {
@@ -88,6 +90,7 @@ impl ServerBuilder {
             sync_tracer: None,
             upstream_url: None,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            client_ttl: DEFAULT_CLIENT_TTL,
         }
     }
 
@@ -113,6 +116,15 @@ impl ServerBuilder {
 
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// How long a disconnected client's server-side state (subscriptions,
+    /// outbox, sync bookkeeping) is kept for a possible reconnect before the
+    /// sweep reaps it. Clients that mint a fresh client id on every launch
+    /// never resume, so deployments dominated by such clients want this low.
+    pub fn with_client_ttl(mut self, ttl: Duration) -> Self {
+        self.client_ttl = ttl;
         self
     }
 
@@ -166,7 +178,7 @@ impl ServerBuilder {
             jwt_verifier,
             http_client,
             disconnect_candidates: RwLock::new(HashMap::new()),
-            client_ttl: RwLock::new(Duration::from_secs(300)),
+            client_ttl: RwLock::new(self.client_ttl),
             sync_tracer: self.sync_tracer.clone(),
             shutdown: crate::server::ShutdownController::new(self.shutdown_timeout),
         });
@@ -545,6 +557,23 @@ fn start_upstream_sync(
 mod tests {
     use super::*;
     use crate::schema_manager::AppId;
+
+    #[tokio::test]
+    async fn builder_applies_configured_client_ttl() {
+        let app_id =
+            AppId::from_string("00000000-0000-0000-0000-000000000001").expect("parse app id");
+        let built = ServerBuilder::new(app_id)
+            .with_storage(StorageBackend::InMemory)
+            .with_client_ttl(Duration::from_secs(7))
+            .build()
+            .await
+            .expect("build server");
+        assert_eq!(
+            *built.state.client_ttl.read().await,
+            Duration::from_secs(7),
+            "configured client TTL must reach ServerState"
+        );
+    }
 
     #[test]
     fn upstream_url_conversion_maps_base_urls_to_app_ws_route() {

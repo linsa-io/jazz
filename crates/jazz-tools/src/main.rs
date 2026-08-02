@@ -23,6 +23,7 @@ use jazz_tools::otel;
 
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 const MAX_SHUTDOWN_TIMEOUT_SECS: u64 = 60 * 60;
+const DEFAULT_CLIENT_TTL_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeEnvMode {
@@ -155,6 +156,16 @@ enum Commands {
         )]
         shutdown_timeout_secs: u64,
 
+        /// How long (seconds) a disconnected client's server-side state is
+        /// kept for a possible reconnect before being reaped. Lower this when
+        /// clients mint a fresh client id per launch and never resume.
+        #[arg(
+            long,
+            env = "JAZZ_CLIENT_TTL_SECS",
+            default_value_t = DEFAULT_CLIENT_TTL_SECS,
+        )]
+        client_ttl_secs: u64,
+
         /// Internal testing hook: write the resolved listen port after binding.
         #[arg(long, env = "JAZZ_BOUND_PORT_FILE", hide = true)]
         bound_port_file: Option<String>,
@@ -202,6 +213,7 @@ async fn main() {
             admin_secret,
             upstream_url,
             shutdown_timeout_secs,
+            client_ttl_secs,
             bound_port_file,
         } => {
             let node_env_mode = resolve_node_env_mode();
@@ -247,6 +259,7 @@ async fn main() {
                 upstream_url,
                 bound_port_file,
                 std::time::Duration::from_secs(shutdown_timeout_secs),
+                std::time::Duration::from_secs(client_ttl_secs),
             )
             .await
             {

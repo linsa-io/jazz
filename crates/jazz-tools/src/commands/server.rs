@@ -12,6 +12,7 @@ use tracing::info;
 const STANDALONE_INSPECTOR_URL: &str = "https://jazz2-inspector.vercel.app/";
 
 /// Run the Jazz server.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     app_id_str: &str,
     port: u16,
@@ -21,6 +22,7 @@ pub async fn run(
     upstream_url: Option<String>,
     bound_port_file: Option<String>,
     shutdown_timeout: Duration,
+    client_ttl: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_id = AppId::from_string(app_id_str)?;
     let app_id_string = app_id.to_string();
@@ -35,7 +37,8 @@ pub async fn run(
 
     let builder = ServerBuilder::new(app_id)
         .with_auth_config(auth_config)
-        .with_shutdown_timeout(shutdown_timeout);
+        .with_shutdown_timeout(shutdown_timeout)
+        .with_client_ttl(client_ttl);
     let builder = match upstream_url {
         Some(upstream_url) => builder.with_upstream_url(upstream_url),
         None => builder,
