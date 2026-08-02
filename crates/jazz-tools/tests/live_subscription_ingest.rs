@@ -102,10 +102,7 @@ fn matching_query() -> jazz_tools::query_manager::query::Query {
 
 async fn insert_part(client: &JazzClient, file_id: &str, idx: i32) -> ObjectId {
     let (id, _, batch_id) = client
-        .insert(
-            "parts",
-            row_input!("file_id" => file_id, "idx" => idx),
-        )
+        .insert("parts", row_input!("file_id" => file_id, "idx" => idx))
         .expect("insert part");
     client
         .wait_for_batch(batch_id, DurabilityTier::EdgeServer)

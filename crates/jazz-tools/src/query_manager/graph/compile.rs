@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::{cmp::Ordering, ops::Bound};
 
 use crate::object::{BranchName, ObjectId};
@@ -536,6 +537,22 @@ impl QueryGraph {
         schema_context: &SchemaContext,
         row_policy_mode: RowPolicyMode,
     ) -> Option<Self> {
+        Self::compile_execution_plan_with_schema_context_shared(
+            plan,
+            &Arc::new(schema.clone()),
+            session,
+            &Arc::new(schema_context.clone()),
+            row_policy_mode,
+        )
+    }
+
+    fn compile_execution_plan_with_schema_context_shared(
+        plan: &ExecutionQueryPlan,
+        schema: &Arc<Schema>,
+        session: Option<Session>,
+        schema_context: &Arc<SchemaContext>,
+        row_policy_mode: RowPolicyMode,
+    ) -> Option<Self> {
         // Build branch -> schema hash map for column translation.
         // Use full hashes from SchemaContext (do not re-parse branch strings, which only encode
         // a shortened hash prefix).
@@ -696,7 +713,7 @@ impl QueryGraph {
                 current_descriptor.clone(),
                 policy,
                 session.clone(),
-                schema.clone(),
+                Arc::clone(schema),
                 plan.table.as_str(),
                 branch_for_policy,
                 row_policy_mode,
@@ -782,7 +799,7 @@ impl QueryGraph {
                     current_tuple_descriptor.clone(),
                     &requests,
                     session.clone(),
-                    schema.clone(),
+                    Arc::clone(schema),
                     branches
                         .first()
                         .cloned()
@@ -853,7 +870,7 @@ impl QueryGraph {
                     current_tuple_descriptor.clone(),
                     &requests,
                     session.clone(),
-                    schema.clone(),
+                    Arc::clone(schema),
                     branches
                         .first()
                         .cloned()
@@ -962,6 +979,32 @@ impl QueryGraph {
         schema_context: &SchemaContext,
         row_policy_mode: RowPolicyMode,
     ) -> Result<Self, QueryCompileError> {
+        // One-time promotion into shared handles; the per-instantiation hot path
+        // (SubgraphTemplate::instantiate) calls the `_shared` variant directly so
+        // nested subquery compiles clone Arcs, not whole schemas.
+        Self::try_compile_with_schema_context_shared(
+            query,
+            &Arc::new(schema.clone()),
+            session,
+            &Arc::new(schema_context.clone()),
+            row_policy_mode,
+        )
+    }
+
+    /// Shared-handle variant of [`Self::try_compile_with_schema_context`].
+    ///
+    /// Field evidence (2026-08-02, linsa): compiling an array subquery cloned the
+    /// full `Schema` and `SchemaContext` per nested node per instantiation; a
+    /// device client re-instantiating include subgraphs during catch-up sync
+    /// allocated its way to the iOS 3 GB jetsam limit. Everything below the
+    /// top-level compile now threads `Arc`s instead.
+    pub fn try_compile_with_schema_context_shared(
+        query: &Query,
+        schema: &Arc<Schema>,
+        session: Option<Session>,
+        schema_context: &Arc<SchemaContext>,
+        row_policy_mode: RowPolicyMode,
+    ) -> Result<Self, QueryCompileError> {
         let branches: Vec<String> = if query.branches.is_empty() {
             schema_context
                 .all_branch_names()
@@ -971,7 +1014,7 @@ impl QueryGraph {
         } else {
             query.branches.clone()
         };
-        ensure_relation_tables_exist(&query.relation_ir, schema)?;
+        ensure_relation_tables_exist(&query.relation_ir, schema.as_ref())?;
 
         let plan = lower_relation_to_execution_plan(
             &query.relation_ir,
@@ -986,9 +1029,9 @@ impl QueryGraph {
             )
         })?;
 
-        validate_execution_plan(&plan, schema)?;
+        validate_execution_plan(&plan, schema.as_ref())?;
 
-        Self::compile_execution_plan_with_schema_context(
+        Self::compile_execution_plan_with_schema_context_shared(
             &plan,
             schema,
             session,
@@ -1009,9 +1052,9 @@ impl QueryGraph {
         &self,
         spec: &crate::query_manager::query::ArraySubquerySpec,
         outer_descriptor: &RowDescriptor,
-        schema: &Schema,
+        schema: &Arc<Schema>,
         branches: &[String],
-        schema_context: &SchemaContext,
+        schema_context: &Arc<SchemaContext>,
         session: Option<&Session>,
         row_policy_mode: RowPolicyMode,
     ) -> Option<(ArraySubqueryNode, RowDescriptor)> {
@@ -1101,7 +1144,7 @@ impl QueryGraph {
             spec.inner_column.clone(),
             spec.select_columns.clone().unwrap_or_default(),
             inner_output_descriptor,
-            schema_context.clone(),
+            Arc::clone(schema_context),
             session.cloned(),
             row_policy_mode,
         );
@@ -1117,7 +1160,7 @@ impl QueryGraph {
             outer_correlation,
             spec.requirement,
             spec.column_name.clone(),
-            schema.clone(),
+            Arc::clone(schema),
         );
 
         // Use the node's output descriptor (which has correct Array<Row> type)
@@ -1169,9 +1212,9 @@ impl QueryGraph {
         &self,
         spec: &crate::query_manager::query::RecursiveSpec,
         current_descriptor: &RowDescriptor,
-        schema: &Schema,
+        schema: &Arc<Schema>,
         branches: &[String],
-        schema_context: &SchemaContext,
+        schema_context: &Arc<SchemaContext>,
         session: Option<&Session>,
         row_policy_mode: RowPolicyMode,
     ) -> Option<(RecursiveRelationNode, RowDescriptor, TableName)> {
@@ -1271,7 +1314,7 @@ impl QueryGraph {
             spec.inner_column.clone(),
             spec.select_columns.clone().unwrap_or_default(),
             step_output_descriptor,
-            schema_context.clone(),
+            Arc::clone(schema_context),
             session.cloned(),
             row_policy_mode,
         );
@@ -1285,7 +1328,7 @@ impl QueryGraph {
             correlation_source,
             hop,
             spec.max_depth,
-            schema.clone(),
+            Arc::clone(schema),
         );
 
         Some((node, current_descriptor.clone(), spec.table))
@@ -1293,10 +1336,10 @@ impl QueryGraph {
 
     fn compile_join_plan(
         plan: &ExecutionQueryPlan,
-        schema: &Schema,
+        schema: &Arc<Schema>,
         branches: &[String],
         session: Option<Session>,
-        schema_context: &SchemaContext,
+        schema_context: &Arc<SchemaContext>,
         row_policy_mode: RowPolicyMode,
     ) -> Option<Self> {
         let mut branch_schema_map: HashMap<String, SchemaHash> = HashMap::new();

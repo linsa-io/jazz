@@ -10,6 +10,8 @@ use ahash::{AHashMap, AHashSet};
 use crate::object::ObjectId;
 use crate::query_manager::encoding::{decode_row, encode_row};
 use crate::query_manager::query::ArraySubqueryRequirement;
+use std::sync::Arc;
+
 use crate::query_manager::types::{
     ColumnDescriptor, ColumnType, LoadedRow, RowDescriptor, Schema, TableName, Tuple,
     TupleBatchProvenance, TupleDelta, TupleDescriptor, TupleElement, TupleProvenance, Value,
@@ -41,6 +43,7 @@ use super::subgraph::{SubgraphInstance, SubgraphTemplate};
 /// - Memory overhead per instance
 /// - Update cost distribution (how many instances need re-settling on inner change?)
 /// - Common subgraph patterns that could benefit from memoization
+///
 /// Hard ceiling on live subgraph instances kept per node.
 ///
 /// The cache is normally bounded by the number of live outer rows, because entries are
@@ -70,7 +73,7 @@ pub struct ArraySubqueryNode {
     /// Template for the inner subgraph.
     subgraph_template: SubgraphTemplate,
     /// Schema for compiling subgraphs.
-    schema: Schema,
+    schema: Arc<Schema>,
 
     /// Source of the correlation value from the outer tuple.
     outer_correlation: Correlate,
@@ -133,7 +136,7 @@ impl ArraySubqueryNode {
         outer_correlation: Correlate,
         requirement: ArraySubqueryRequirement,
         array_column_name: String,
-        schema: Schema,
+        schema: Arc<Schema>,
     ) -> Self {
         // Build output descriptor: outer columns + array column
         let outer_row_descriptor = outer_descriptor.combined_descriptor();
@@ -311,10 +314,10 @@ impl ArraySubqueryNode {
             let old_outer_id = old_tuple.first_id();
             let new_outer_id = new_tuple.first_id();
             let old_state = old_outer_id.and_then(|outer_id| self.instances.remove(&outer_id));
-            if let Some(outer_id) = old_outer_id {
-                if Some(outer_id) != new_outer_id {
-                    self.forget_cached_subgraphs(outer_id);
-                }
+            if let Some(outer_id) = old_outer_id
+                && Some(outer_id) != new_outer_id
+            {
+                self.forget_cached_subgraphs(outer_id);
             }
 
             let old_array = old_state
@@ -854,7 +857,7 @@ mod tests {
             Correlate::Col(0),
             ArraySubqueryRequirement::Optional,
             "posts".to_string(),
-            schema,
+            Arc::new(schema),
         );
 
         // Output should have: id, name, posts (array)
@@ -889,7 +892,7 @@ mod tests {
             Correlate::Col(0),
             ArraySubqueryRequirement::Optional,
             "posts".to_string(),
-            schema.clone(),
+            Arc::new(schema.clone()),
         );
 
         // Create a tuple with user id=42
@@ -932,7 +935,7 @@ mod tests {
             Correlate::Id,
             ArraySubqueryRequirement::Optional,
             "posts".to_string(),
-            schema.clone(),
+            Arc::new(schema.clone()),
         );
 
         let row_id = ObjectId::new();
@@ -973,7 +976,7 @@ mod tests {
             Correlate::Col(0),
             ArraySubqueryRequirement::Optional,
             "posts".to_string(),
-            schema,
+            Arc::new(schema),
         )
     }
 
@@ -1041,5 +1044,4 @@ mod tests {
 
         assert_eq!(node.subgraph_cache.len(), 1);
     }
-
 }

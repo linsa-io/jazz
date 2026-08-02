@@ -234,8 +234,16 @@ impl ServerProcess {
         }
         format!(
             "\nstdout:\n{}\nstderr:\n{}",
-            if stdout.is_empty() { "<empty>" } else { stdout.trim() },
-            if stderr.is_empty() { "<empty>" } else { stderr.trim() },
+            if stdout.is_empty() {
+                "<empty>"
+            } else {
+                stdout.trim()
+            },
+            if stderr.is_empty() {
+                "<empty>"
+            } else {
+                stderr.trim()
+            },
         )
     }
 }
@@ -393,7 +401,10 @@ async fn live_subscriptions_survive_sigkill_restart() {
         .limit(50)
         .build();
     let mut eq_sub = reader.subscribe(eq_query.clone()).await.expect("eq sub");
-    let mut list_sub = reader.subscribe(list_query.clone()).await.expect("list sub");
+    let mut list_sub = reader
+        .subscribe(list_query.clone())
+        .await
+        .expect("list sub");
 
     let mut before: BTreeSet<ObjectId> = BTreeSet::new();
     for idx in 0..4 {
@@ -602,7 +613,10 @@ async fn drain_until_added(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             let missing: Vec<_> = expected.difference(&log.added).collect();
-            panic!("{what}: never delivered {missing:?} (added so far {:?})", log.added);
+            panic!(
+                "{what}: never delivered {missing:?} (added so far {:?})",
+                log.added
+            );
         }
         drain_into(stream, log, remaining.min(Duration::from_millis(500))).await;
     }

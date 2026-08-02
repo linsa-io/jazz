@@ -82,11 +82,19 @@ impl TableDeps {
 /// Extract every table `table`'s select policy reads, transitively through Inherits
 /// chains. Conservative: any construct whose reads cannot be enumerated yields
 /// `Unknown`.
-pub(super) fn select_policy_dependency_tables(auth_schema: &Schema, table: &TableName) -> TableDeps {
+pub(super) fn select_policy_dependency_tables(
+    auth_schema: &Schema,
+    table: &TableName,
+) -> TableDeps {
     let mut deps = HashSet::new();
     let mut visited = HashSet::new();
-    if collect_operation_policy_deps(auth_schema, table, Operation::Select, &mut deps, &mut visited)
-    {
+    if collect_operation_policy_deps(
+        auth_schema,
+        table,
+        Operation::Select,
+        &mut deps,
+        &mut visited,
+    ) {
         TableDeps::Known(deps)
     } else {
         TableDeps::Unknown
@@ -100,7 +108,7 @@ fn collect_operation_policy_deps(
     deps: &mut HashSet<TableName>,
     visited: &mut HashSet<(TableName, Operation)>,
 ) -> bool {
-    if !visited.insert((table.clone(), operation)) {
+    if !visited.insert((*table, operation)) {
         return true;
     }
     let Some(table_schema) = auth_schema.get(table) else {
@@ -145,7 +153,7 @@ fn collect_policy_expr_deps(
             condition,
         } => {
             let exists_table = TableName::new(exists_table);
-            deps.insert(exists_table.clone());
+            deps.insert(exists_table);
             collect_policy_expr_deps(auth_schema, &exists_table, condition, deps, visited)
         }
         PolicyExpr::ExistsRel { rel } => collect_rel_expr_deps(rel, deps),
@@ -157,12 +165,12 @@ fn collect_policy_expr_deps(
             let Some(target): Option<TableName> = auth_schema
                 .get(table)
                 .and_then(|schema| schema.columns.column(via_column))
-                .and_then(|column| column.references.clone())
+                .and_then(|column| column.references)
             else {
                 // FK target unknown — cannot bound what the policy reads.
                 return false;
             };
-            deps.insert(target.clone());
+            deps.insert(target);
             collect_operation_policy_deps(auth_schema, &target, *operation, deps, visited)
         }
         PolicyExpr::InheritsReferencing {
@@ -171,20 +179,22 @@ fn collect_policy_expr_deps(
             ..
         } => {
             let source = TableName::new(source_table);
-            deps.insert(source.clone());
+            deps.insert(source);
             collect_operation_policy_deps(auth_schema, &source, *operation, deps, visited)
         }
         PolicyExpr::And(items) | PolicyExpr::Or(items) => items
             .iter()
             .all(|item| collect_policy_expr_deps(auth_schema, table, item, deps, visited)),
-        PolicyExpr::Not(inner) => collect_policy_expr_deps(auth_schema, table, inner, deps, visited),
+        PolicyExpr::Not(inner) => {
+            collect_policy_expr_deps(auth_schema, table, inner, deps, visited)
+        }
     }
 }
 
 fn collect_rel_expr_deps(rel: &RelExpr, deps: &mut HashSet<TableName>) -> bool {
     match rel {
         RelExpr::TableScan { table } => {
-            deps.insert(table.clone());
+            deps.insert(*table);
             true
         }
         RelExpr::Filter { input, .. }
@@ -193,7 +203,9 @@ fn collect_rel_expr_deps(rel: &RelExpr, deps: &mut HashSet<TableName>) -> bool {
         | RelExpr::OrderBy { input, .. }
         | RelExpr::Offset { input, .. }
         | RelExpr::Limit { input, .. } => collect_rel_expr_deps(input, deps),
-        RelExpr::Union { inputs } => inputs.iter().all(|input| collect_rel_expr_deps(input, deps)),
+        RelExpr::Union { inputs } => inputs
+            .iter()
+            .all(|input| collect_rel_expr_deps(input, deps)),
         RelExpr::Join { left, right, .. } => {
             collect_rel_expr_deps(left, deps) && collect_rel_expr_deps(right, deps)
         }
@@ -205,7 +217,6 @@ fn collect_rel_expr_deps(rel: &RelExpr, deps: &mut HashSet<TableName>) -> bool {
 
 #[derive(Debug)]
 struct RowVerdicts {
-    table: TableName,
     deps: Arc<TableDeps>,
     by_session: HashMap<AuthzSessionKey, bool>,
 }
@@ -223,7 +234,6 @@ pub(super) struct AuthzVerdictCache {
     /// prove the cache actually served hits rather than passing vacuously.
     hits: u64,
 }
-
 
 // OFF by default, opt-in via JAZZ_AUTHZ_CACHE_ENABLE. Field evidence (linsa-v5): with
 // the cache on, subscription row sets flapped (full → empty → full on every settle
@@ -252,7 +262,10 @@ fn cache_enabled() -> bool {
 /// Test hook: force the cache on/off for this process, bypassing the env lookup.
 #[cfg(any(test, feature = "test"))]
 pub fn set_cache_enabled_for_tests(enabled: bool) {
-    CACHE_STATE.store(if enabled { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+    CACHE_STATE.store(
+        if enabled { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 impl AuthzVerdictCache {
@@ -291,6 +304,7 @@ impl AuthzVerdictCache {
         self.hits
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn store(
         &mut self,
         marker: AuthzMarker,
@@ -307,13 +321,12 @@ impl AuthzVerdictCache {
         }
         let deps = self
             .deps_by_table
-            .entry(table.clone())
+            .entry(table)
             .or_insert_with(|| Arc::new(select_policy_dependency_tables(auth_schema, &table)))
             .clone();
         self.rows
             .entry((object_id, branch))
             .or_insert_with(|| RowVerdicts {
-                table,
                 deps,
                 by_session: HashMap::new(),
             })
@@ -345,8 +358,8 @@ impl AuthzVerdictCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_manager::types::{SchemaBuilder, TableSchema};
     use crate::query_manager::types::{ColumnType, PolicyExpr as Expr, TablePolicies};
+    use crate::query_manager::types::{SchemaBuilder, TableSchema};
 
     fn deps_of(schema: &Schema, table: &str) -> TableDeps {
         select_policy_dependency_tables(schema, &TableName::new(table))
@@ -370,10 +383,10 @@ mod tests {
             .table(
                 TableSchema::builder("docs")
                     .column("owner_id", ColumnType::Text)
-                    .policies(TablePolicies::new().with_select(Expr::eq_session(
-                        "owner_id",
-                        vec!["user_id".into()],
-                    ))),
+                    .policies(
+                        TablePolicies::new()
+                            .with_select(Expr::eq_session("owner_id", vec!["user_id".into()])),
+                    ),
             )
             .build();
         assert_eq!(deps_of(&schema, "docs"), known(&[]));
@@ -416,7 +429,10 @@ mod tests {
             )
             .table(TableSchema::builder("memberships").column("user_id", ColumnType::Text))
             .build();
-        assert_eq!(deps_of(&schema, "messages"), known(&["chats", "memberships"]));
+        assert_eq!(
+            deps_of(&schema, "messages"),
+            known(&["chats", "memberships"])
+        );
     }
 
     #[test]
@@ -475,8 +491,24 @@ mod tests {
 
         set_cache_enabled_for_tests(true);
         let mut cache = AuthzVerdictCache::default();
-        cache.store(marker, row_a, branch, TableName::new("docs"), session, true, &schema);
-        cache.store(marker, row_b, branch, TableName::new("docs"), session, false, &schema);
+        cache.store(
+            marker,
+            row_a,
+            branch,
+            TableName::new("docs"),
+            session,
+            true,
+            &schema,
+        );
+        cache.store(
+            marker,
+            row_b,
+            branch,
+            TableName::new("docs"),
+            session,
+            false,
+            &schema,
+        );
         assert_eq!(cache.get(marker, row_a, branch, session), Some(true));
         assert_eq!(cache.get(marker, row_b, branch, session), Some(false));
 
@@ -510,7 +542,15 @@ mod tests {
 
         set_cache_enabled_for_tests(true);
         let mut cache = AuthzVerdictCache::default();
-        cache.store(marker, row, branch, TableName::new("docs"), session, true, &schema);
+        cache.store(
+            marker,
+            row,
+            branch,
+            TableName::new("docs"),
+            session,
+            true,
+            &schema,
+        );
         let other_marker = AuthzMarker {
             schema_hash: marker.schema_hash,
             auth_generation: marker.auth_generation,

@@ -114,9 +114,7 @@ fn incremental_scan_matches_model_under_randomized_writes() {
 
         let mut expected_hot: Vec<ObjectId> = model
             .iter()
-            .filter_map(|(id, title)| {
-                (title.as_deref() == Some("hot")).then_some(*id)
-            })
+            .filter_map(|(id, title)| (title.as_deref() == Some("hot")).then_some(*id))
             .collect();
         expected_hot.sort();
         let mut expected_all: Vec<ObjectId> = model

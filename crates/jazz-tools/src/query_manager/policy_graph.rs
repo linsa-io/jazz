@@ -4,6 +4,7 @@
 //! These graphs are throwaway - created, settled until complete, then discarded.
 
 use crate::object::ObjectId;
+use std::sync::Arc;
 
 use crate::storage::Storage;
 
@@ -133,7 +134,7 @@ impl PolicyGraph {
             descriptor.clone(),
             policy.clone(),
             session.clone(),
-            schema.clone(),
+            Arc::new(schema.clone()),
             table.as_str(),
             PolicyFilterOptions::for_branch(options.branch)
                 .with_initial_depth(options.initial_depth)
@@ -224,7 +225,7 @@ impl PolicyGraph {
             descriptor.clone(),
             condition.clone(),
             session.clone(),
-            schema.clone(),
+            Arc::new(schema.clone()),
             table.as_str(),
             branch,
             row_policy_mode,

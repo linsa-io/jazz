@@ -134,7 +134,10 @@ fn authz_cache_serves_hits_and_tracks_policy_dep_writes() {
         )
         .unwrap();
     core.immediate_tick();
-    assert_eq!(team_ids(&mut core, sub), vec![team1].into_iter().chain([]).collect::<Vec<_>>());
+    assert_eq!(
+        team_ids(&mut core, sub),
+        vec![team1].into_iter().chain([]).collect::<Vec<_>>()
+    );
     let hits_after = core
         .schema_manager_mut()
         .query_manager_mut()

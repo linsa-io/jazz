@@ -334,7 +334,8 @@ impl SourceNode for IndexScanNode {
                 match (was_member, is_member) {
                     (false, true) => {
                         self.last_scanned_ids.insert(row_id);
-                        self.current_tuples.insert(Tuple::from_scoped_id(row_id, branch));
+                        self.current_tuples
+                            .insert(Tuple::from_scoped_id(row_id, branch));
                         added.push(row_id);
                     }
                     (true, false) => {

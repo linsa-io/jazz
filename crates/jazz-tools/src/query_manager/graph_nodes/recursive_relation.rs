@@ -8,6 +8,7 @@
 use ahash::{AHashMap, AHashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::metadata::{RowProvenance, SYSTEM_PRINCIPAL_ID};
@@ -52,7 +53,7 @@ pub struct RecursiveRelationNode {
     /// Template for recursive step evaluation.
     step_template: SubgraphTemplate,
     /// Schema used to compile step subgraphs.
-    schema: Schema,
+    schema: Arc<Schema>,
     /// Value source used for step correlation.
     correlation_source: CorrelationSource,
     /// Optional hop from step rows to target rows.
@@ -77,7 +78,7 @@ impl RecursiveRelationNode {
         correlation_source: CorrelationSource,
         hop: Option<RecursiveHop>,
         max_depth: usize,
-        schema: Schema,
+        schema: Arc<Schema>,
     ) -> Self {
         Self {
             input_descriptor,
@@ -992,7 +993,7 @@ mod tests {
             CorrelationSource::Column(0),
             None,
             10,
-            schema,
+            Arc::new(schema),
         );
         assert_eq!(node.output_descriptor(), &output_desc);
         assert_eq!(node.max_depth, 10);
@@ -1021,7 +1022,7 @@ mod tests {
             CorrelationSource::Column(0),
             None,
             10,
-            schema.clone(),
+            Arc::new(schema.clone()),
         );
 
         let seed_desc = &schema.get(&TableName::new("teams")).unwrap().columns;
@@ -1069,7 +1070,7 @@ mod tests {
             CorrelationSource::Column(0),
             None,
             10,
-            schema.clone(),
+            Arc::new(schema.clone()),
         );
         let filtered_node = RecursiveRelationNode::new(
             input_desc,
@@ -1078,7 +1079,7 @@ mod tests {
             CorrelationSource::Column(0),
             None,
             10,
-            schema,
+            Arc::new(schema),
         );
 
         assert_ne!(

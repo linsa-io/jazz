@@ -11,6 +11,7 @@ use crate::query_manager::types::{RowDescriptor, RowPolicyMode, Schema, Value};
 use crate::schema_manager::SchemaContext;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// Template for creating subgraph instances.
 ///
@@ -29,7 +30,7 @@ pub struct SubgraphTemplate {
     /// Output descriptor for individual result rows.
     output_descriptor: RowDescriptor,
     /// Schema context inherited from the parent graph compile.
-    schema_context: SchemaContext,
+    schema_context: Arc<SchemaContext>,
     /// Session inherited from the parent graph compile.
     session: Option<Session>,
     /// Policy mode inherited from the parent graph compile.
@@ -49,7 +50,7 @@ impl SubgraphTemplate {
         inner_column: String,
         select_columns: Vec<String>,
         output_descriptor: RowDescriptor,
-        schema_context: SchemaContext,
+        schema_context: Arc<SchemaContext>,
         session: Option<Session>,
         row_policy_mode: RowPolicyMode,
     ) -> Self {
@@ -71,7 +72,7 @@ impl SubgraphTemplate {
     pub fn instantiate(
         &self,
         correlation_value: Value,
-        schema: &Schema,
+        schema: &Arc<Schema>,
     ) -> Option<SubgraphInstance> {
         // Build query with correlation filter
         let mut query_builder = QueryBuilder::new(self.base_query.table);
@@ -169,7 +170,7 @@ impl SubgraphTemplate {
         }
 
         let query = query_builder.try_build().ok()?;
-        let graph = QueryGraph::try_compile_with_schema_context(
+        let graph = QueryGraph::try_compile_with_schema_context_shared(
             &query,
             schema,
             self.session.clone(),
@@ -362,7 +363,7 @@ impl SubgraphBuilder {
             self.inner_column,
             self.select_columns,
             output_descriptor,
-            SchemaContext::with_defaults(schema.clone(), "main"),
+            Arc::new(SchemaContext::with_defaults(schema.clone(), "main")),
             self.session,
             self.row_policy_mode,
         ))
@@ -434,7 +435,7 @@ mod tests {
             .build(&schema)
             .unwrap();
 
-        let instance = template.instantiate(Value::Integer(42), &schema);
+        let instance = template.instantiate(Value::Integer(42), &Arc::new(schema.clone()));
         assert!(instance.is_some());
 
         let instance = instance.unwrap();
@@ -568,7 +569,9 @@ mod tests {
             .build(&schema)
             .unwrap();
 
-        let mut instance = template.instantiate(Value::Integer(1), &schema).unwrap();
+        let mut instance = template
+            .instantiate(Value::Integer(1), &Arc::new(schema.clone()))
+            .unwrap();
         instance.current_results = vec![Value::Integer(10), Value::Integer(20)];
 
         let array = instance.as_array();
@@ -626,13 +629,16 @@ mod tests {
             "email_address".to_string(),
             Vec::new(),
             output_descriptor,
-            schema_context,
+            Arc::new(schema_context),
             None,
             RowPolicyMode::PermissiveLocal,
         );
 
         let instance = template
-            .instantiate(Value::Text("alice@example.com".to_string()), &v2)
+            .instantiate(
+                Value::Text("alice@example.com".to_string()),
+                &Arc::new(v2.clone()),
+            )
             .expect("subgraph should compile using inherited schema context");
         assert_eq!(instance.graph.index_scan_nodes.len(), 1);
 

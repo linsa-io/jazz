@@ -5,6 +5,7 @@
 
 use ahash::AHashSet;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::object::ObjectId;
 use crate::query_manager::encoding::column_is_null;
@@ -35,7 +36,7 @@ pub struct PolicyFilterNode {
     policy_operation: Operation,
     session: Session,
     /// Schema for INHERITS lookups (resolving foreign key references).
-    schema: Schema,
+    schema: Arc<Schema>,
     /// Table name for this node (for INHERITS resolution).
     table_name: String,
     /// Branch name for index lookups.
@@ -105,7 +106,7 @@ impl PolicyFilterNode {
         descriptor: RowDescriptor,
         policy: PolicyExpr,
         session: Session,
-        schema: Schema,
+        schema: Arc<Schema>,
         table_name: impl Into<String>,
     ) -> Self {
         Self::new_with_options(
@@ -123,7 +124,7 @@ impl PolicyFilterNode {
         descriptor: RowDescriptor,
         policy: PolicyExpr,
         session: Session,
-        schema: Schema,
+        schema: Arc<Schema>,
         table_name: impl Into<String>,
         branch: impl Into<String>,
     ) -> Self {
@@ -141,7 +142,7 @@ impl PolicyFilterNode {
         descriptor: RowDescriptor,
         policy: PolicyExpr,
         session: Session,
-        schema: Schema,
+        schema: Arc<Schema>,
         table_name: impl Into<String>,
         branch: impl Into<String>,
         row_policy_mode: RowPolicyMode,
@@ -161,7 +162,7 @@ impl PolicyFilterNode {
         descriptor: RowDescriptor,
         policy: PolicyExpr,
         session: Session,
-        schema: Schema,
+        schema: Arc<Schema>,
         table_name: impl Into<String>,
         branch: impl Into<String>,
         row_policy_mode: RowPolicyMode,
@@ -184,7 +185,7 @@ impl PolicyFilterNode {
         descriptor: RowDescriptor,
         policy: PolicyExpr,
         session: Session,
-        schema: Schema,
+        schema: Arc<Schema>,
         table_name: impl Into<String>,
         branch: impl Into<String>,
         initial_depth: usize,
@@ -203,7 +204,7 @@ impl PolicyFilterNode {
         descriptor: RowDescriptor,
         policy: PolicyExpr,
         session: Session,
-        schema: Schema,
+        schema: Arc<Schema>,
         table_name: impl Into<String>,
         options: PolicyFilterOptions,
     ) -> Self {
@@ -636,7 +637,7 @@ mod tests {
             test_descriptor(),
             PolicyExpr::True,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -651,7 +652,7 @@ mod tests {
             test_descriptor(),
             PolicyExpr::False,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -673,7 +674,7 @@ mod tests {
                 value: PolicyValue::Literal(Value::Uuid(row_id)),
             },
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -705,7 +706,7 @@ mod tests {
             test_descriptor(),
             policy,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -727,7 +728,7 @@ mod tests {
             test_descriptor(),
             policy,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -757,7 +758,7 @@ mod tests {
             test_descriptor(),
             policy,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -788,7 +789,7 @@ mod tests {
             test_descriptor(),
             policy,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -816,7 +817,7 @@ mod tests {
             test_descriptor(),
             policy,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -854,7 +855,7 @@ mod tests {
                 max_depth: Some(1),
             },
             Session::new("user1"),
-            schema,
+            Arc::new(schema),
             "documents",
         );
 
@@ -892,7 +893,7 @@ mod tests {
             test_descriptor(),
             policy,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -912,7 +913,7 @@ mod tests {
             test_descriptor(),
             policy,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 
@@ -932,7 +933,7 @@ mod tests {
             test_descriptor(),
             policy,
             session,
-            test_schema(),
+            Arc::new(test_schema()),
             "documents",
         );
 

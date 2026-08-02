@@ -1,5 +1,6 @@
 use ahash::{AHashMap, AHashSet};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::object::ObjectId;
 use crate::query_manager::encoding::{decode_row, encode_row};
@@ -60,7 +61,7 @@ pub struct MagicColumnsNode {
     output_descriptor: RowDescriptor,
     element_requests: Vec<ElementMagicColumns>,
     session: Option<Session>,
-    schema: Schema,
+    schema: Arc<Schema>,
     branch: String,
     row_policy_mode: RowPolicyMode,
     dependency_tables: HashSet<String>,
@@ -77,7 +78,7 @@ impl MagicColumnsNode {
         input_tuple_descriptor: TupleDescriptor,
         requests: &[MagicColumnRequest],
         session: Option<Session>,
-        schema: Schema,
+        schema: Arc<Schema>,
         branch: impl Into<String>,
         row_policy_mode: RowPolicyMode,
     ) -> Option<Self> {

@@ -156,16 +156,14 @@ fn decode_ffi_json_value(value: FfiJsonValue, blobs: &[Vec<u8>]) -> Result<Value
             .map_err(|error| ffi_json_err(format!("invalid Bytea hex payload: {error}"))),
         // Clone, not take: the originals stay untouched in `blobs` so the return path can
         // recognize them by content and echo a BlobRef instead of the bytes.
-        FfiJsonValue::BlobRef(index) => blobs
-            .get(index)
-            .cloned()
-            .map(Value::Bytea)
-            .ok_or_else(|| {
+        FfiJsonValue::BlobRef(index) => {
+            blobs.get(index).cloned().map(Value::Bytea).ok_or_else(|| {
                 ffi_json_err(format!(
                     "BlobRef {index} out of range: {} blob(s) provided",
                     blobs.len()
                 ))
-            }),
+            })
+        }
         FfiJsonValue::Array(values) => values
             .into_iter()
             .map(|value| decode_ffi_json_value(value, blobs))
@@ -237,8 +235,9 @@ fn encode_return_value_with_blob_refs(value: &Value, blobs: &[Vec<u8>]) -> serde
             );
             serde_json::json!({ "type": "Row", "value": row })
         }
-        other => serde_json::to_value(other)
-            .expect("scalar Value serialization to JSON cannot fail"),
+        other => {
+            serde_json::to_value(other).expect("scalar Value serialization to JSON cannot fail")
+        }
     }
 }
 
@@ -1352,7 +1351,10 @@ mod blob_codec_tests {
     fn return_encoding_falls_back_to_hex_for_unknown_bytes() {
         let blobs = vec![vec![9u8; 16]];
         let encoded = encode_return_value_with_blob_refs(&Value::Bytea(vec![1u8, 2]), &blobs);
-        assert_eq!(encoded, serde_json::json!({"type": "Bytea", "value": "0102"}));
+        assert_eq!(
+            encoded,
+            serde_json::json!({"type": "Bytea", "value": "0102"})
+        );
     }
 
     #[test]

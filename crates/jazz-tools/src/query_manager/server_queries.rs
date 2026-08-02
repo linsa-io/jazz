@@ -592,6 +592,7 @@ impl QueryManager {
         verdict
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_provenance_row_select_policy(
         &mut self,
         storage: &dyn Storage,
@@ -640,7 +641,7 @@ impl QueryManager {
             AuthorizationPolicyRequest {
                 object_id,
                 branch_name,
-                table_name: table_name.clone(),
+                table_name,
                 policy: select_policy,
                 content: &tip_content,
                 provenance: &tip_provenance,
