@@ -1249,6 +1249,13 @@ impl QueryManager {
             }
 
             // Store the server subscription for reactive updates
+            tracing::info!(
+                client_id = %sub.client_id,
+                query_id = sub.query_id.0,
+                table = %sub.query.table,
+                total = self.server_subscriptions.len() + 1,
+                "server subscription registered"
+            );
             self.server_subscriptions.insert(
                 (sub.client_id, sub.query_id),
                 ServerQuerySubscription {

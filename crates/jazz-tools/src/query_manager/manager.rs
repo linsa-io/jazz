@@ -1126,7 +1126,18 @@ impl QueryManager {
         }
 
         for (client_id, query_id, code, reason, propagation) in failed_server {
-            self.server_subscriptions.remove(&(client_id, query_id));
+            if self
+                .server_subscriptions
+                .remove(&(client_id, query_id))
+                .is_some()
+            {
+                tracing::info!(
+                    client_id = %client_id,
+                    query_id = query_id.0,
+                    total = self.server_subscriptions.len(),
+                    "server subscription removed"
+                );
+            }
             self.sync_manager
                 .drop_client_query_subscription(client_id, query_id);
             if propagation == QueryPropagation::Full {
