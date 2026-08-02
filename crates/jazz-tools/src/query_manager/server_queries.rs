@@ -335,30 +335,31 @@ impl QueryManager {
     fn transform_content_to_authorization_schema(
         &self,
         table: &str,
-        content: &[u8],
+        content: &crate::query_manager::types::RowBytes,
         batch_id: BatchId,
         branch_name: BranchName,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
         auth_context: &crate::schema_manager::SchemaContext,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<crate::query_manager::types::RowBytes> {
         let source_hash = match self.source_schema_hash_for_authorization(
             branch_name,
             source_branch_schema_map,
             auth_context,
         )? {
             Some(source_hash) => source_hash,
-            None => return Some(content.to_vec()),
+            // Identity: share the caller's allocation instead of copying.
+            None => return Some(content.clone()),
         };
 
         if source_hash == auth_context.current_hash {
-            return Some(content.to_vec());
+            return Some(content.clone());
         }
 
         let transformer = LensTransformer::new(auth_context, table);
         transformer
             .transform(content, batch_id, source_hash)
             .ok()
-            .map(|result| result.data)
+            .map(|result| crate::query_manager::types::RowBytes::from(result.data))
     }
 
     fn source_schema_hash_for_authorization(
@@ -432,7 +433,12 @@ impl QueryManager {
         }
 
         let tip_batch_id = row.batch_id;
-        let tip_content = row.data.clone();
+        // Canonicalize so every authorization load of this (row, batch)
+        // shares one allocation with the subscription graphs.
+        let tip_content =
+            self.row_bytes_dedup
+                .borrow_mut()
+                .dedup(object_id, tip_batch_id, row.data.clone());
         let tip_provenance = row.row_provenance();
 
         let transformed = self.transform_content_to_authorization_schema(
@@ -475,9 +481,10 @@ impl QueryManager {
         let Some(table_schema) = auth_schema.get(&table_name) else {
             return false;
         };
+        let content_bytes = crate::query_manager::types::RowBytes::from(content);
         let Some(transformed) = self.transform_content_to_authorization_schema(
             table_name.as_str(),
-            content,
+            &content_bytes,
             BatchId([0; 16]),
             branch_name,
             source_branch_schema_map,
@@ -1106,6 +1113,7 @@ impl QueryManager {
             let mut schema_warnings = SchemaWarningAccumulator::default();
             let include_deleted = sub.query.include_deleted;
             {
+                let row_bytes_dedup = &self.row_bytes_dedup;
                 let row_loader =
                     |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
                         Self::load_visible_row_for_query(
@@ -1123,6 +1131,7 @@ impl QueryManager {
                             &table,
                             super::graph_nodes::output::QuerySubscriptionId(sub.query_id.0),
                             &mut schema_warnings,
+                            row_bytes_dedup,
                         )
                     };
 
@@ -1360,6 +1369,7 @@ impl QueryManager {
             // Row loader for this subscription
             let new_scope: Option<Cow<'_, HashSet<(ObjectId, BranchName)>>> = {
                 {
+                    let row_bytes_dedup = &self.row_bytes_dedup;
                     let row_loader =
                         |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
                             Self::load_visible_row_for_query(
@@ -1377,6 +1387,7 @@ impl QueryManager {
                                 &table,
                                 super::graph_nodes::output::QuerySubscriptionId(query_id.0),
                                 &mut schema_warnings,
+                                row_bytes_dedup,
                             )
                         };
 

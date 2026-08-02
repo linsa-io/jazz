@@ -16,6 +16,7 @@ mod query_to_relation_ir;
 pub mod query_wire;
 pub mod relation_ir;
 mod relation_ir_query_plan;
+mod row_bytes_dedup;
 pub mod server_queries;
 pub mod session;
 pub mod settlement_eval_cache;

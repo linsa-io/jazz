@@ -552,6 +552,13 @@ pub struct QueryManager {
     /// scope instead of reloading it once per subscription emission.
     pub(super) authoritative_batch_fate_cache: HashMap<BatchId, Option<BatchFate>>,
 
+    /// Canonical shared allocations for loaded row content, keyed by
+    /// (row, batch). Persistent backends deserialize a private copy per
+    /// load; without this cache every subscription retains its own copy
+    /// of identical bytes. Interior mutability because row loaders are
+    /// shared-borrow closures built during settle.
+    pub(super) row_bytes_dedup: std::cell::RefCell<super::row_bytes_dedup::RowBytesDedup>,
+
     /// Currently queued SyncManager batch fates whose query effects have
     /// already been applied by this manager.
     ///
@@ -667,6 +674,7 @@ impl QueryManager {
             pending_local_row_batches: HashMap::new(),
             visible_rows_by_batch: HashMap::new(),
             authoritative_batch_fate_cache: HashMap::new(),
+            row_bytes_dedup: Default::default(),
             applied_pending_batch_fates: Vec::new(),
             known_schemas: Arc::new(HashMap::new()),
             pending_catalogue_schema_hashes: HashSet::new(),
@@ -1508,6 +1516,7 @@ impl QueryManager {
             let delta = {
                 let schema_context = &self.schema_context;
                 let branch_schema_map = &self.branch_schema_map;
+                let row_bytes_dedup = &self.row_bytes_dedup;
                 let row_loader =
                     |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
                         let lacks_authoritative_remote_scope = subscription.sync_backed
@@ -1546,6 +1555,7 @@ impl QueryManager {
                             &table,
                             sub_id,
                             &mut schema_warnings,
+                            row_bytes_dedup,
                         )
                     };
 
@@ -2760,6 +2770,7 @@ impl QueryManager {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn load_visible_row_for_query(
         storage: &dyn Storage,
         row_id: ObjectId,
@@ -2775,6 +2786,7 @@ impl QueryManager {
         table_for_warnings: &str,
         sub_id: QuerySubscriptionId,
         schema_warnings: &mut SchemaWarningAccumulator,
+        row_bytes_dedup: &std::cell::RefCell<super::row_bytes_dedup::RowBytesDedup>,
     ) -> Option<LoadedRow> {
         let exact_pending_visible_row = || {
             let pending_version = local_pending_version?;
@@ -2878,8 +2890,15 @@ impl QueryManager {
             }
         }
 
+        // Canonicalize the freshly loaded bytes so every subscription over
+        // this (row, batch) shares one allocation. The lens path above is
+        // deliberately NOT deduplicated: its transformed bytes share the
+        // source batch id and would collide with the raw content.
+        let data = row_bytes_dedup
+            .borrow_mut()
+            .dedup(row_id, row.batch_id, row.data);
         Some(LoadedRow::new(
-            row.data,
+            data,
             row_provenance,
             [(row_id, BranchName::new(source_branch))]
                 .into_iter()

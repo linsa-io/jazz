@@ -17,6 +17,16 @@ impl RowBytes {
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.as_ref().to_vec()
     }
+
+    /// The shared allocation behind these bytes (for cross-subscription
+    /// deduplication — see `query_manager::row_bytes_dedup`).
+    pub(crate) fn as_arc(&self) -> &Arc<[u8]> {
+        &self.0
+    }
+
+    pub(crate) fn from_arc(arc: Arc<[u8]>) -> Self {
+        Self(arc)
+    }
 }
 
 impl From<Vec<u8>> for RowBytes {

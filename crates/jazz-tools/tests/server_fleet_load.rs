@@ -159,24 +159,27 @@ fn linsa_like_schema() -> jazz_tools::Schema {
 /// clients are dropped. This is the number that decides how many peers a
 /// server survives.
 ///
-/// Measured 2026-08-02: ~4.35 MiB per client on a ~5 MiB store — the server
-/// retains ~85% of the store size PER SUBSCRIBER (sent_batch_ids frontier +
-/// subscription graph state). Extrapolated to the linsa field store (129 MB):
-/// ~108 MB/client, i.e. a 3 GiB container dies at ~25-30 concurrent peers.
-/// The budget sits just above today's measured value as a no-regression
-/// gate; ratchet it down hard (target ≤256 KiB) when frontier compaction /
-/// windowed delivery land (linsa-i#183).
+/// Measured 2026-08-02 on RocksDB with the row-content dedup cache in
+/// place: ~4.4 MiB per parked client on this 580-row fixture — pure per-ROW
+/// bookkeeping (~7.5 KiB/row: sent_batch_ids frontier, scope sets, graph
+/// tuple structs); row VALUES are now shared across subscribers
+/// (`query_manager::row_bytes_dedup`). Per-client cost therefore scales
+/// with visible ROW COUNT, not store bytes. Ratchet target ≤256 KiB when
+/// frontier watermarks / bookkeeping slimming land (linsa-i#183).
 const PARKED_PER_CLIENT_BUDGET_BYTES: u64 = 5 * MIB;
 
 /// After a zero-TTL sweep of all 100 dead sessions the server must return
-/// to near-baseline.
-const RESIDUAL_AFTER_SWEEP_BUDGET_BYTES: u64 = 32 * MIB;
+/// to near-baseline (8 MiB measured on RocksDB).
+const RESIDUAL_AFTER_SWEEP_BUDGET_BYTES: u64 = 16 * MIB;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn fleet_of_100_clients_survives_and_releases() {
     let schema = linsa_like_schema();
+    // RocksDB like production: the in-memory backend Arc-shares row loads
+    // with the store itself and understates per-subscriber costs.
     let server = JazzServer::builder()
         .with_schema(schema.clone())
+        .with_rocksdb_storage()
         .start()
         .await;
 
