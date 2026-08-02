@@ -460,7 +460,7 @@ pub fn create<W: StreamAdapter, T: TickNotifier>(
     auth: AuthConfig,
     tick: T,
 ) -> (TransportHandle, TransportManager<W, T>) {
-    create_with_retry_config(url, auth, tick, TransportRetryConfig::default())
+    create_with_retry_config(url, auth, tick, TransportRetryConfig::default(), None)
 }
 
 pub fn create_with_retry_config<W: StreamAdapter, T: TickNotifier>(
@@ -468,9 +468,14 @@ pub fn create_with_retry_config<W: StreamAdapter, T: TickNotifier>(
     auth: AuthConfig,
     tick: T,
     retry_config: TransportRetryConfig,
+    client_id: Option<ClientId>,
 ) -> (TransportHandle, TransportManager<W, T>) {
     let server_id = ServerId::new();
-    let client_id = ClientId::new();
+    // The wire ClientId is the identity the server keys its per-client
+    // delivery frontier (`sent_batch_ids`) and reconnect parking by. Callers
+    // that own persistent storage pass the store's stable id so a process
+    // restart resumes instead of replaying the full visible dataset.
+    let client_id = client_id.unwrap_or_default();
     let (outbox_tx, outbox_rx) = mpsc::unbounded();
     let (inbound_tx, inbound_rx) = mpsc::unbounded();
     let (control_tx, control_rx) = mpsc::unbounded();
@@ -1460,6 +1465,7 @@ mod tests {
             AuthConfig::default(),
             CountingTick(counter.clone()),
             retry_config,
+            None,
         );
         let task = tokio::spawn(manager.run());
 
@@ -1563,6 +1569,7 @@ mod tests {
             AuthConfig::default(),
             CountingTick(counter.clone()),
             retry_config,
+            None,
         );
         let task = tokio::spawn(manager.run());
 

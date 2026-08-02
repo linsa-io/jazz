@@ -742,3 +742,46 @@ async fn memory_storage_client_does_not_persist_local_state_to_disk() {
         .await
         .expect("shutdown restarted memory client");
 }
+
+// A persistent client must present the SAME wire client id across process
+// restarts. The server keys its delivery frontier (`sent_batch_ids`) and
+// parked reconnect state by client id — a fresh id per launch makes every
+// app relaunch look like a brand-new device and forces a full re-stream of
+// everything the client can see (field incident 2026-08-02: ~900 MB server
+// burst per relaunch against a 129 MB store).
+#[tokio::test]
+async fn persistent_client_keeps_wire_client_id_across_restarts() {
+    let schema = test_schema();
+    let server = JazzServer::start_with_schema(schema.clone()).await;
+    let client_dir = TempDir::new().expect("client dir");
+    let context = AppContext {
+        app_id: server.app_id(),
+        client_id: None,
+        schema,
+        server_url: server.base_url(),
+        data_dir: client_dir.path().to_path_buf(),
+        storage: ClientStorage::Persistent,
+        jwt_token: Some(TestJwtIssuer::jwt_for_user("stable-wire-id")),
+        backend_secret: None,
+        admin_secret: None,
+        sync_tracer: None,
+    };
+
+    let first = JazzClient::connect(context.clone())
+        .await
+        .expect("connect first launch");
+    let first_id = first.client_id().expect("first wire client id");
+    first.shutdown().await.expect("shutdown first launch");
+
+    let second = JazzClient::connect(context)
+        .await
+        .expect("connect second launch");
+    let second_id = second.client_id().expect("second wire client id");
+    assert_eq!(
+        first_id, second_id,
+        "persistent storage must keep a stable wire client id across restarts \
+         so the server's per-client delivery frontier survives an app relaunch"
+    );
+    second.shutdown().await.expect("shutdown second launch");
+    server.shutdown().await;
+}

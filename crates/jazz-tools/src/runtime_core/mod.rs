@@ -811,8 +811,18 @@ where
         core.transport().is_none(),
         "install_transport called while a transport is already installed; call clear_transport / disconnect first"
     );
-    let (handle, manager) =
-        crate::transport_manager::create_with_retry_config::<W, T>(url, auth, tick, retry_config);
+    // Resolve the wire ClientId from the runtime's storage so every binding
+    // (client, RN, NAPI) presents a stable identity across process restarts.
+    // The server keys its per-client delivery frontier by this id; a fresh id
+    // per launch makes every relaunch replay the full visible dataset.
+    let client_id = Some(stable_wire_client_id(core.storage_mut()));
+    let (handle, manager) = crate::transport_manager::create_with_retry_config::<W, T>(
+        url,
+        auth,
+        tick,
+        retry_config,
+        client_id,
+    );
     handle.set_catalogue_state_hash(Some(core.schema_manager().catalogue_state_hash()));
     handle.set_declared_schema_hash(
         core.schema_manager()
@@ -825,6 +835,40 @@ where
         .add_pending_server(handle.server_id);
     core.set_transport(handle);
     manager
+}
+
+/// Load the store's stable wire ClientId, minting and persisting one on
+/// first use.
+///
+/// The id lives INSIDE the store (raw KV table `__jazz_meta`) on purpose:
+/// wiping the local store must also rotate the identity, otherwise the
+/// server's per-client delivery frontier would skip batches the client no
+/// longer has. Backends without raw-table support fall back to a fresh id
+/// per process — the pre-existing behavior.
+#[cfg(feature = "transport")]
+fn stable_wire_client_id<S: crate::storage::Storage>(
+    storage: &mut S,
+) -> crate::sync_manager::ClientId {
+    use crate::sync_manager::ClientId;
+
+    const META_TABLE: &str = "__jazz_meta";
+    const META_KEY: &str = "wire_client_id";
+
+    if let Ok(Some(bytes)) = storage.raw_table_get(META_TABLE, META_KEY)
+        && let Ok(text) = std::str::from_utf8(&bytes)
+        && let Some(id) = ClientId::parse(text.trim())
+    {
+        return id;
+    }
+
+    let id = ClientId::new();
+    if let Err(error) = storage.raw_table_put(META_TABLE, META_KEY, id.to_string().as_bytes()) {
+        tracing::debug!(
+            ?error,
+            "could not persist wire client id; falling back to per-process identity"
+        );
+    }
+    id
 }
 
 impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {

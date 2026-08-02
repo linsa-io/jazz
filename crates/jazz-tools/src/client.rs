@@ -239,14 +239,10 @@ impl JazzClient {
         build_schema_manager: impl FnOnce(&DynStorage, &AppContext) -> Result<SchemaManager>,
     ) -> Result<Self> {
         let default_session = default_session_from_context(&context);
-        // Loaded for its side effect of persisting the client-id file on disk;
-        // the wire ClientId is assigned by `TransportManager::create` at connect
-        // time and is exposed via `runtime.transport_client_id()`.
-        let _client_id = match context.storage {
-            ClientStorage::Persistent => load_or_create_persistent_client_id(&context)?,
-            ClientStorage::Memory => context.client_id.unwrap_or_default(),
-        };
-
+        // The wire ClientId is resolved inside `install_transport` from the
+        // runtime's storage (`__jazz_meta`/`wire_client_id`), so persistent
+        // clients keep a stable identity across restarts and the server's
+        // per-client delivery frontier survives an app relaunch.
         let storage: DynStorage = match context.storage {
             ClientStorage::Persistent => open_persistent_storage(&context.data_dir).await?,
             ClientStorage::Memory => Box::new(MemoryStorage::new()),
@@ -1008,29 +1004,6 @@ mod tests {
             "non-lock errors should not be retried and should fail immediately"
         );
     }
-}
-
-fn load_or_create_persistent_client_id(context: &AppContext) -> Result<ClientId> {
-    std::fs::create_dir_all(&context.data_dir)?;
-
-    let client_id_path = context.data_dir.join("client_id");
-    let client_id = if client_id_path.exists() {
-        let id_str = std::fs::read_to_string(&client_id_path)?;
-        ClientId::parse(id_str.trim()).unwrap_or_else(|| {
-            let id = context.client_id.unwrap_or_default();
-            let _ = std::fs::write(&client_id_path, id.to_string());
-            id
-        })
-    } else if let Some(id) = context.client_id {
-        std::fs::write(&client_id_path, id.to_string())?;
-        id
-    } else {
-        let id = ClientId::new();
-        std::fs::write(&client_id_path, id.to_string())?;
-        id
-    };
-
-    Ok(client_id)
 }
 
 /// Convert an HTTP(S) server URL to the app-scoped WebSocket endpoint URL.
