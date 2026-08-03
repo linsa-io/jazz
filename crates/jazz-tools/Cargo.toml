@@ -42,6 +42,7 @@ server = [
   "dep:reqwest",
 ]
 cli = ["server", "rocksdb", "dep:clap", "dep:mimalloc"]
+heap-profile = ["dep:dhat"]
 test-utils = ["server", "client", "sqlite"]
 test = ["test-utils", "cli"]
 otel-core = [
@@ -56,6 +57,7 @@ otel-core = [
 otel = ["cli", "otel-core"]
 
 [dependencies]
+dhat = { version = "0.3", optional = true }
 opfs-btree = { path = "../opfs-btree", version = "0.1.0" }
 futures = "0.3"
 tracing = "0.1"
@@ -133,6 +135,7 @@ lz4_flex = "0.13.1"
 gloo-timers = { version = "0.3", features = ["futures"] }
 
 [dev-dependencies]
+dhat = "0.3"
 # Test-only: exposes `InMemoryMetricExporter` for asserting observed metric
 # values. Scoped to dev-dependencies so the `testing` feature never reaches a
 # production build (Cargo enables dev-dependency features only for tests).

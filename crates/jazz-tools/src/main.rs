@@ -11,8 +11,44 @@
 // allocation-heavy paths (query/insert/observer). The global allocator is a
 // per-binary choice; library code in `jazz-tools` does not declare one so that
 // consumers (jazz-napi, todo-server, third-party embedders) keep theirs.
+#[cfg(not(feature = "heap-profile"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Heap-profiling build: DHAT records every allocation's call stack. The
+// profile is written when the profiler drops — a SIGTERM/SIGINT handler dumps
+// it BEFORE any teardown so state that is live while serving stays live in
+// the profile, then exits immediately.
+#[cfg(feature = "heap-profile")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "heap-profile")]
+static HEAP_PROFILER: std::sync::Mutex<Option<dhat::Profiler>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "heap-profile")]
+fn start_heap_profiler() {
+    let file = std::env::var("DHAT_FILE").unwrap_or_else(|_| "dhat-server.json".to_string());
+    let profiler = dhat::Profiler::builder()
+        .file_name(&file)
+        .trim_backtraces(None)
+        .build();
+    *HEAP_PROFILER.lock().unwrap() = Some(profiler);
+    eprintln!("heap-profile: recording to {file}; SIGTERM/SIGINT dumps and exits");
+    tokio::spawn(async {
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let mut int =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        eprintln!("heap-profile: dumping profile…");
+        drop(HEAP_PROFILER.lock().unwrap().take());
+        std::process::exit(0);
+    });
+}
 
 mod commands;
 
@@ -186,6 +222,9 @@ enum CreateResource {
 async fn main() {
     // Initialize tracing with layered subscriber
     init_tracing();
+
+    #[cfg(feature = "heap-profile")]
+    start_heap_profiler();
 
     let cli = Cli::parse();
     if let Err(error) = validate_server_cli_options(&cli.command) {

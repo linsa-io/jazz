@@ -168,48 +168,53 @@ async fn per_subscription_fixed_cost_on_small_data() {
             .build()
     };
 
-    // Warm phase: caches, first compiles.
+    let empty_query = || {
+        QueryBuilder::new("messages")
+            .filter_eq("chat_id", Value::Uuid(ObjectId::new()))
+            .limit(50)
+            .build()
+    };
+
+    // Warm phase: caches, first compiles of every shape.
     let mut warm = Vec::new();
     for i in 0..WARM_SUBS {
-        let sub = if i % 2 == 0 {
-            alice.subscribe(include_query()).await.expect("subscribe")
-        } else {
+        warm.push(alice.subscribe(include_query()).await.expect("subscribe"));
+        warm.push(
             alice
                 .subscribe(thread_query(chat_ids[i % CHATS]))
                 .await
-                .expect("subscribe")
-        };
-        warm.push(sub);
+                .expect("subscribe"),
+        );
+        warm.push(alice.subscribe(empty_query()).await.expect("subscribe"));
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let after_warm = live_now();
 
-    // Measured phase: identical shapes over warm everything.
-    let mut measured = Vec::new();
-    for i in 0..MEASURED_SUBS {
-        let sub = if i % 2 == 0 {
-            alice.subscribe(include_query()).await.expect("subscribe")
-        } else {
-            alice
-                .subscribe(thread_query(chat_ids[i % CHATS]))
-                .await
-                .expect("subscribe")
+    // Decomposition: marginal cost per subscription SHAPE over warm caches.
+    let mut phase =
+        async |label: &str, make: &dyn Fn() -> jazz_tools::query_manager::query::Query| {
+            let before = live_now();
+            let mut subs = Vec::new();
+            for _ in 0..MEASURED_SUBS {
+                subs.push(alice.subscribe(make()).await.expect("subscribe"));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let marginal = live_now().saturating_sub(before);
+            eprintln!(
+                "{label}: {MEASURED_SUBS} subs, +{} KiB total, ~{} KiB per sub",
+                marginal / KIB,
+                marginal / MEASURED_SUBS as u64 / KIB,
+            );
+            subs
         };
-        measured.push(sub);
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let after_measured = live_now();
 
-    let marginal_total = after_measured.saturating_sub(after_warm);
-    let per_sub = marginal_total / MEASURED_SUBS as u64;
-    eprintln!(
-        "{MEASURED_SUBS} extra subscriptions: +{} KiB total, ~{} KiB per subscription \
-         (client+server combined, in-proc)",
-        marginal_total / KIB,
-        per_sub / KIB,
-    );
+    let empty_subs = phase("EMPTY  (0 rows, pure compile)", &empty_query).await;
+    let chat0 = chat_ids[0];
+    let flat_subs = phase("FLAT   (50 rows, no include)", &move || thread_query(chat0)).await;
+    let incl_subs = phase("INCLUDE(3 chats x 40 msgs)  ", &include_query).await;
 
-    drop(measured);
+    drop(incl_subs);
+    drop(flat_subs);
+    drop(empty_subs);
     drop(warm);
     alice.shutdown().await.expect("shutdown alice");
     writer.shutdown().await.expect("shutdown writer");
