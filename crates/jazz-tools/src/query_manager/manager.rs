@@ -2393,7 +2393,7 @@ impl QueryManager {
     ) {
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
-                subscription.graph.mark_rows_updated(ids);
+                subscription.graph.mark_rows_updated(table, ids);
                 if local_overlay {
                     subscription
                         .pending_local_row_ids
@@ -2403,21 +2403,22 @@ impl QueryManager {
         }
         for server_sub in self.server_subscriptions.values_mut() {
             if Self::subscription_involves_table(&server_sub.graph, table) {
-                server_sub.graph.mark_rows_updated(ids);
+                server_sub.graph.mark_rows_updated(table, ids);
             }
         }
     }
 
     pub(crate) fn mark_local_row_updated_in_subscriptions(&mut self, table: &str, id: ObjectId) {
+        let ids = ahash::AHashSet::from_iter([id]);
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
-                subscription.graph.mark_row_updated(id);
+                subscription.graph.mark_rows_updated(table, &ids);
                 subscription.pending_local_row_ids.insert(id);
             }
         }
         for server_sub in self.server_subscriptions.values_mut() {
             if Self::subscription_involves_table(&server_sub.graph, table) {
-                server_sub.graph.mark_row_updated(id);
+                server_sub.graph.mark_rows_updated(table, &ids);
             }
         }
     }
@@ -2430,7 +2431,7 @@ impl QueryManager {
     ) {
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
-                subscription.graph.mark_rows_deleted(ids);
+                subscription.graph.mark_rows_deleted(table, ids);
                 if local_overlay {
                     subscription
                         .pending_local_row_ids
@@ -2440,21 +2441,22 @@ impl QueryManager {
         }
         for server_sub in self.server_subscriptions.values_mut() {
             if Self::subscription_involves_table(&server_sub.graph, table) {
-                server_sub.graph.mark_rows_deleted(ids);
+                server_sub.graph.mark_rows_deleted(table, ids);
             }
         }
     }
 
     pub(super) fn mark_local_row_deleted_in_subscriptions(&mut self, table: &str, id: ObjectId) {
+        let ids = ahash::AHashSet::from_iter([id]);
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
-                subscription.graph.mark_row_deleted(id);
+                subscription.graph.mark_rows_deleted(table, &ids);
                 subscription.pending_local_row_ids.insert(id);
             }
         }
         for server_sub in self.server_subscriptions.values_mut() {
             if Self::subscription_involves_table(&server_sub.graph, table) {
-                server_sub.graph.mark_row_deleted(id);
+                server_sub.graph.mark_rows_deleted(table, &ids);
             }
         }
     }

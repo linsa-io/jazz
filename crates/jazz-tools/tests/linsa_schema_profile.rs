@@ -31,11 +31,18 @@ struct TrackingAllocator;
 
 static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 static PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Cumulative allocated bytes — CHURN, not residency.
+///
+/// Live bytes are blind to the cost the per-write phase below exists to catch:
+/// work that allocates and frees inside one settle leaves residency flat while
+/// burning CPU. That is exactly the shape of the include-instance walk.
+static TOTAL_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
+            TOTAL_ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
             let live = LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed)
                 + layout.size() as u64;
             PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
@@ -51,6 +58,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
+            TOTAL_ALLOCATED.fetch_add(new_size as u64, Ordering::Relaxed);
             LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
             let live = LIVE_BYTES.fetch_add(new_size as u64, Ordering::Relaxed) + new_size as u64;
             PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
@@ -68,6 +76,10 @@ fn live_mb() -> f64 {
 
 fn peak_mb() -> f64 {
     PEAK_BYTES.load(Ordering::Relaxed) as f64 / 1048576.0
+}
+
+fn total_allocated() -> u64 {
+    TOTAL_ALLOCATED.load(Ordering::Relaxed)
 }
 
 fn heartbeats() -> usize {
@@ -181,15 +193,66 @@ async fn open_app_graph(
                 .expect("sub chat by id"),
         );
     }
+    // The chat list resolves its participants inline, so this one is
+    // include-bearing too: one subgraph instance per visible chat.
     subs.push(
         client
-            .subscribe(QueryBuilder::new("chats").build())
+            .subscribe(
+                QueryBuilder::new("chats")
+                    .with_array("members", |members| {
+                        members
+                            .from("chat_members")
+                            .correlate("chatId", "chats.id")
+                            .filter_eq("isBanned", Value::Boolean(false))
+                    })
+                    .build(),
+            )
             .await
-            .expect("sub chats list"),
+            .expect("sub chats list with members include"),
     );
 
-    // messages ×9: five threads (limit 50) + four previews (limit 1)
-    for chat_id in chat_ids.iter().take(5) {
+    // messages ×9: five threads (limit 50) + four previews (limit 1).
+    //
+    // The first two threads carry the app's real INCLUDE shape: the mobile
+    // thread view reads each message together with its attachments, and each
+    // attachment together with the media variants that back the thumbnail.
+    // That is one array-subquery node per thread with a live subgraph instance
+    // per message, and a nested node inside it — the only shape in this
+    // profile that instantiates cached subgraphs at all. Without it the
+    // profile measures a graph made entirely of flat scans and is structurally
+    // blind to per-instance costs (v13-2 shipped past it for exactly that
+    // reason).
+    for chat_id in chat_ids.iter().take(2) {
+        subs.push(
+            client
+                .subscribe(
+                    QueryBuilder::new("messages")
+                        .filter_eq("chatId", Value::Uuid(*chat_id))
+                        .filter_eq("isDeleted", Value::Boolean(false))
+                        .order_by_desc("createdAtMs")
+                        .limit(50)
+                        .with_array("attachments", |attachments| {
+                            attachments
+                                .from("message_attachments")
+                                .correlate("messageId", "messages.id")
+                                .order_by("position")
+                                .with_array("variants", |variants| {
+                                    variants
+                                        .from("media_asset_variants")
+                                        .correlate(
+                                            "mediaAssetId",
+                                            "message_attachments.mediaAssetId",
+                                        )
+                                        .order_by("createdAtMs")
+                                })
+                        })
+                        .build(),
+                )
+                .await
+                .expect("sub thread with attachments include"),
+        );
+    }
+    for chat_id in chat_ids.iter().skip(2).take(3) {
         subs.push(
             client
                 .subscribe(
@@ -320,6 +383,8 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
     );
 
     let mut chat_ids = Vec::new();
+    let mut message_ids = Vec::new();
+    let mut attachment_asset_ids = Vec::new();
     for _ in 0..CHATS {
         let chat = insert_filled(
             &writer,
@@ -344,7 +409,7 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
             );
         }
         for i in 0..MESSAGES_PER_CHAT {
-            insert_filled(
+            let message = insert_filled(
                 &writer,
                 &schema,
                 "messages",
@@ -356,6 +421,43 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
                     ("isDeleted".into(), Value::Boolean(false)),
                 ],
             );
+            message_ids.push(message);
+
+            // Every third message carries a media attachment with two
+            // variants, so the thread includes hold non-empty arrays at both
+            // levels. An include over empty arrays would settle without ever
+            // touching the inner scans and would measure nothing.
+            if i % 3 != 0 {
+                continue;
+            }
+            let asset = insert_filled(
+                &writer,
+                &schema,
+                "media_assets",
+                vec![("ownerUserId".into(), Value::Uuid(alice))],
+            );
+            insert_filled(
+                &writer,
+                &schema,
+                "message_attachments",
+                vec![
+                    ("messageId".into(), Value::Uuid(message)),
+                    ("mediaAssetId".into(), Value::Uuid(asset)),
+                    ("position".into(), Value::Integer(0)),
+                ],
+            );
+            for variant in 0..2 {
+                insert_filled(
+                    &writer,
+                    &schema,
+                    "media_asset_variants",
+                    vec![
+                        ("mediaAssetId".into(), Value::Uuid(asset)),
+                        ("createdAtMs".into(), Value::Timestamp(1000 + variant)),
+                    ],
+                );
+            }
+            attachment_asset_ids.push(asset);
         }
         chat_ids.push(chat);
     }
@@ -456,6 +558,46 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
         .unwrap_or(0);
     eprintln!("alice sees {visible} chats (0 would mean policy-denied graph)");
 
+    // Same guard for the include shapes: an include whose arrays are all empty
+    // instantiates no inner scans and would make the whole graph look cheap
+    // for the wrong reason.
+    let thread_rows = alice_client
+        .query(
+            QueryBuilder::new("messages")
+                .filter_eq("chatId", Value::Uuid(chat_ids[0]))
+                .with_array("attachments", |attachments| {
+                    attachments
+                        .from("message_attachments")
+                        .correlate("messageId", "messages.id")
+                        .with_array("variants", |variants| {
+                            variants
+                                .from("media_asset_variants")
+                                .correlate("mediaAssetId", "message_attachments.mediaAssetId")
+                        })
+                })
+                .build(),
+            None,
+        )
+        .await
+        .expect("query the include-bearing thread shape");
+    let non_empty_includes = thread_rows
+        .iter()
+        .filter(|(_, values)| {
+            values
+                .iter()
+                .any(|value| matches!(value, Value::Array(items) if !items.is_empty()))
+        })
+        .count();
+    eprintln!(
+        "alice's thread include: {} rows, {non_empty_includes} carrying a non-empty array",
+        thread_rows.len(),
+    );
+    assert!(
+        non_empty_includes > 0,
+        "the include-bearing subscriptions instantiated no inner rows — the profile \
+         would be measuring a graph of flat scans again"
+    );
+
     // ── device 2: bob's identical graph — the per-device marginal ──────────
     let bob_client = connect_ready_user(&server, &schema, &bob.to_string(), "users", ready).await;
     let before_bob = live_mb();
@@ -484,6 +626,95 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
     assert_eq!(
         provenance_scans_after_subs, provenance_scans_before_subs,
         "provenance lookups walked row history during the subscription phases"
+    );
+
+    // ── phase D2: steady-state write cost with the include graph live ───────
+    //
+    // Phases A-E measure RESIDENCY. This one measures CHURN per write, which
+    // is the axis the v13-2 include regression lived on: it left live bytes
+    // flat and burned CPU re-walking cached subgraph instances. Two write
+    // shapes, both taken from the live app, on the same settled graph:
+    //
+    //   * a presence heartbeat on the hot `users` row — the ten-second tick
+    //     every device emits, and a table NO include in this graph reads. Its
+    //     cost must be independent of how many include instances are live.
+    //   * a new `media_asset_variants` row — one row into the innermost table
+    //     of the nested thread include, the shape that actually has to reach
+    //     one instance.
+    //
+    // Reported, not asserted: the numbers are the point, and a residency
+    // profile is the wrong place to pin a throughput budget. The hard gate on
+    // this axis is `tests/include_instance_flatness.rs`.
+    let probe_writes = 20;
+    let hot_asset = *attachment_asset_ids
+        .first()
+        .expect("seed produced at least one attachment asset");
+    eprintln!(
+        "phase D2 probe: {} messages / {} attachment assets seeded, {} live subs per device",
+        message_ids.len(),
+        attachment_asset_ids.len(),
+        alice_subs.len(),
+    );
+
+    let heartbeat_before = total_allocated();
+    let mut last_probe = None;
+    for i in 0..probe_writes {
+        last_probe = Some(
+            writer
+                .update(
+                    alice,
+                    vec![
+                        (
+                            "onlineTimeMs".to_string(),
+                            Value::Integer(1_000_000 + i as i32),
+                        ),
+                        (
+                            "onlineTimeUpdatedAtMs".to_string(),
+                            Value::Timestamp(9_000_000 + i as u64),
+                        ),
+                    ],
+                )
+                .expect("probe heartbeat"),
+        );
+    }
+    writer
+        .wait_for_batch(
+            last_probe.expect("probe heartbeats"),
+            DurabilityTier::EdgeServer,
+        )
+        .await
+        .expect("probe heartbeats durable");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let heartbeat_bytes = total_allocated() - heartbeat_before;
+
+    let variant_before = total_allocated();
+    for i in 0..probe_writes {
+        insert_filled(
+            &writer,
+            &schema,
+            "media_asset_variants",
+            vec![
+                ("mediaAssetId".into(), Value::Uuid(hot_asset)),
+                ("createdAtMs".into(), Value::Timestamp(9_000_000 + i as u64)),
+            ],
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let variant_bytes = total_allocated() - variant_before;
+
+    eprintln!(
+        "phase D2 per-write churn: users heartbeat {} B/write (no include reads `users`), \
+         nested-include inner row {} B/write; live {:.1} MiB",
+        heartbeat_bytes / probe_writes as u64,
+        variant_bytes / probe_writes as u64,
+        live_mb(),
+    );
+    eprintln!(
+        "phase D2 scan tripwires: tier-read {} provenance {}",
+        jazz_tools::row_histories::QUERY_TIER_READ_HISTORY_SCANS.load(Ordering::Relaxed)
+            - tier_scans_after_subs,
+        jazz_tools::row_histories::QUERY_PROVENANCE_HISTORY_SCANS.load(Ordering::Relaxed)
+            - provenance_scans_after_subs,
     );
 
     // ── teardown: drop both devices, sweep, must release ───────────────────

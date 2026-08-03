@@ -54,6 +54,101 @@ use super::subgraph::{SubgraphInstance, SubgraphTemplate};
 /// old recompile-per-row behaviour for the overflow rather than growing without bound.
 const MAX_CACHED_SUBGRAPHS: usize = 2048;
 
+/// Ceiling on ids held in [`PendingInnerDirt`] before it is flushed eagerly.
+///
+/// Sized like `MAX_PENDING_CHANGED_ROWS` in `index_scan.rs`, and for the same
+/// reason: past it the bookkeeping costs more than the work it defers. It is
+/// also what stops a node whose instances are never re-evaluated from pinning
+/// changed-id sets without bound — see [`Self::flush_pending_inner_dirt`] for
+/// the overflow policy.
+const MAX_PENDING_INNER_ROWS: usize = 4096;
+
+/// Inner-table dirt recorded at WRITE time and threaded into a cached subgraph
+/// instance when that instance is next evaluated (v13-3).
+///
+/// WHY: v13-2 threaded every mark into every cached instance eagerly, inside
+/// `mark_table_dependents_dirty` and the `forward_rows_*` siblings. That made
+/// one write cost O(live outer rows) on the write path — for every table the
+/// subscription touches, not just the include's own, because the content and
+/// removal channels were table-blind. Measured on the live server it doubled
+/// idle CPU and turned a ten-second presence heartbeat into a burst that
+/// scaled with the subscribed result set (`tests/include_instance_flatness.rs`
+/// pins both axes). Buffering here makes the write path O(1) in the instance
+/// count; the marks are applied per instance in `evaluate_subgraph_for_single`,
+/// which the settle already visits, so no instance sees a different bitmap
+/// than it would have under eager marking — only later.
+///
+/// The buffer is a SNAPSHOT, not a log: an instance behind `generation` gets
+/// the whole current payload applied. That is a superset of the marks it
+/// missed, and every mark is a "re-check this" instruction, so over-applying
+/// costs work, never correctness. `generation` plus the per-instance
+/// `applied_generation` is what makes application exactly-once: an instance
+/// compiled after a push starts all-dirty AND up to date, so it neither misses
+/// the change nor re-applies it.
+#[derive(Debug, Default)]
+struct PendingInnerDirt {
+    /// Bumped on every payload change. An instance is up to date exactly when
+    /// its `applied_generation` equals this.
+    generation: u64,
+    /// Cached instances still behind `generation`. The payload is non-empty
+    /// only while this is non-zero — reaching zero drops it.
+    stale_instances: usize,
+    /// Row-precise membership marks, per inner table.
+    rows: AHashMap<TableName, AHashSet<ObjectId>>,
+    /// Inner tables marked with no row information: a full rescan on apply.
+    /// Dominates `rows` for the same table, exactly as `IndexScanNode`'s
+    /// `needs_full` dominates its pending set.
+    full_tables: AHashSet<TableName>,
+    /// Content re-load marks, per inner table.
+    updated: AHashMap<TableName, AHashSet<ObjectId>>,
+    /// Removal marks, per inner table.
+    deleted: AHashMap<TableName, AHashSet<ObjectId>>,
+}
+
+/// Which table-keyed content buffer a graph-level row mark lands in.
+#[derive(Debug, Clone, Copy)]
+enum ContentMark {
+    Updated,
+    Deleted,
+}
+
+impl PendingInnerDirt {
+    /// Ids currently buffered, across every channel and inner table.
+    fn buffered_ids(&self) -> usize {
+        fn total(per_table: &AHashMap<TableName, AHashSet<ObjectId>>) -> usize {
+            per_table.values().map(|ids| ids.len()).sum()
+        }
+        total(&self.rows) + total(&self.updated) + total(&self.deleted)
+    }
+
+    /// Thread the whole payload into one instance's graph, in the order the
+    /// eager path delivered it: table-level marks (which force a full rescan)
+    /// before row-precise ones, membership before content before removals —
+    /// the order `apply_batched_subscription_visibility_effects` marks in.
+    fn apply_to(&self, graph: &mut crate::query_manager::graph::QueryGraph) {
+        for table in &self.full_tables {
+            graph.mark_dirty_for_table(table.as_str());
+        }
+        for (table, ids) in &self.rows {
+            graph.mark_rows_changed_for_table(table.as_str(), ids);
+        }
+        for (table, ids) in &self.updated {
+            graph.mark_rows_updated(table.as_str(), ids);
+        }
+        for (table, ids) in &self.deleted {
+            graph.mark_rows_deleted(table.as_str(), ids);
+        }
+    }
+
+    fn clear_payload(&mut self) {
+        self.rows.clear();
+        self.full_tables.clear();
+        self.updated.clear();
+        self.deleted.clear();
+        self.stale_instances = 0;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Correlate {
     /// Correlate using a column value from the outer row.
@@ -104,6 +199,14 @@ pub struct ArraySubqueryNode {
     subgraph_cache: AHashMap<(ObjectId, usize), CachedSubgraph>,
     /// Monotonic tick used to order cache entries by last use.
     subgraph_cache_clock: u64,
+    /// Inner-table dirt buffered at write time, applied per instance on use.
+    ///
+    /// Boxed: the buffer's four collections are ~200 bytes of mostly-empty
+    /// headers, and `ArraySubqueryNode` is the largest `GraphNode` variant, so
+    /// inline they would widen every node slot in every compiled graph
+    /// (`clippy::large_enum_variant`). One pointer here, one allocation per
+    /// compiled node.
+    pending_inner_dirt: Box<PendingInnerDirt>,
 }
 
 #[derive(Debug)]
@@ -111,6 +214,9 @@ struct CachedSubgraph {
     correlation_value: Value,
     instance: SubgraphInstance,
     last_used: u64,
+    /// [`PendingInnerDirt::generation`] this instance's graph has already been
+    /// marked with. Behind it means the buffer still owes this instance.
+    applied_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +286,7 @@ impl ArraySubqueryNode {
             inner_dirty: false,
             subgraph_cache: AHashMap::new(),
             subgraph_cache_clock: 0,
+            pending_inner_dirt: Box::default(),
         }
     }
 
@@ -189,7 +296,16 @@ impl ArraySubqueryNode {
     /// than every row ever seen. Without this the cache is what grows without bound —
     /// the capacity ceiling is only a backstop.
     fn forget_cached_subgraphs(&mut self, outer_id: ObjectId) {
-        self.subgraph_cache.retain(|(id, _), _| *id != outer_id);
+        let generation = self.pending_inner_dirt.generation;
+        let mut dropped_stale = 0usize;
+        self.subgraph_cache.retain(|(id, _), cached| {
+            let keep = *id != outer_id;
+            if !keep && cached.applied_generation != generation {
+                dropped_stale += 1;
+            }
+            keep
+        });
+        self.release_stale_instances(dropped_stale);
     }
 
     /// Make room for one new entry, evicting the least recently used one if needed.
@@ -206,13 +322,67 @@ impl ArraySubqueryNode {
             .min_by_key(|(_, cached)| cached.last_used)
             .map(|(key, _)| *key)
         {
-            self.subgraph_cache.remove(&victim);
+            self.drop_cached_subgraph(&victim);
         }
+    }
+
+    /// Drop one cache entry, keeping the pending-dirt debt count in step.
+    fn drop_cached_subgraph(&mut self, key: &(ObjectId, usize)) {
+        if let Some(cached) = self.subgraph_cache.remove(key)
+            && cached.applied_generation != self.pending_inner_dirt.generation
+        {
+            self.release_stale_instances(1);
+        }
+    }
+
+    /// Record that `count` instances no longer owe the buffer an application.
+    /// The payload is dropped the moment nobody is behind it any more — that is
+    /// what keeps a settled node from carrying changed-id sets between ticks.
+    fn release_stale_instances(&mut self, count: usize) {
+        let pending = &mut self.pending_inner_dirt;
+        pending.stale_instances = pending.stale_instances.saturating_sub(count);
+        if pending.stale_instances == 0 {
+            pending.clear_payload();
+        }
+    }
+
+    /// Open a new buffer generation: every cached instance now owes it an
+    /// application. Called after any payload change.
+    fn bump_pending_generation(&mut self) {
+        self.pending_inner_dirt.generation += 1;
+        self.pending_inner_dirt.stale_instances = self.subgraph_cache.len();
+        if self.pending_inner_dirt.stale_instances == 0 {
+            // Nothing to owe it to — a node with no live instances buffers
+            // nothing, so an idle include costs nothing to keep marked.
+            self.pending_inner_dirt.clear_payload();
+        } else if self.pending_inner_dirt.buffered_ids() > MAX_PENDING_INNER_ROWS {
+            self.flush_pending_inner_dirt();
+        }
+    }
+
+    /// Bounded degradation past [`MAX_PENDING_INNER_ROWS`]: thread the payload
+    /// into every cached instance NOW — the v13-2 eager walk — and reset the
+    /// buffer.
+    ///
+    /// Deliberately not "mark everything on next use": `mark_all_dirty` is the
+    /// legacy coarse mark, and the legacy mark is exactly what fails to re-load
+    /// content for rows an instance already holds (the staleness family in
+    /// `manager_tests/subscription_output_oracle.rs`). Flushing eagerly keeps
+    /// the marks row-precise, so the overflow path costs one O(instances) walk
+    /// per `MAX_PENDING_INNER_ROWS` buffered ids — amortised O(instances/4096)
+    /// per id — and never trades correctness for the bound.
+    fn flush_pending_inner_dirt(&mut self) {
+        let generation = self.pending_inner_dirt.generation;
+        for cached in self.subgraph_cache.values_mut() {
+            self.pending_inner_dirt.apply_to(&mut cached.instance.graph);
+            cached.applied_generation = generation;
+        }
+        self.pending_inner_dirt.clear_payload();
     }
 
     /// Table-level sibling of [`Self::note_inner_rows_changed`] for dirt with
     /// no row information (F2): with precise dirtiness enabled the table mark
-    /// is threaded into every cached subgraph instance, whose scans on that
+    /// is buffered for every cached subgraph instance, whose scans on that
     /// table then take one full rescan (restoring an exact incremental
     /// baseline) while every other node stays clean. Without this, a
     /// table-level channel (e.g. the manager's row-coverage fallback in
@@ -224,9 +394,12 @@ impl ArraySubqueryNode {
         if !precise_dirty_enabled() {
             return;
         }
-        for cached in self.subgraph_cache.values_mut() {
-            cached.instance.graph.mark_dirty_for_table(table);
-        }
+        let table = TableName::new(table);
+        // The full-rescan mark dominates everything row-precise for this table,
+        // so drop what it subsumes rather than applying both.
+        self.pending_inner_dirt.rows.remove(&table);
+        self.pending_inner_dirt.full_tables.insert(table);
+        self.bump_pending_generation();
     }
 
     /// Row-precise sibling of [`Self::note_inner_table_dirty`] (F2): `ids`
@@ -234,12 +407,13 @@ impl ArraySubqueryNode {
     /// one or a nested one, both registered against this node at compile
     /// time).
     ///
-    /// With precise dirtiness enabled the ids are threaded into every cached
-    /// subgraph instance: the instance's index scans learn exactly which rows
-    /// changed (point-membership re-checks instead of full rescans), and the
-    /// instance's own `mark_table_dependents_dirty` routes nested-table ids
-    /// onward into nested ArraySubqueryNodes — the recursion that fixes
-    /// nested-include staleness (FINDING manifestation 2 in
+    /// With precise dirtiness enabled the ids are BUFFERED (see
+    /// [`PendingInnerDirt`]) and threaded into a cached subgraph instance when
+    /// that instance is next evaluated: the instance's index scans then learn
+    /// exactly which rows changed (point-membership re-checks instead of full
+    /// rescans), and the instance's own `mark_table_dependents_dirty` routes
+    /// nested-table ids onward into nested ArraySubqueryNodes — the recursion
+    /// that fixes nested-include staleness (FINDING manifestation 2 in
     /// `manager_tests/subscription_output_oracle.rs`). Content re-loads for
     /// held rows arrive separately via [`Self::forward_rows_updated`].
     ///
@@ -248,77 +422,67 @@ impl ArraySubqueryNode {
     /// `evaluate_subgraph_for_single`).
     pub fn note_inner_rows_changed(&mut self, table: &str, ids: &AHashSet<ObjectId>) {
         self.inner_dirty = true;
-        if !precise_dirty_enabled() {
+        if !precise_dirty_enabled() || ids.is_empty() {
             return;
         }
-        for cached in self.subgraph_cache.values_mut() {
-            cached
-                .instance
-                .graph
-                .mark_rows_changed_for_table(table, ids);
+        let table = TableName::new(table);
+        if self.pending_inner_dirt.full_tables.contains(&table) {
+            // Already scheduled for a full rescan; row detail adds nothing.
+            return;
         }
+        self.pending_inner_dirt
+            .rows
+            .entry(table)
+            .or_default()
+            .extend(ids.iter().copied());
+        self.bump_pending_generation();
     }
 
-    /// Forward a content-update mark into every cached subgraph instance so
-    /// include-inner materializers re-load rows they already hold (FINDING
-    /// manifestation 1). Table-blind by design — ids not held by an instance
-    /// are ignored there — mirroring the outer graph's `mark_rows_updated`
-    /// contract. Returns whether any instance actually tracked one of the
-    /// ids; only then does this node need re-evaluation (an untracked mark
-    /// cannot change any array, and treating it as dirt would make every
-    /// uncorrelated write re-settle every instance — the churn the precise
-    /// path exists to remove). Legacy mode forwards nothing, preserving the
-    /// old behavior byte for byte.
-    pub fn forward_row_updated(&mut self, id: ObjectId) -> bool {
-        if !precise_dirty_enabled() {
-            return false;
-        }
-        let mut any_tracked = false;
-        for cached in self.subgraph_cache.values_mut() {
-            any_tracked |= cached.instance.graph.mark_row_updated(id);
-        }
-        self.inner_dirty |= any_tracked;
-        any_tracked
+    /// Buffer a content-update mark so include-inner materializers re-load rows
+    /// they already hold (FINDING manifestation 1) when their instance is next
+    /// evaluated.
+    ///
+    /// `table` is one of this node's registered inner tables — the caller
+    /// (`QueryGraph::mark_rows_updated`) only forwards to nodes that read it.
+    /// That scoping is the other half of the v13-2 fix: the channel used to be
+    /// table-blind, so a write to ANY table in the subscription walked every
+    /// cached instance of every include, none of which could hold the row.
+    ///
+    /// Returns whether the node needs re-evaluation. Marks for a table this
+    /// node reads always qualify: the membership channel for the same table
+    /// runs first in the same tick (see
+    /// `apply_batched_subscription_visibility_effects`, whose changed-row set
+    /// is the union of the updated and deleted ids) and has already dirtied
+    /// this node, so answering "yes" here adds no re-settles — it only removes
+    /// the dependency on that ordering. Legacy mode buffers nothing,
+    /// preserving the old behavior byte for byte.
+    pub fn forward_rows_updated(&mut self, table: &str, ids: &AHashSet<ObjectId>) -> bool {
+        self.buffer_content_marks(table, ids, ContentMark::Updated)
     }
 
-    /// Plural sibling of [`Self::forward_row_updated`].
-    pub fn forward_rows_updated(&mut self, ids: &AHashSet<ObjectId>) -> bool {
-        if !precise_dirty_enabled() {
-            return false;
-        }
-        let mut any_tracked = false;
-        for cached in self.subgraph_cache.values_mut() {
-            any_tracked |= cached.instance.graph.mark_rows_updated(ids);
-        }
-        self.inner_dirty |= any_tracked;
-        any_tracked
+    /// Removal-delta counterpart of [`Self::forward_rows_updated`].
+    pub fn forward_rows_deleted(&mut self, table: &str, ids: &AHashSet<ObjectId>) -> bool {
+        self.buffer_content_marks(table, ids, ContentMark::Deleted)
     }
 
-    /// Forward a deletion mark into every cached subgraph instance — the
-    /// removal-delta counterpart of [`Self::forward_row_updated`].
-    pub fn forward_row_deleted(&mut self, id: ObjectId) -> bool {
-        if !precise_dirty_enabled() {
+    fn buffer_content_marks(
+        &mut self,
+        table: &str,
+        ids: &AHashSet<ObjectId>,
+        mark: ContentMark,
+    ) -> bool {
+        if !precise_dirty_enabled() || ids.is_empty() {
             return false;
         }
-        let mut any_tracked = false;
-        for cached in self.subgraph_cache.values_mut() {
-            any_tracked |= cached.instance.graph.mark_row_deleted(id);
-        }
-        self.inner_dirty |= any_tracked;
-        any_tracked
-    }
-
-    /// Plural sibling of [`Self::forward_row_deleted`].
-    pub fn forward_rows_deleted(&mut self, ids: &AHashSet<ObjectId>) -> bool {
-        if !precise_dirty_enabled() {
-            return false;
-        }
-        let mut any_tracked = false;
-        for cached in self.subgraph_cache.values_mut() {
-            any_tracked |= cached.instance.graph.mark_rows_deleted(ids);
-        }
-        self.inner_dirty |= any_tracked;
-        any_tracked
+        let table = TableName::new(table);
+        let sink = match mark {
+            ContentMark::Updated => &mut self.pending_inner_dirt.updated,
+            ContentMark::Deleted => &mut self.pending_inner_dirt.deleted,
+        };
+        sink.entry(table).or_default().extend(ids.iter().copied());
+        self.inner_dirty = true;
+        self.bump_pending_generation();
+        true
     }
 
     /// How many compiled subgraphs this node is holding.
@@ -628,17 +792,28 @@ impl ArraySubqueryNode {
                 Some(fresh) => {
                     self.evict_subgraphs_over_capacity(&cache_key);
                     self.subgraph_cache_clock += 1;
-                    self.subgraph_cache.insert(
+                    // A freshly compiled graph starts with every node dirty, so
+                    // it already covers everything the buffer holds: it is born
+                    // UP TO DATE with the current generation. That is what stops
+                    // an instance created after a buffered change from either
+                    // missing it or applying it a second time.
+                    let replaced = self.subgraph_cache.insert(
                         cache_key,
                         CachedSubgraph {
                             correlation_value: correlation_value.clone(),
                             instance: fresh,
                             last_used: self.subgraph_cache_clock,
+                            applied_generation: self.pending_inner_dirt.generation,
                         },
                     );
+                    if let Some(replaced) = replaced
+                        && replaced.applied_generation != self.pending_inner_dirt.generation
+                    {
+                        self.release_stale_instances(1);
+                    }
                 }
                 None => {
-                    self.subgraph_cache.remove(&cache_key);
+                    self.drop_cached_subgraph(&cache_key);
                     return (
                         Value::Array(vec![]),
                         TupleProvenance::default(),
@@ -658,6 +833,18 @@ impl ArraySubqueryNode {
             );
         };
         cached.last_used = clock;
+
+        // Apply whatever inner-table dirt was buffered since this instance was
+        // last evaluated. This is the deferred half of the write-path marking:
+        // the instance ends up with the bitmap the eager walk would have given
+        // it (a superset when several ticks coalesced), just paid for here,
+        // where the settle was going to visit it anyway.
+        let generation = self.pending_inner_dirt.generation;
+        let consumed_pending = cached.applied_generation != generation;
+        if consumed_pending {
+            self.pending_inner_dirt.apply_to(&mut cached.instance.graph);
+            cached.applied_generation = generation;
+        }
         let instance = &mut cached.instance;
 
         if reused && !precise_dirty_enabled() {
@@ -715,6 +902,9 @@ impl ArraySubqueryNode {
                 })
             })
             .collect();
+        if consumed_pending {
+            self.release_stale_instances(1);
+        }
         (Value::Array(array_elements), provenance, batch_provenance)
     }
 
@@ -785,14 +975,21 @@ impl ArraySubqueryNode {
     }
 
     /// Whether every cached subgraph serving this correlation value exists,
-    /// is bound to the current correlation, and carries no dirty nodes — in
-    /// which case re-evaluating it is provably a no-op (a settle over a clean
-    /// bitmap evaluates zero nodes, so the output tuples cannot have moved).
+    /// is bound to the current correlation, owes the pending-dirt buffer
+    /// nothing, and carries no dirty nodes — in which case re-evaluating it is
+    /// provably a no-op (a settle over a clean bitmap evaluates zero nodes, so
+    /// the output tuples cannot have moved).
+    ///
+    /// The generation check is what keeps deferral invisible: an instance with
+    /// buffered dirt still owed to it is NOT clean, exactly as it would not
+    /// have been under eager marking, so it is re-evaluated on the same tick.
     fn subgraph_state_clean(&self, outer_id: ObjectId, correlation_value: &Value) -> bool {
+        let generation = self.pending_inner_dirt.generation;
         let element_clean = |index: usize, element: &Value| {
             matches!(
                 self.subgraph_cache.get(&(outer_id, index)),
                 Some(cached) if &cached.correlation_value == element
+                    && cached.applied_generation == generation
                     && !cached.instance.graph.has_dirty_nodes()
             )
         };
@@ -823,68 +1020,92 @@ impl ArraySubqueryNode {
         // Clear inner_dirty flag
         self.inner_dirty = false;
 
-        // Collect state snapshots to avoid borrow issues during re-evaluation.
+        // Snapshot the IDS to re-evaluate, never the state behind them.
+        //
+        // This used to clone the whole `ArrayInstanceState` per instance —
+        // outer tuple, materialised array, provenance sets — purely to dodge
+        // the borrow conflict with `&mut self` below. That deep copy ran on
+        // every settle pass reaching this node, for every live instance, and
+        // showed up on the live server as `Vec<TupleElement>::clone` under
+        // `reevaluate_all`. Ids are `Copy`; the state is looked up again
+        // inside the loop, where the immutable borrow ends before any mutation
+        // needs one. Evaluation order, eviction and emitted deltas are
+        // unchanged: the map is not mutated between the collect and the
+        // lookups, so each instance sees exactly the state the snapshot held.
         let precise = precise_dirty_enabled();
-        let instances_snapshot: Vec<(ObjectId, ArrayInstanceState)> = self
+        let outer_ids: Vec<ObjectId> = self
             .instances
             .iter()
             .filter(|(id, state)| {
                 !precise || !self.subgraph_state_clean(**id, &state.correlation_value)
             })
-            .map(|(id, state)| (*id, state.clone()))
+            .map(|(id, _)| *id)
             .collect();
 
-        for (outer_id, old_state) in instances_snapshot {
-            // Re-evaluate subgraph
+        for outer_id in outer_ids {
+            // The correlation value is the one piece `evaluate_subgraph` needs
+            // while holding `&mut self`: a bound id or a small id array, not a
+            // materialised result set.
+            let Some(correlation_value) = self
+                .instances
+                .get(&outer_id)
+                .map(|state| state.correlation_value.clone())
+            else {
+                continue;
+            };
+
             let (new_array, new_provenance, new_batch_provenance) =
-                self.evaluate_subgraph(outer_id, &old_state.correlation_value, io, row_loader);
+                self.evaluate_subgraph(outer_id, &correlation_value, io, row_loader);
 
-            if old_state.array_result != new_array
-                || old_state.provenance != new_provenance
-                || old_state.batch_provenance != new_batch_provenance
+            let Some(old_state) = self.instances.get(&outer_id) else {
+                continue;
+            };
+            if old_state.array_result == new_array
+                && old_state.provenance == new_provenance
+                && old_state.batch_provenance == new_batch_provenance
             {
-                let old_tuple = self.build_output_tuple(
-                    &old_state.outer_tuple,
-                    &old_state.correlation_value,
-                    &old_state.array_result,
-                    &old_state.provenance,
-                    &old_state.batch_provenance,
-                );
-                let new_tuple = self.build_output_tuple(
-                    &old_state.outer_tuple,
-                    &old_state.correlation_value,
-                    &new_array,
-                    &new_provenance,
-                    &new_batch_provenance,
-                );
+                continue;
+            }
 
-                match (old_tuple, new_tuple) {
-                    (Some(old_tuple), Some(new_tuple)) => {
-                        result.updated.push((old_tuple.clone(), new_tuple.clone()));
-                        self.current_tuples.remove(&old_tuple);
-                        self.current_tuples.insert(new_tuple);
-                    }
-                    (Some(old_tuple), None) => {
-                        self.current_tuples.remove(&old_tuple);
-                        result.removed.push(old_tuple);
-                    }
-                    (None, Some(new_tuple)) => {
-                        self.current_tuples.insert(new_tuple.clone());
-                        result.added.push(new_tuple);
-                    }
-                    (None, None) => {}
+            let old_tuple = self.build_output_tuple(
+                &old_state.outer_tuple,
+                &old_state.correlation_value,
+                &old_state.array_result,
+                &old_state.provenance,
+                &old_state.batch_provenance,
+            );
+            let new_tuple = self.build_output_tuple(
+                &old_state.outer_tuple,
+                &old_state.correlation_value,
+                &new_array,
+                &new_provenance,
+                &new_batch_provenance,
+            );
+
+            match (old_tuple, new_tuple) {
+                (Some(old_tuple), Some(new_tuple)) => {
+                    result.updated.push((old_tuple.clone(), new_tuple.clone()));
+                    self.current_tuples.remove(&old_tuple);
+                    self.current_tuples.insert(new_tuple);
                 }
+                (Some(old_tuple), None) => {
+                    self.current_tuples.remove(&old_tuple);
+                    result.removed.push(old_tuple);
+                }
+                (None, Some(new_tuple)) => {
+                    self.current_tuples.insert(new_tuple.clone());
+                    result.added.push(new_tuple);
+                }
+                (None, None) => {}
+            }
 
-                self.instances.insert(
-                    outer_id,
-                    ArrayInstanceState {
-                        outer_tuple: old_state.outer_tuple.clone(),
-                        correlation_value: old_state.correlation_value.clone(),
-                        array_result: new_array,
-                        provenance: new_provenance,
-                        batch_provenance: new_batch_provenance,
-                    },
-                );
+            // Outer tuple and correlation stay as they were; only the
+            // evaluated result moves — the same fields the re-insert used to
+            // carry over, without rebuilding the entry.
+            if let Some(state) = self.instances.get_mut(&outer_id) {
+                state.array_result = new_array;
+                state.provenance = new_provenance;
+                state.batch_provenance = new_batch_provenance;
             }
         }
 
@@ -1164,6 +1385,9 @@ mod tests {
                 correlation_value,
                 instance,
                 last_used,
+                // Freshly instantiated: no buffered dirt has been applied to
+                // it yet, so it starts behind the current pending generation.
+                applied_generation: 0,
             },
         );
     }
