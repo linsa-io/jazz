@@ -31,10 +31,28 @@ fn start_heap_profiler() {
     let file = std::env::var("DHAT_FILE").unwrap_or_else(|_| "dhat-server.json".to_string());
     let profiler = dhat::Profiler::builder()
         .file_name(&file)
-        .trim_backtraces(None)
+        .trim_backtraces(Some(20)) // LOCAL PROFILING PATCH — do not commit (None is too slow to serve catch-up)
         .build();
     *HEAP_PROFILER.lock().unwrap() = Some(profiler);
     eprintln!("heap-profile: recording to {file}; SIGTERM/SIGINT dumps and exits");
+    // LOCAL PROFILING PATCH — do not commit. The tokio signal path starves when
+    // the runtime wedges into a busy loop (observed: settle/compile spin makes
+    // HTTP and signal delivery dead) — which is exactly when a dump is most
+    // wanted. A dedicated OS thread polling for a trigger file dumps regardless
+    // of runtime health: `touch $DHAT_TRIGGER` → dump + exit.
+    if let Ok(trigger) = std::env::var("DHAT_TRIGGER") {
+        eprintln!("heap-profile: dump trigger file: {trigger}");
+        std::thread::spawn(move || {
+            loop {
+                if std::path::Path::new(&trigger).exists() {
+                    eprintln!("heap-profile: trigger seen; dumping profile…");
+                    drop(HEAP_PROFILER.lock().unwrap().take());
+                    std::process::exit(0);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        });
+    }
     tokio::spawn(async {
         let mut term =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();

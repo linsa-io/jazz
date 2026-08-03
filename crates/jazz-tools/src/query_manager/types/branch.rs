@@ -134,7 +134,7 @@ impl<'de> Deserialize<'de> for SchemaHash {
 
 /// Hash a RowDescriptor into a hasher, preserving declared column order.
 pub(crate) fn hash_row_descriptor(hasher: &mut blake3::Hasher, descriptor: &RowDescriptor) {
-    for col in &descriptor.columns {
+    for col in descriptor.columns.iter() {
         hash_column_descriptor(hasher, col);
     }
 }

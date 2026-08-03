@@ -261,24 +261,26 @@ fn project_columns_for_tuple_descriptor(tuple_descriptor: &TupleDescriptor) -> V
 }
 
 fn selected_output_descriptor(
-    columns: &[ColumnDescriptor],
+    descriptor: &RowDescriptor,
     select_columns: Option<&[String]>,
 ) -> RowDescriptor {
     let Some(select_columns) = select_columns else {
-        return RowDescriptor::new(columns.to_vec());
+        // No projection: the output is the input, so share the column list.
+        return descriptor.clone();
     };
 
     RowDescriptor::new(
         select_columns
             .iter()
             .filter_map(|name| {
-                columns
+                descriptor
+                    .columns
                     .iter()
                     .find(|column| column.name.as_str() == name)
                     .cloned()
                     .or_else(|| magic_column_kind(name).map(magic_column_descriptor))
             })
-            .collect(),
+            .collect::<Vec<_>>(),
     )
 }
 
@@ -1109,10 +1111,10 @@ impl QueryGraph {
         base_query.array_subqueries = spec.nested_arrays.clone();
 
         // Build combined descriptor: base table + all joined tables + nested array columns
-        let mut combined_columns = inner_descriptor.columns.clone();
+        let mut combined_columns = inner_descriptor.columns.to_vec();
         for join_spec in &spec.joins {
             if let Some(joined_schema) = schema.get(&join_spec.table) {
-                combined_columns.extend(joined_schema.columns.columns.clone());
+                combined_columns.extend(joined_schema.columns.columns.iter().cloned());
             }
         }
 
@@ -1133,10 +1135,8 @@ impl QueryGraph {
         let combined_descriptor = RowDescriptor::new(combined_columns);
 
         // Build output descriptor for inner query, including requested magic columns.
-        let inner_output_descriptor = selected_output_descriptor(
-            &combined_descriptor.columns,
-            spec.select_columns.as_deref(),
-        );
+        let inner_output_descriptor =
+            selected_output_descriptor(&combined_descriptor, spec.select_columns.as_deref());
 
         // Create subgraph template
         let subgraph_template = SubgraphTemplate::new(
@@ -1177,10 +1177,10 @@ impl QueryGraph {
         let inner_schema = schema.get(&spec.table)?;
 
         // Start with base table columns + joined table columns
-        let mut columns = inner_schema.columns.columns.clone();
+        let mut columns = inner_schema.columns.columns.to_vec();
         for join_spec in &spec.joins {
             if let Some(joined_schema) = schema.get(&join_spec.table) {
-                columns.extend(joined_schema.columns.columns.clone());
+                columns.extend(joined_schema.columns.columns.iter().cloned());
             }
         }
 
@@ -1201,7 +1201,7 @@ impl QueryGraph {
         // Row id is carried in Value::Row { id: Some(...), .. } rather than
         // as a prepended column.
         Some(selected_output_descriptor(
-            &columns,
+            &RowDescriptor::new(columns),
             spec.select_columns.as_deref(),
         ))
     }

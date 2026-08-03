@@ -103,7 +103,7 @@ fn fill_required(
         .get(&jazz_tools::query_manager::types::TableName::new(table))
         .unwrap_or_else(|| panic!("table {table} in schema"));
     let mut map: std::collections::HashMap<String, Value> = provided.into_iter().collect();
-    for column in &table_schema.columns.columns {
+    for column in table_schema.columns.columns.iter() {
         let name = column.name.as_str();
         if name == "id" || map.contains_key(name) || column.nullable || column.default.is_some() {
             continue;

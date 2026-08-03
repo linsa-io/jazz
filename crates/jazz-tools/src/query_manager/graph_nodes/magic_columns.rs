@@ -108,9 +108,11 @@ impl MagicColumnsNode {
             let mut descriptor = element.descriptor.clone();
 
             if let Some(requests) = grouped.get(&element_index) {
+                let mut columns = descriptor.columns.to_vec();
                 for kind in &requests.kinds {
-                    descriptor.columns.push(magic_column_descriptor(*kind));
+                    columns.push(magic_column_descriptor(*kind));
                 }
+                descriptor = RowDescriptor::new(columns);
 
                 if session.is_some()
                     && let Some(table_schema) = schema.get(&requests.table_name)

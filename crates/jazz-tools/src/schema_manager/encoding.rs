@@ -320,7 +320,7 @@ fn encode_row_descriptor_with_version(
     version: SchemaEncodingVersion,
 ) {
     write_u32(buf, desc.columns.len() as u32);
-    for col in &desc.columns {
+    for col in desc.columns.iter() {
         encode_column_descriptor_with_version(buf, col, version);
     }
 }

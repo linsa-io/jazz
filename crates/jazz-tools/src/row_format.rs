@@ -121,7 +121,7 @@ fn compile_row_layout(descriptor: &RowDescriptor) -> CompiledRowLayout {
     let mut fixed_offset = 0usize;
     let mut variable_index = 0usize;
 
-    for column in &descriptor.columns {
+    for column in descriptor.columns.iter() {
         if let Some(fixed_value_size) = column.column_type.fixed_size() {
             let fixed_total_size = fixed_value_size + usize::from(column.nullable);
             columns.push(CompiledColumnLayout {

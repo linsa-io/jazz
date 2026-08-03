@@ -1962,7 +1962,7 @@ fn reorder_values_by_column_name(
     }
 
     let mut reordered_values = Vec::with_capacity(values.len());
-    for column in &target_descriptor.columns {
+    for column in target_descriptor.columns.iter() {
         reordered_values.push(values_by_column.remove(&column.name)?);
     }
 

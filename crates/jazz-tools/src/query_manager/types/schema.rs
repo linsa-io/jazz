@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use internment::Intern;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -307,17 +307,52 @@ impl ColumnDescriptor {
 }
 
 /// Descriptor for a row's schema, defining column order and types.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(transparent)]
+///
+/// The column list is refcounted, not owned: `ColumnType::Row` nests another
+/// `RowDescriptor`, so a by-value column vector makes every clone a deep copy
+/// of the whole nested descriptor tree. Descriptors are cloned per compiled
+/// graph node, and `SubgraphTemplate::instantiate` compiles a graph per outer
+/// row — that deep copy was the single largest retained-heap line on a syncing
+/// device. `Arc<[ColumnDescriptor]>` makes a clone a refcount bump.
+///
+/// Descriptors are treated as immutable once built. To change columns, build a
+/// new list and hand it to `new` (see `MagicColumnsNode`); there is no in-place
+/// mutation path, which is also what keeps `content_hash_cache` honest.
+#[derive(Debug)]
 pub struct RowDescriptor {
-    pub columns: Vec<ColumnDescriptor>,
-    #[serde(skip)]
+    pub columns: Arc<[ColumnDescriptor]>,
     content_hash_cache: OnceLock<[u8; 32]>,
+}
+
+impl Serialize for RowDescriptor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Wire-compatible with the previous `#[serde(transparent)]` over `Vec`.
+        self.columns[..].serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RowDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self::new(Vec::<ColumnDescriptor>::deserialize(
+            deserializer,
+        )?))
+    }
 }
 
 impl Clone for RowDescriptor {
     fn clone(&self) -> Self {
-        Self::new(self.columns.clone())
+        // Share the columns and the memoized hash: both describe the same
+        // immutable column list.
+        Self {
+            columns: Arc::clone(&self.columns),
+            content_hash_cache: self.content_hash_cache.clone(),
+        }
     }
 }
 
@@ -336,9 +371,9 @@ impl From<Vec<ColumnDescriptor>> for RowDescriptor {
 }
 
 impl RowDescriptor {
-    pub fn new(columns: Vec<ColumnDescriptor>) -> Self {
+    pub fn new(columns: impl Into<Arc<[ColumnDescriptor]>>) -> Self {
         Self {
-            columns,
+            columns: columns.into(),
             content_hash_cache: OnceLock::new(),
         }
     }
@@ -373,8 +408,15 @@ impl RowDescriptor {
     /// Column names from later descriptors are preserved as-is.
     /// Use with table-qualified names to avoid ambiguity.
     pub fn combine(descriptors: &[RowDescriptor]) -> Self {
-        let columns: Vec<ColumnDescriptor> =
-            descriptors.iter().flat_map(|d| d.columns.clone()).collect();
+        // The overwhelmingly common case is a single-table query; sharing the
+        // column list beats rebuilding it.
+        if let [only] = descriptors {
+            return only.clone();
+        }
+        let columns: Vec<ColumnDescriptor> = descriptors
+            .iter()
+            .flat_map(|d| d.columns.iter().cloned())
+            .collect();
         Self::new(columns)
     }
 

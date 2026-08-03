@@ -201,6 +201,49 @@ impl SubgraphTemplate {
         &self.output_descriptor
     }
 
+    /// Identity of everything that can change what an instantiation computes,
+    /// *given the invariant below*. Folded into `RecursiveRelationNode`'s
+    /// `SettlementEvalCache` site key.
+    ///
+    /// `schema_context` is deliberately NOT hashed. It carries the schema hash,
+    /// the live older schemas and the lenses between them, and it does change
+    /// which index column a step scan reads (a lens can rename `email` to
+    /// `email_address` without moving the output descriptor — see
+    /// `subgraph_template_inherits_parent_schema_and_branch_context`). Omitting
+    /// it is safe only because of the scoping of the one consumer:
+    ///
+    /// 1. `SettlementEvalCache` is never stored. Its three construction sites
+    ///    (`server_queries.rs`, `manager.rs`) are stack locals consumed by a
+    ///    single `authorized_*_from_graph*` call, so a cache never outlives one
+    ///    authorization pass over one subscription graph within one tick. A
+    ///    schema republish cannot reach an entry written before it.
+    /// 2. That pass resolves `auth_schema`/`auth_context` once and holds them
+    ///    fixed for every row it authorizes.
+    /// 3. The cache is attached to exactly one evaluator
+    ///    (`server_queries::evaluate_authorization_policy`) and only under
+    ///    `Operation::Select`; the nested evaluators in `policy_filter.rs` and
+    ///    `magic_columns.rs` run uncached.
+    /// 4. The only compile path that can build a cache-consulting
+    ///    `RecursiveRelationNode` is `PolicyGraph::for_exists_rel`, which takes
+    ///    no `SchemaContext` argument at all — it synthesizes
+    ///    `SchemaContext::with_defaults(compile_schema, "main")`: zero lenses,
+    ///    zero live schemas, fixed env and user branch. Lens-driven divergence
+    ///    is unrepresentable there. Because `structural_scans` is
+    ///    `operation == Select`, `compile_schema` is always the same
+    ///    policy-stripped copy of the single `auth_schema`.
+    ///
+    /// Recursive relations compiled on the subscription path *do* inherit a
+    /// lens-carrying parent context, but those nodes settle with no cache and
+    /// never call this.
+    ///
+    /// The one axis that genuinely varies inside a cache lifetime is the
+    /// branch: a pass authorizes rows across branches, and the branch list is
+    /// baked into `base_query.branches` at compile time, so it is discriminated
+    /// here. `semantic_fingerprint_discriminates_branch` pins that.
+    ///
+    /// Give this fingerprint a consumer with a wider scope — a cache that
+    /// survives a tick, a republish, or two subscriptions — and the omission
+    /// stops being safe: add the schema context discriminator then.
     pub(crate) fn semantic_fingerprint(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         serde_json::to_vec(&self.base_query)
@@ -354,7 +397,7 @@ impl SubgraphBuilder {
                 .select_columns
                 .iter()
                 .filter_map(|name| descriptor.columns.iter().find(|c| &c.name == name).cloned())
-                .collect();
+                .collect::<Vec<_>>();
             RowDescriptor::new(columns)
         };
 
@@ -661,6 +704,48 @@ mod tests {
         assert_eq!(
             scan_branch, v1_branch,
             "subgraph should keep the parent branch list when instantiating"
+        );
+    }
+
+    /// `semantic_fingerprint` omits the schema context on purpose (see the
+    /// invariant documented there); the branch is the one axis that genuinely
+    /// varies within a `SettlementEvalCache` lifetime, because one
+    /// authorization pass authorizes rows across branches. If the branch ever
+    /// stopped reaching the fingerprint, a memoized recursive-relation result
+    /// from one branch would be served for another.
+    #[test]
+    fn semantic_fingerprint_discriminates_branch() {
+        let schema = test_schema();
+        let output_descriptor = schema
+            .get(&TableName::new("posts"))
+            .unwrap()
+            .columns
+            .clone();
+
+        let template_for_branch = |branch: &str| {
+            SubgraphTemplate::new(
+                QueryBuilder::new("posts").branches(&[branch]).build(),
+                "author_id".to_string(),
+                Vec::new(),
+                output_descriptor.clone(),
+                Arc::new(SchemaContext::with_defaults(schema.clone(), "main")),
+                None,
+                RowPolicyMode::PermissiveLocal,
+            )
+        };
+
+        let main = template_for_branch("main");
+        let preview = template_for_branch("preview");
+
+        assert_eq!(
+            main.semantic_fingerprint(),
+            template_for_branch("main").semantic_fingerprint(),
+            "fingerprint must be stable for identical templates"
+        );
+        assert_ne!(
+            main.semantic_fingerprint(),
+            preview.semantic_fingerprint(),
+            "templates differing only in branch must not share a cache entry"
         );
     }
 }

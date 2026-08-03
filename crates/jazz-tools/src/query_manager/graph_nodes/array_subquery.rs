@@ -141,7 +141,7 @@ impl ArraySubqueryNode {
     ) -> Self {
         // Build output descriptor: outer columns + array column
         let outer_row_descriptor = outer_descriptor.combined_descriptor();
-        let mut output_columns = outer_row_descriptor.columns.clone();
+        let mut output_columns = outer_row_descriptor.columns.to_vec();
 
         // Array column type: Array<Row> with the subgraph's output columns.
         // The row id is carried in Value::Row { id: Some(...), .. } rather than

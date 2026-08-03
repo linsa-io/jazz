@@ -852,22 +852,32 @@ fn row_descriptor_content_hash() {
 }
 
 #[test]
-fn cloned_row_descriptor_recomputes_content_hash_after_mutation() {
+fn row_descriptor_content_hash_follows_its_columns_across_clones() {
     let desc = RowDescriptor::new(vec![
         ColumnDescriptor::new("id", ColumnType::Uuid),
         ColumnDescriptor::new("name", ColumnType::Text),
     ]);
     let original_hash = desc.content_hash();
 
-    let mut cloned = desc.clone();
-    cloned
-        .columns
-        .push(ColumnDescriptor::new("$canEdit", ColumnType::Boolean));
+    // Columns are shared, not owned, so a clone may reuse the memoized hash:
+    // the column list it describes cannot change underneath it.
+    let cloned = desc.clone();
+    assert_eq!(
+        original_hash,
+        cloned.content_hash(),
+        "A clone describes the same columns and must report the same hash"
+    );
+
+    // Adding a column means building a new descriptor, which starts with an
+    // empty cache and therefore cannot serve the old hash.
+    let mut extended_columns = cloned.columns.to_vec();
+    extended_columns.push(ColumnDescriptor::new("$canEdit", ColumnType::Boolean));
+    let extended = RowDescriptor::new(extended_columns);
 
     assert_ne!(
         original_hash,
-        cloned.content_hash(),
-        "A cloned descriptor must not reuse a stale cached hash after its columns change"
+        extended.content_hash(),
+        "A descriptor with different columns must not reuse a stale cached hash"
     );
 }
 

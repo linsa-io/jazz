@@ -153,7 +153,7 @@ impl ProjectNode {
             projection_fields
                 .iter()
                 .map(|field| field.output_column.clone())
-                .collect(),
+                .collect::<Vec<_>>(),
         );
         let output_tuple_descriptor =
             TupleDescriptor::single_with_materialization("", output_descriptor.clone(), true);

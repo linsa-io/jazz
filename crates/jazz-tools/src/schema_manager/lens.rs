@@ -354,7 +354,7 @@ impl Lens {
 
         // Reorder to match target descriptor
         let mut final_result = Vec::with_capacity(target_desc.columns.len());
-        for target_col in &target_desc.columns {
+        for target_col in target_desc.columns.iter() {
             let name = target_col.name.as_str();
             if let Some(idx) = column_names.iter().position(|n| n == name) {
                 final_result.push(result[idx].clone().unwrap_or(Value::Null));

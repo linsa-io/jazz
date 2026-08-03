@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::*;
 
@@ -23,10 +24,14 @@ pub struct ElementDescriptor {
 /// enabling FilterNode to find data in multi-element tuples (e.g., after joins).
 ///
 /// Also tracks per-element materialization state to enable lazy materialization.
+///
+/// Elements are refcounted for the same reason as `RowDescriptor::columns`:
+/// each carries a nested `RowDescriptor`, and tuple descriptors are cloned per
+/// graph node on every subgraph instantiation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TupleDescriptor {
     /// Descriptors for each element in the tuple.
-    elements: Vec<ElementDescriptor>,
+    elements: Arc<[ElementDescriptor]>,
     /// Total columns across all elements.
     total_columns: usize,
     /// Per-element materialization state.
@@ -38,11 +43,11 @@ impl TupleDescriptor {
     pub fn single(table: impl Into<TableName>, descriptor: RowDescriptor) -> Self {
         let total_columns = descriptor.columns.len();
         Self {
-            elements: vec![ElementDescriptor {
+            elements: Arc::new([ElementDescriptor {
                 table: table.into(),
                 descriptor,
                 column_offset: 0,
-            }],
+            }]),
             total_columns,
             materialization: MaterializationState::all_ids(1),
         }
@@ -56,11 +61,11 @@ impl TupleDescriptor {
     ) -> Self {
         let total_columns = descriptor.columns.len();
         Self {
-            elements: vec![ElementDescriptor {
+            elements: Arc::new([ElementDescriptor {
                 table: table.into(),
                 descriptor,
                 column_offset: 0,
-            }],
+            }]),
             total_columns,
             materialization: if materialized {
                 MaterializationState::all_materialized(1)
@@ -71,7 +76,8 @@ impl TupleDescriptor {
     }
 
     /// Create a tuple descriptor from multiple element descriptors (all ID-only).
-    pub fn from_elements(elements: Vec<ElementDescriptor>) -> Self {
+    pub fn from_elements(elements: impl Into<Arc<[ElementDescriptor]>>) -> Self {
+        let elements = elements.into();
         let element_count = elements.len();
         let total_columns = elements
             .last()
@@ -104,16 +110,16 @@ impl TupleDescriptor {
         Self {
             total_columns: offset,
             materialization: MaterializationState::all_ids(elements.len()),
-            elements,
+            elements: elements.into(),
         }
     }
 
     /// Concatenate two descriptors (for join output).
     /// Combines elements from both and concatenates materialization states.
     pub fn concat(left: &Self, right: &Self) -> Self {
-        let mut elements = left.elements.clone();
+        let mut elements = left.elements.to_vec();
         let left_cols = left.total_columns;
-        for elem in &right.elements {
+        for elem in right.elements.iter() {
             elements.push(ElementDescriptor {
                 table: elem.table,
                 descriptor: elem.descriptor.clone(),
@@ -123,7 +129,7 @@ impl TupleDescriptor {
         Self {
             total_columns: left.total_columns + right.total_columns,
             materialization: left.materialization.concat(&right.materialization),
-            elements,
+            elements: elements.into(),
         }
     }
 
@@ -171,7 +177,7 @@ impl TupleDescriptor {
     /// Get column index by name, searching all elements.
     pub fn column_index(&self, name: &str) -> Option<usize> {
         let mut offset = 0;
-        for elem in &self.elements {
+        for elem in self.elements.iter() {
             if let Some(local_idx) = elem.descriptor.column_index(name) {
                 return Some(offset + local_idx);
             }
@@ -182,7 +188,7 @@ impl TupleDescriptor {
 
     /// Get column index by qualified name (table.column).
     pub fn qualified_column_index(&self, table: &str, column: &str) -> Option<usize> {
-        for elem in &self.elements {
+        for elem in self.elements.iter() {
             if elem.table == table
                 && let Some(local_idx) = elem.descriptor.column_index(column)
             {
@@ -236,10 +242,15 @@ impl TupleDescriptor {
 
     /// Create a combined RowDescriptor with all columns from all elements.
     pub fn combined_descriptor(&self) -> RowDescriptor {
+        // Single-element tuples are the common case; share the element's
+        // column list instead of rebuilding it on every call.
+        if let [only] = &self.elements[..] {
+            return only.descriptor.clone();
+        }
         let columns: Vec<ColumnDescriptor> = self
             .elements
             .iter()
-            .flat_map(|e| e.descriptor.columns.clone())
+            .flat_map(|e| e.descriptor.columns.iter().cloned())
             .collect();
         RowDescriptor::new(columns)
     }
