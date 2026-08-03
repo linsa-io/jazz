@@ -466,4 +466,14 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
 
     writer.shutdown().await.expect("shutdown writer");
     server.shutdown().await;
+
+    // The batchId->rows index must serve every lookup; the last-resort
+    // full-store history scan firing even once here means the index is broken
+    // for exactly the write pattern this profile exercises — and it would
+    // dominate every cost the fast paths remove.
+    assert_eq!(
+        jazz_tools::runtime_core::LOCAL_BATCH_FULL_SCANS.load(Ordering::Relaxed),
+        0,
+        "last-resort full-store batch scan fired during the profile"
+    );
 }

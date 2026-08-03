@@ -6,6 +6,13 @@ use crate::sync_manager::{RowMetadata, SyncPayload};
 
 type LocalBatchRow = (LocalBatchMember, crate::storage::RowLocator, StoredRowBatch);
 
+/// Fires when every batchId->rows member source misses and `local_batch_rows`
+/// degrades to scanning the history of every row in every table. That walk is
+/// O(total rows x history depth) and must stay cold: production telemetry and
+/// the linsa_schema_profile harness both watch this counter.
+pub static LOCAL_BATCH_FULL_SCANS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     fn local_batch_row_from_member(
         &self,
@@ -209,6 +216,11 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         if rows.is_empty() {
             // Last-resort fallback if the batchId->rows index is not found.
             // This is extremely inefficient, as we're scanning across all tables' rows.
+            LOCAL_BATCH_FULL_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                ?batch_id,
+                "batchId->rows index missed; falling back to full-store history scan"
+            );
             rows = self.scan_local_batch_rows(batch_id);
         }
 

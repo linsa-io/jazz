@@ -965,6 +965,8 @@ mod sync;
 mod ticks;
 mod writes;
 
+pub use ticks::LOCAL_BATCH_FULL_SCANS;
+
 use durability::DurabilityTracker;
 
 #[cfg(test)]
