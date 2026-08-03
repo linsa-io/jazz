@@ -11,6 +11,7 @@ pub mod policy;
 pub mod policy_counters;
 pub mod policy_graph;
 pub mod policy_ir;
+pub mod precise_dirty;
 pub mod query;
 mod query_to_relation_ir;
 pub mod query_wire;

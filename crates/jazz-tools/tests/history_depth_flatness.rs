@@ -7,12 +7,13 @@
 //! history depth ~500 vs ~8000, and the gate asserts
 //! `work(8000) <= work(500) * 1.2` per verb:
 //!
-//! - serial applies (`apply_row_batch`, unconfirmed tips) — flat today via the
+//! - serial applies (`apply_row_batch`, unconfirmed tips) — flat via the
 //!   Fix A serial fast path;
 //! - append + wait-confirm-per-write at `EdgeServer` (the external agent's
 //!   workload: every write is immediately re-applied through
-//!   `accepted_transaction_output(EdgeServer)`) — EXPECTED RED today, see the
-//!   `#[ignore]` note on the test;
+//!   `accepted_transaction_output(EdgeServer)`) — flat since v13-2 removed
+//!   the B3 tier-pointer wall (causal-domination tier frontiers +
+//!   unconditional tier-entry pointer collapse, `row_histories/fastpath.rs`);
 //! - visible reads (`load_visible_query_row`, the query-serving point read) —
 //!   flat today via Fix C frontier-first reads.
 //!
@@ -732,16 +733,18 @@ fn serial_apply_work_is_flat_in_history_depth() {
 /// (b) Append + wait-confirm-per-write at `EdgeServer` — the external agent's
 /// workload. One window op = one append + one edge confirm of that batch.
 ///
-/// EXPECTED RED today: the confirm is an in-place tip update whose EdgeServer
-/// tier pointer is `Some(previous confirmed batch)`; `in_place_tier_pointer`
-/// (`row_histories/fastpath.rs`) can only prove the `(false -> true)` tier
-/// entry when the pointer is `None`, so every confirm after the first declines
-/// to the full history rebuild — the B3 tier-pointer wall (history-fastpaths
-/// design §5, "pure confirmed_tier bump" row; include-plan-sharing design §9,
-/// "converge stored tiers to fates" follow-up). v13-2 must remove the wall and
-/// un-ignore this gate.
+/// This was the B3 tier-pointer wall (history-fastpaths design §5, "pure
+/// confirmed_tier bump" row; include-plan-sharing design §9): the confirm is
+/// an in-place tip update whose EdgeServer tier pointer is `Some(previous
+/// confirmed batch)`, and under one-step tier frontiers `in_place_tier_pointer`
+/// could only prove the `(false -> true)` tier entry when the pointer was
+/// `None` — every confirm after the first declined to an O(depth) rebuild.
+/// v13-2 switched the tier-filtered frontier to causal domination through the
+/// full history DAG (`row_histories/resolution.rs`), under which a confirmed
+/// sole tip provably dominates every tier set it enters — the tier-entry
+/// transition is O(1) unconditionally, holes in the unconfirmed prefix
+/// included (this test's growth phase creates exactly such a hole).
 #[test]
-#[ignore = "EXPECTED RED: B3 tier-pointer wall makes every edge confirm O(depth); v13-2 must fix and un-ignore"]
 fn append_confirm_per_write_at_edge_server_is_flat_in_history_depth() {
     let _lock = measure_lock();
     let mut hot = HotRow::new();

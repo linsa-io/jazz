@@ -309,6 +309,34 @@ pub(super) fn preview_override_sidecar(
     ))
 }
 
+/// Batch ids that are PROPER ancestors (through the full history DAG,
+/// visible or not) of at least one of the given rows.
+///
+/// Used by the tier-filtered frontier: a tier-satisfying version that some
+/// other tier-satisfying version causally builds on is superseded at that
+/// tier, even when the intermediate versions are not tier-confirmed
+/// themselves ("tier holes"). Walking the FULL parent DAG (not just the
+/// tier-filtered members) is what closes the holes.
+fn proper_ancestors_of(
+    rows: &[&StoredRowBatch],
+    row_by_batch_id: &HashMap<BatchId, &StoredRowBatch>,
+) -> std::collections::BTreeSet<BatchId> {
+    let mut reached = std::collections::BTreeSet::new();
+    let mut stack: Vec<BatchId> = rows
+        .iter()
+        .flat_map(|row| row.parents.iter().copied())
+        .collect();
+    while let Some(batch_id) = stack.pop() {
+        if !reached.insert(batch_id) {
+            continue;
+        }
+        if let Some(row) = row_by_batch_id.get(&batch_id) {
+            stack.extend(row.parents.iter().copied());
+        }
+    }
+    reached
+}
+
 pub(super) fn build_computed_visible_preview(
     user_descriptor: &RowDescriptor,
     history_rows: &[StoredRowBatch],
@@ -319,17 +347,51 @@ pub(super) fn build_computed_visible_preview(
         return Ok(None);
     }
 
-    let mut non_tips = std::collections::BTreeSet::new();
-    for row in &visible_rows {
-        for parent in &row.parents {
-            non_tips.insert(*parent);
+    // Frontier semantics differ deliberately between the two views:
+    //
+    // - UNFILTERED (`required_tier == None`): one-step parent naming within
+    //   the visible set — a visible version is superseded exactly when a
+    //   visible version names it as parent. Unchanged semantics; this is
+    //   what `current_row` and the serial fast path's domination guard
+    //   (`parents_cover_frontier_exactly`) are built on.
+    // - TIER-FILTERED (`required_tier == Some(..)`): causal domination
+    //   through the FULL history DAG (v13-2, the B3 tier-pointer wall). A
+    //   tier-satisfying version whose lineage a newer tier-satisfying
+    //   version builds on is superseded at that tier even when the chain
+    //   between them is not tier-confirmed. The previous one-step rule
+    //   resurfaced such "hole-hidden" ancestors as concurrent tier tips and
+    //   merged them — double-counting already-incorporated changes (a
+    //   counter ancestor re-added its own delta) and making every tier
+    //   confirmation over a holed chain pay an O(depth) rebuild, because no
+    //   O(1) entry-local rule can know what hides behind a hole. Under
+    //   causal domination, a row that dominates the whole visible set (a
+    //   sole frontier tip, or a batch naming every tip as parent) provably
+    //   dominates EVERY tier set the moment it enters one — which is what
+    //   `fastpath::in_place_tier_pointer` / `carried_tier_pointer` exploit.
+    let mut frontier: Vec<_> = if required_tier.is_some() {
+        let full_map: HashMap<BatchId, &StoredRowBatch> = history_rows
+            .iter()
+            .map(|row| (row.batch_id(), row))
+            .collect();
+        let dominated = proper_ancestors_of(&visible_rows, &full_map);
+        visible_rows
+            .iter()
+            .copied()
+            .filter(|row| !dominated.contains(&row.batch_id()))
+            .collect()
+    } else {
+        let mut non_tips = std::collections::BTreeSet::new();
+        for row in &visible_rows {
+            for parent in &row.parents {
+                non_tips.insert(*parent);
+            }
         }
-    }
-    let mut frontier: Vec<_> = visible_rows
-        .iter()
-        .copied()
-        .filter(|row| !non_tips.contains(&row.batch_id()))
-        .collect();
+        visible_rows
+            .iter()
+            .copied()
+            .filter(|row| !non_tips.contains(&row.batch_id()))
+            .collect()
+    };
     frontier.sort_by_key(|row| (row.updated_at, row.batch_id()));
     frontier.dedup_by_key(|row| row.batch_id());
     let Some(latest_tip) = frontier.last().copied() else {

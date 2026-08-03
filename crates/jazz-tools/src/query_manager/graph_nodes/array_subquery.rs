@@ -9,6 +9,7 @@ use ahash::{AHashMap, AHashSet};
 
 use crate::object::ObjectId;
 use crate::query_manager::encoding::{decode_row, encode_row};
+use crate::query_manager::precise_dirty::precise_dirty_enabled;
 use crate::query_manager::query::ArraySubqueryRequirement;
 use std::sync::Arc;
 
@@ -209,9 +210,115 @@ impl ArraySubqueryNode {
         }
     }
 
-    /// Mark this node as needing re-evaluation due to inner table changes.
-    pub fn mark_inner_dirty(&mut self) {
+    /// Table-level sibling of [`Self::note_inner_rows_changed`] for dirt with
+    /// no row information (F2): with precise dirtiness enabled the table mark
+    /// is threaded into every cached subgraph instance, whose scans on that
+    /// table then take one full rescan (restoring an exact incremental
+    /// baseline) while every other node stays clean. Without this, a
+    /// table-level channel (e.g. the manager's row-coverage fallback in
+    /// `apply_batched_subscription_visibility_effects`) would set
+    /// `inner_dirty` but leave instance graphs clean, and the precise
+    /// re-evaluation skip would serve stale arrays.
+    pub fn note_inner_table_dirty(&mut self, table: &str) {
         self.inner_dirty = true;
+        if !precise_dirty_enabled() {
+            return;
+        }
+        for cached in self.subgraph_cache.values_mut() {
+            cached.instance.graph.mark_dirty_for_table(table);
+        }
+    }
+
+    /// Row-precise sibling of [`Self::note_inner_table_dirty`] (F2): `ids`
+    /// changed in `table` (one of this include's inner tables — the direct
+    /// one or a nested one, both registered against this node at compile
+    /// time).
+    ///
+    /// With precise dirtiness enabled the ids are threaded into every cached
+    /// subgraph instance: the instance's index scans learn exactly which rows
+    /// changed (point-membership re-checks instead of full rescans), and the
+    /// instance's own `mark_table_dependents_dirty` routes nested-table ids
+    /// onward into nested ArraySubqueryNodes — the recursion that fixes
+    /// nested-include staleness (FINDING manifestation 2 in
+    /// `manager_tests/subscription_output_oracle.rs`). Content re-loads for
+    /// held rows arrive separately via [`Self::forward_rows_updated`].
+    ///
+    /// With the kill switch off this degrades to the legacy coarse mark; the
+    /// reused instances are then `mark_all_dirty`-ed at evaluation time (see
+    /// `evaluate_subgraph_for_single`).
+    pub fn note_inner_rows_changed(&mut self, table: &str, ids: &AHashSet<ObjectId>) {
+        self.inner_dirty = true;
+        if !precise_dirty_enabled() {
+            return;
+        }
+        for cached in self.subgraph_cache.values_mut() {
+            cached
+                .instance
+                .graph
+                .mark_rows_changed_for_table(table, ids);
+        }
+    }
+
+    /// Forward a content-update mark into every cached subgraph instance so
+    /// include-inner materializers re-load rows they already hold (FINDING
+    /// manifestation 1). Table-blind by design — ids not held by an instance
+    /// are ignored there — mirroring the outer graph's `mark_rows_updated`
+    /// contract. Returns whether any instance actually tracked one of the
+    /// ids; only then does this node need re-evaluation (an untracked mark
+    /// cannot change any array, and treating it as dirt would make every
+    /// uncorrelated write re-settle every instance — the churn the precise
+    /// path exists to remove). Legacy mode forwards nothing, preserving the
+    /// old behavior byte for byte.
+    pub fn forward_row_updated(&mut self, id: ObjectId) -> bool {
+        if !precise_dirty_enabled() {
+            return false;
+        }
+        let mut any_tracked = false;
+        for cached in self.subgraph_cache.values_mut() {
+            any_tracked |= cached.instance.graph.mark_row_updated(id);
+        }
+        self.inner_dirty |= any_tracked;
+        any_tracked
+    }
+
+    /// Plural sibling of [`Self::forward_row_updated`].
+    pub fn forward_rows_updated(&mut self, ids: &AHashSet<ObjectId>) -> bool {
+        if !precise_dirty_enabled() {
+            return false;
+        }
+        let mut any_tracked = false;
+        for cached in self.subgraph_cache.values_mut() {
+            any_tracked |= cached.instance.graph.mark_rows_updated(ids);
+        }
+        self.inner_dirty |= any_tracked;
+        any_tracked
+    }
+
+    /// Forward a deletion mark into every cached subgraph instance — the
+    /// removal-delta counterpart of [`Self::forward_row_updated`].
+    pub fn forward_row_deleted(&mut self, id: ObjectId) -> bool {
+        if !precise_dirty_enabled() {
+            return false;
+        }
+        let mut any_tracked = false;
+        for cached in self.subgraph_cache.values_mut() {
+            any_tracked |= cached.instance.graph.mark_row_deleted(id);
+        }
+        self.inner_dirty |= any_tracked;
+        any_tracked
+    }
+
+    /// Plural sibling of [`Self::forward_row_deleted`].
+    pub fn forward_rows_deleted(&mut self, ids: &AHashSet<ObjectId>) -> bool {
+        if !precise_dirty_enabled() {
+            return false;
+        }
+        let mut any_tracked = false;
+        for cached in self.subgraph_cache.values_mut() {
+            any_tracked |= cached.instance.graph.mark_rows_deleted(ids);
+        }
+        self.inner_dirty |= any_tracked;
+        any_tracked
     }
 
     /// How many compiled subgraphs this node is holding.
@@ -339,8 +446,27 @@ impl ArraySubqueryNode {
                 .or_else(|| self.extract_correlation_value(&old_tuple));
             let new_correlation = self.extract_correlation_value(&new_tuple);
 
+            // Reusing the stored array is only sound when no inner change is
+            // pending for this instance. When one is, evaluate HERE so this
+            // settle emits a single coalesced pair for the row: emitting the
+            // stale array now and letting `reevaluate_all` emit a correction
+            // would put two chained update pairs for one row id into one
+            // TupleDelta — and tuple identity is ID-based, so downstream
+            // nodes (SortNode keeps a Vec ordered by ID-equality) double-book
+            // the row and later serve a stale pre-image (FINDING
+            // manifestation 3 in `manager_tests/subscription_output_oracle.rs`).
+            let reused_array_is_fresh = if precise_dirty_enabled() {
+                match (new_outer_id, new_correlation.as_ref()) {
+                    (Some(outer_id), Some(correlation)) => {
+                        self.subgraph_state_clean(outer_id, correlation)
+                    }
+                    _ => true,
+                }
+            } else {
+                !self.inner_dirty
+            };
             let (new_array, new_provenance, new_batch_provenance) =
-                if old_correlation == new_correlation {
+                if old_correlation == new_correlation && reused_array_is_fresh {
                     (
                         old_state
                             .as_ref()
@@ -534,12 +660,26 @@ impl ArraySubqueryNode {
         cached.last_used = clock;
         let instance = &mut cached.instance;
 
-        if reused {
-            // A freshly compiled graph starts with every node dirty. A reused one does
-            // not, and its scan nodes have no idea the inner table moved — that is what
-            // made three array_subquery tests return stale arrays. Marking all dirty
-            // restores exactly the fresh-graph semantics; the saving is the compile, not
-            // the scan.
+        if reused && !precise_dirty_enabled() {
+            // LEGACY PATH (JAZZ_PRECISE_DIRTY=0). A freshly compiled graph
+            // starts with every node dirty. A reused one does not, and its
+            // scan nodes have no idea the inner table moved — that is what
+            // made three array_subquery tests return stale arrays. Marking all
+            // dirty restores exactly the fresh-graph semantics; the saving is
+            // the compile, not the scan.
+            //
+            // PRECISE PATH (default): reused instance graphs carry their own
+            // row-precise dirt, delivered at write time through
+            // `note_inner_rows_changed` (membership) and `forward_rows_*`
+            // (content / removals), so the settle below re-evaluates exactly
+            // the touched rows — O(|changed ids|) point reads per instance —
+            // and a clean instance settles in zero evaluations. The one dirt
+            // source that bypasses these channels is a schema republish, and
+            // that never reuses instances: `recompile_stale_subscriptions`
+            // (query_manager/manager.rs) replaces the whole subscription
+            // graph, dropping this node together with its instance caches, so
+            // a stale-shape plan cannot survive a schema change (verified
+            // pre-condition, include-plan-sharing design §9).
             instance.graph.mark_all_dirty();
         }
         let _row_delta = instance
@@ -644,8 +784,36 @@ impl ArraySubqueryNode {
         }
     }
 
-    /// Re-evaluate all instances when inner data changes.
+    /// Whether every cached subgraph serving this correlation value exists,
+    /// is bound to the current correlation, and carries no dirty nodes — in
+    /// which case re-evaluating it is provably a no-op (a settle over a clean
+    /// bitmap evaluates zero nodes, so the output tuples cannot have moved).
+    fn subgraph_state_clean(&self, outer_id: ObjectId, correlation_value: &Value) -> bool {
+        let element_clean = |index: usize, element: &Value| {
+            matches!(
+                self.subgraph_cache.get(&(outer_id, index)),
+                Some(cached) if &cached.correlation_value == element
+                    && !cached.instance.graph.has_dirty_nodes()
+            )
+        };
+        match correlation_value {
+            Value::Array(elements) => elements
+                .iter()
+                .enumerate()
+                .all(|(index, element)| element_clean(index, element)),
+            single => element_clean(0, single),
+        }
+    }
+
+    /// Re-evaluate instances when inner data changes.
     /// Returns deltas for any arrays that changed.
+    ///
+    /// With precise dirtiness enabled only instances whose subgraphs actually
+    /// carry dirt (or need a fresh compile) are re-evaluated; the rest are
+    /// skipped outright, which is what makes an uncorrelated write cost
+    /// O(|changed ids|) per live instance instead of a full re-scan per
+    /// instance per settle (the settle-spin fix, design §5). The legacy path
+    /// re-evaluates every instance unconditionally.
     pub fn reevaluate_all<F>(&mut self, io: &dyn Storage, row_loader: &mut F) -> TupleDelta
     where
         F: FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
@@ -656,9 +824,13 @@ impl ArraySubqueryNode {
         self.inner_dirty = false;
 
         // Collect state snapshots to avoid borrow issues during re-evaluation.
+        let precise = precise_dirty_enabled();
         let instances_snapshot: Vec<(ObjectId, ArrayInstanceState)> = self
             .instances
             .iter()
+            .filter(|(id, state)| {
+                !precise || !self.subgraph_state_clean(**id, &state.correlation_value)
+            })
             .map(|(id, state)| (*id, state.clone()))
             .collect();
 

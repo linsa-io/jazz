@@ -136,15 +136,28 @@ impl MaterializeNode {
             .unwrap_or(false)
     }
 
-    /// Mark an ID for content update checking (only if we're tracking it).
-    pub fn mark_updated(&mut self, id: ObjectId) {
-        self.updated_ids.insert(id);
+    /// Mark an ID for content update checking — only if this node tracks it
+    /// (a mark for an unknown id can never produce a delta: the id has no
+    /// tuple to re-materialize, and if it arrives later the scan-add path
+    /// loads fresh content anyway). Returns whether the id was tracked, so
+    /// callers dirty this node only when a re-settle can matter.
+    pub fn mark_updated(&mut self, id: ObjectId) -> bool {
+        if self.known_tuples_by_id.contains_key(&id) || self.rows.contains_key(&id) {
+            self.updated_ids.insert(id);
+            true
+        } else {
+            false
+        }
     }
 
     /// Mark an ID as deleted - emit removal delta during next settle.
-    pub fn mark_deleted(&mut self, id: ObjectId) {
+    /// Returns whether the id was held (see [`Self::mark_updated`]).
+    pub fn mark_deleted(&mut self, id: ObjectId) -> bool {
         if self.rows.contains_key(&id) {
             self.deleted_ids.insert(id);
+            true
+        } else {
+            false
         }
     }
 

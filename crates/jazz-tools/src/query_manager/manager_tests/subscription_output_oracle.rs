@@ -12,12 +12,14 @@
 //! — must be identical between the two engines, and must reconstruct both the
 //! engine's own materialized state and an independent generator-side model.
 //!
-//! Today both sides run the legacy evaluation path, which pins the harness
-//! green and freezes the output contract. When the F1 (shared subquery plans)
-//! and F2 (precise dirtiness) kill-switches land, [`EnginePath`] grows
-//! variants whose guards force each side's mode — the same plug shape as
-//! `force_history_fastpath` in `storage/conformance_differential.rs` — and
-//! the dual-run becomes legacy-vs-fastpath with zero harness changes.
+//! Each side runs a declared [`EnginePath`] — `Legacy`
+//! (`JAZZ_PRECISE_DIRTY=0`, the pre-F2 mark-all path) or `PreciseDirty` (the
+//! default) — forced per engine call through `force_precise_dirty`, the same
+//! plug shape as `force_history_fastpath` in
+//! `storage/conformance_differential.rs`. The default oracle runs the FULL
+//! op matrix precise-vs-precise (the model layer carries the proof); the
+//! legacy-vs-precise dual-run is confined to [`OpProfile::LegacyParity`],
+//! the subset on which the legacy path is actually correct.
 //!
 //! What is checked per batch, per subscription:
 //! - **A/B equality**: every `QueryUpdate` (RowDelta rows byte-for-byte,
@@ -72,37 +74,42 @@
 //!   subscription settle path; cross-tier delivery is exercised by the e2e
 //!   suites.
 //!
-//! FINDING (v13-1, caught by this oracle's model layer on its first run):
-//! content-only updates to an include's INNER rows never reach subscription
-//! outputs — the include array stays permanently stale, on the local-write
-//! path AND the remote sync-inbox path, through any number of settle passes.
-//! Root cause is exactly the scope cut §9/F2 names: row-precise changed ids
-//! are discarded at `mark_table_dependents_dirty` (`graph/execute.rs` — no
-//! ids parameter), so a reused subquery instance re-runs its correlate scan
-//! (membership refreshes) but its materialize state never re-loads content
-//! for ids it already holds; `process_with_context` likewise reuses the old
-//! array whenever the correlation value is unchanged. Consequences:
-//! - a child edit is invisible in every parent's include until the NEXT
-//!   membership change of that include;
-//! - an `is_deleted` FILTER FLIP is a content update, so rows flip in the
-//!   model but not in the engine — filter transitions are broken, not just
-//!   cosmetic staleness;
-//! - NESTED-include membership is stale too: a grandchild insert/move under
-//!   an unchanged child set never surfaces, because the nested subquery's
-//!   instance caches inside a reused outer instance never re-run their scans
-//!   (`mark_all_dirty` on the outer instance does not reach them — design
-//!   §9's "inner ArraySubqueryNodes own their own caches");
+//! FINDING (v13-1, caught by this oracle's model layer on its first run;
+//! FIXED by F2 in v13-2 — the fix points are noted inline): content-only
+//! updates to an include's INNER rows never reached subscription outputs —
+//! the include array stayed permanently stale, on the local-write path AND
+//! the remote sync-inbox path, through any number of settle passes. Root
+//! cause was exactly the scope cut §9/F2 names: row-precise changed ids were
+//! discarded at `mark_table_dependents_dirty` (`graph/execute.rs` — no ids
+//! parameter), so a reused subquery instance re-ran its correlate scan
+//! (membership refreshed) but its materialize state never re-loaded content
+//! for ids it already held; `process_with_context` likewise reused the old
+//! array whenever the correlation value was unchanged. The manifestations,
+//! and where each is fixed:
+//! - a child edit was invisible in every parent's include until the NEXT
+//!   membership change of that include — fixed by forwarding
+//!   `mark_rows_updated` into the include's subgraph instances
+//!   (`ArraySubqueryNode::forward_rows_updated`);
+//! - an `is_deleted` FILTER FLIP is a content update, so rows flipped in the
+//!   model but not in the engine — same fix (the instance's FilterNode sees
+//!   the reloaded content and retracts);
+//! - NESTED-include membership was stale too: a grandchild insert/move under
+//!   an unchanged child set never surfaced, because the nested subquery's
+//!   instance caches inside a reused outer instance never re-ran their scans
+//!   — fixed by `note_inner_rows_changed` recursing through the instance
+//!   graphs' own dependent routing;
 //! - mixing an OUTER-row update with an inner membership change in ONE
-//!   settle corrupts the output tuple set: `reevaluate_all` runs before the
-//!   outer input delta and rebuilds from a stale outer-tuple snapshot, so
-//!   the outer path's retraction misses `current_tuples` and the same
-//!   parent is served twice (caught here as a double-booked ordered index
-//!   plus a stale `updated` pre-image).
-//! The green default therefore runs [`OpProfile::MembershipSafe`]: filter
-//! flips and nested-membership mutations excluded, and each mutation batch
-//! class-homogeneous (all-outer or all-inner). The FULL §6.2 op matrix runs
-//! as an `#[ignore]`d expected-red test plus a minimal pinned fixture, both
-//! of which F2's row-precise dirtiness must turn green and un-ignore.
+//!   settle corrupted the output tuple set (double-booked ordered index plus
+//!   a stale `updated` pre-image): tuple identity is ID-based, so the two
+//!   chained update pairs the old settle emitted for one row id
+//!   double-booked downstream sort state — fixed by processing the outer
+//!   delta FIRST and evaluating the fresh array inside the update when the
+//!   instance carries pending inner dirt, so each settle emits exactly one
+//!   coalesced pair per row (`graph/execute.rs` ArraySubquery arm +
+//!   `process_with_context`'s freshness check).
+//! The LEGACY path (`JAZZ_PRECISE_DIRTY=0`) retains the first three
+//! manifestations by design; [`OpProfile::LegacyParity`] excludes exactly
+//! those op classes so the kill-switch dual-run stays meaningful.
 
 use std::collections::HashMap;
 
@@ -151,42 +158,47 @@ const SEEDS: [u64; 6] = [
 ];
 
 // ============================================================================
-// Engine-path plug point for the F1/F2 kill-switch dual-runs.
+// Engine-path plug point for the F2 kill-switch dual-runs.
 // ============================================================================
 
 /// Which evaluation path a differential side runs.
 ///
-/// Today only `Legacy` exists and `engage()` is a no-op guard. When F1/F2
-/// land with test overrides (mirroring `force_history_fastpath`), this enum
-/// gains e.g. `SharedPlans` / `PreciseDirty` variants whose guards hold the
-/// corresponding kill-switch for the side's lifetime, and `run_oracle` is
-/// called with `(EnginePath::Legacy, EnginePath::SharedPlans)`.
+/// Each engine call (write or settle) is wrapped in a scoped
+/// `force_precise_dirty` guard for the engine's path — the same plug shape
+/// as `force_history_fastpath`, but held per call instead of per engine
+/// lifetime so a legacy engine and a precise engine can interleave in one
+/// dual-run without deadlocking on the override mutex.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnginePath {
+    /// The pre-F2 mark-all path (`JAZZ_PRECISE_DIRTY=0`). Keeps the known
+    /// include-staleness bugs; byte-correct only for [`OpProfile::LegacyParity`].
     Legacy,
+    /// Row-precise include dirtiness (the default runtime path).
+    PreciseDirty,
 }
 
-struct EnginePathGuard;
-
 impl EnginePath {
-    fn engage(self) -> EnginePathGuard {
-        match self {
-            EnginePath::Legacy => EnginePathGuard,
-        }
+    fn engage(self) -> crate::query_manager::precise_dirty::PreciseDirtyMode {
+        crate::query_manager::precise_dirty::force_precise_dirty(matches!(
+            self,
+            EnginePath::PreciseDirty
+        ))
     }
 }
 
 /// Which mutation classes the generator draws from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpProfile {
-    /// Everything except `is_deleted` filter flips and nested-include
-    /// membership mutations — the op classes whose ID-tree effect the
-    /// pre-existing include-staleness bug swallows (see the FINDING in the
-    /// module docs). Green today; the regression floor.
-    MembershipSafe,
+    /// Everything except the op classes whose subscription-output effect the
+    /// LEGACY path swallows by design (inner-row content updates: child
+    /// title edits and `is_deleted` filter flips; nested-include membership:
+    /// grandchild inserts/moves). On this profile the legacy and precise
+    /// paths must produce byte-identical output streams — the kill-switch
+    /// regression guard.
+    LegacyParity,
     /// The full §6.2 op matrix including filter flips and grandchild
-    /// inserts/moves. EXPECTED RED until F2 threads row-precise changed ids
-    /// into include instances (nested ones included).
+    /// inserts/moves — the default oracle profile since F2 (v13-2) threads
+    /// row-precise changed ids into include instances (nested ones included).
     FullIncludingFilterFlips,
 }
 
@@ -643,72 +655,22 @@ impl OpGenerator {
         )
     }
 
-    /// One mutation batch (1..=`MAX_OPS_PER_BATCH` ops).
+    /// One mutation batch (1..=`MAX_OPS_PER_BATCH` ops), freely mixing outer
+    /// and inner op classes.
     ///
-    /// `MembershipSafe` batches are CLASS-HOMOGENEOUS — all-outer (parents
-    /// table) or all-inner (children table) — because mixing the classes in
-    /// one settle corrupts the engine's output tuple set today (FINDING,
-    /// third manifestation): the settle runs `reevaluate_all` BEFORE the
-    /// outer input delta, rebuilding an instance's output from its stale
-    /// outer-tuple snapshot; the outer-update path then retracts a tuple
-    /// that is no longer in `current_tuples`, the removal misses, and the
-    /// same parent is served twice with divergent contents (observed as a
-    /// double-booked ordered index plus a stale `updated` pre-image).
+    /// (Historical note: mixing the classes in one settle used to corrupt
+    /// the engine's output tuple set — FINDING manifestation 3 — so the
+    /// pre-F2 green profile had to keep batches class-homogeneous. Fixed by
+    /// the outer-first + per-row-coalesced settle in
+    /// `graph/execute.rs` / `graph_nodes/array_subquery.rs`; both profiles
+    /// now draw from the mixed stream.)
     fn batch_ops(&mut self, model: &mut Model) -> Vec<StampedOp> {
         let count = 1 + self.prng.below(MAX_OPS_PER_BATCH);
-        match self.profile {
-            OpProfile::FullIncludingFilterFlips => {
-                (0..count).map(|_| self.mutation(model)).collect()
-            }
-            OpProfile::MembershipSafe => {
-                if self.prng.chance(2, 5) {
-                    (0..count).map(|_| self.outer_mutation(model)).collect()
-                } else {
-                    (0..count).map(|_| self.inner_mutation(model)).collect()
-                }
-            }
-        }
+        (0..count).map(|_| self.mutation(model)).collect()
     }
 
-    /// One parents-table mutation (fallbacks stay within the outer class).
-    fn outer_mutation(&mut self, model: &mut Model) -> StampedOp {
-        let roll = self.prng.below(100);
-        let live_parents = model.live_parents();
-        match roll {
-            0..25 => {
-                if model.parents.len() < MAX_PARENTS {
-                    let owner = self.owner();
-                    self.insert_parent(model, owner)
-                } else {
-                    self.move_parent_ord(model, &live_parents)
-                }
-            }
-            25..50 => self.update_parent_title(model, &live_parents),
-            50..85 => self.move_parent_ord(model, &live_parents),
-            _ => self.soft_delete_parent(model, &live_parents),
-        }
-    }
-
-    /// One children-table mutation (fallbacks stay within the inner class).
-    fn inner_mutation(&mut self, model: &mut Model) -> StampedOp {
-        let roll = self.prng.below(100);
-        let live_children = model.live_children();
-        match roll {
-            0..30 => {
-                if model.children.len() < MAX_CHILDREN {
-                    self.insert_child(model, None)
-                } else {
-                    self.move_child_parent(model, &live_children)
-                }
-            }
-            30..45 => self.update_child_title(model, &live_children),
-            45..80 => self.move_child_parent(model, &live_children),
-            _ => self.soft_delete_child(model, &live_children),
-        }
-    }
-
-    /// One random mutation from the full matrix; falls back to inserts when
-    /// a target pool is empty or capped, so an op is always produced.
+    /// One random mutation from the profile's matrix; falls back to inserts
+    /// when a target pool is empty or capped, so an op is always produced.
     fn mutation(&mut self, model: &mut Model) -> StampedOp {
         let roll = self.prng.below(100);
         let live_parents = model.live_parents();
@@ -734,8 +696,8 @@ impl OpGenerator {
             }
             // insert grandchild (FullIncludingFilterFlips only: nested-include
             // membership changes under an unchanged child set are swallowed by
-            // the same staleness bug — the nested subquery's instance caches
-            // inside a reused outer instance never re-run their scans)
+            // the LEGACY path — the nested subquery's instance caches inside a
+            // reused outer instance never re-run their scans)
             20..28 => match self.profile {
                 OpProfile::FullIncludingFilterFlips
                     if model.grandchildren.len() < MAX_GRANDCHILDREN =>
@@ -745,20 +707,25 @@ impl OpGenerator {
                 OpProfile::FullIncludingFilterFlips => {
                     self.move_grandchild(model, &live_grandchildren)
                 }
-                OpProfile::MembershipSafe => self.insert_child(model, None),
+                OpProfile::LegacyParity => self.insert_child(model, None),
             },
             // parent content update
             28..36 => self.update_parent_title(model, &live_parents),
             // parent order move (window churn under order_by + limit)
             36..48 => self.move_parent_ord(model, &live_parents),
-            // child content update
-            48..54 => self.update_child_title(model, &live_children),
-            // include-filter flip (FullIncludingFilterFlips only: the flip's
-            // membership effect is swallowed by the include-staleness bug —
-            // see the FINDING in the module docs)
+            // child content update (Full only: the LEGACY path never re-serves
+            // include-inner content — FINDING manifestation 1)
+            48..54 => match self.profile {
+                OpProfile::FullIncludingFilterFlips => {
+                    self.update_child_title(model, &live_children)
+                }
+                OpProfile::LegacyParity => self.move_child_parent(model, &live_children),
+            },
+            // include-filter flip (Full only: the flip is an inner content
+            // update, swallowed by the LEGACY path — FINDING manifestation 1)
             54..66 => match self.profile {
                 OpProfile::FullIncludingFilterFlips => self.flip_child_flag(model, &live_children),
-                OpProfile::MembershipSafe => self.move_child_parent(model, &live_children),
+                OpProfile::LegacyParity => self.move_child_parent(model, &live_children),
             },
             // correlate-value move: child re-homed to another parent
             66..78 => self.move_child_parent(model, &live_children),
@@ -768,7 +735,7 @@ impl OpGenerator {
                 OpProfile::FullIncludingFilterFlips => {
                     self.move_grandchild(model, &live_grandchildren)
                 }
-                OpProfile::MembershipSafe => self.move_child_parent(model, &live_children),
+                OpProfile::LegacyParity => self.move_child_parent(model, &live_children),
             },
             // soft deletes
             85..91 => self.soft_delete_parent(model, &live_parents),
@@ -1118,7 +1085,7 @@ struct Engine<H: Storage> {
     subs: Vec<QuerySubscriptionId>,
     mirrors: Vec<Mirror>,
     name: &'static str,
-    _path: EnginePathGuard,
+    path: EnginePath,
 }
 
 impl<H: Storage> Engine<H> {
@@ -1141,11 +1108,12 @@ impl<H: Storage> Engine<H> {
             subs: Vec::new(),
             mirrors: Vec::new(),
             name,
-            _path: path.engage(),
+            path,
         }
     }
 
     fn subscribe_all(&mut self, context: &str) {
+        let _path = self.path.engage();
         for spec in sub_specs() {
             let builder = self.qm.query(PARENT_TABLE);
             let builder = if spec.descending {
@@ -1182,6 +1150,7 @@ impl<H: Storage> Engine<H> {
     }
 
     fn apply(&mut self, context: &str, op: &StampedOp) {
+        let _path = self.path.engage();
         let write_context = WriteContext {
             session: None,
             attribution: Some(op.author.to_string()),
@@ -1239,6 +1208,7 @@ impl<H: Storage> Engine<H> {
     /// A single `process()` emits at most one update per subscription — the
     /// grouping is the ONLY normalization applied (see module docs).
     fn process_and_take(&mut self, context: &str) -> HashMap<u64, QueryUpdate> {
+        let _path = self.path.engage();
         self.qm.process(&mut self.storage);
         let mut grouped: HashMap<u64, QueryUpdate> = HashMap::new();
         for update in self.qm.take_updates() {
@@ -1406,11 +1376,12 @@ fn run_oracle<H: Storage>(
     make_storage: &dyn Fn(&Schema) -> H,
     fault: Fault,
     profile: OpProfile,
+    (path_a, path_b): (EnginePath, EnginePath),
 ) {
     let schema = oracle_schema();
     let specs = sub_specs();
-    let mut engine_a = Engine::new("A", EnginePath::Legacy, &schema, make_storage);
-    let mut engine_b = Engine::new("B", EnginePath::Legacy, &schema, make_storage);
+    let mut engine_a = Engine::new("A", path_a, &schema, make_storage);
+    let mut engine_b = Engine::new("B", path_b, &schema, make_storage);
     let mut model = Model::default();
     let mut generator = OpGenerator::new(seed, profile);
     let mut op_index = 0usize;
@@ -1574,14 +1545,21 @@ fn memory_storage_factory(schema: &Schema) -> MemoryStorage {
 // Tests.
 // ============================================================================
 
+/// The kill-switch regression guard: on the ops whose effect the legacy
+/// path handles correctly, `JAZZ_PRECISE_DIRTY=0` and the precise default
+/// must produce byte-identical output streams. (The full matrix cannot run
+/// legacy-vs-precise: the legacy side swallows inner content updates and
+/// nested membership changes by design — that gap is exactly what F2 fixed,
+/// and it is pinned by `include_array_reflects_inner_row_content_update`.)
 #[test]
-fn subscription_output_differential_random_ops_memory() {
+fn subscription_output_differential_legacy_vs_precise_on_legacy_parity_ops() {
     for seed in SEEDS {
         run_oracle(
             seed,
             &memory_storage_factory,
             Fault::None,
-            OpProfile::MembershipSafe,
+            OpProfile::LegacyParity,
+            (EnginePath::Legacy, EnginePath::PreciseDirty),
         );
     }
 }
@@ -1605,20 +1583,21 @@ fn subscription_output_differential_random_ops_rocksdb() {
     // Two seeds: rocksdb runs the identical logic through the persistent
     // backend; the memory run carries the seed breadth.
     for seed in &SEEDS[..2] {
-        run_oracle(*seed, &factory, Fault::None, OpProfile::MembershipSafe);
+        run_oracle(
+            *seed,
+            &factory,
+            Fault::None,
+            OpProfile::FullIncludingFilterFlips,
+            (EnginePath::PreciseDirty, EnginePath::PreciseDirty),
+        );
     }
 }
 
-/// The FULL §6.2 op matrix, filter flips included.
-///
-/// EXPECTED RED: pinned by
-/// `include_array_goes_stale_on_inner_row_content_update` below — content
-/// updates (and therefore `is_deleted` filter transitions) on include-inner
-/// rows never reach subscription outputs. F2's row-precise dirtiness must
-/// make this green and un-ignore it; from then on it IS the oracle and the
-/// `MembershipSafe` run becomes redundant.
+/// The FULL §6.2 op matrix, filter flips included — the default oracle
+/// profile since F2 (v13-2). Both engines run the precise path; the model
+/// layer (per-batch id-tree comparison against the generator-side reference)
+/// is what proves every mutation class reaches the output stream.
 #[test]
-#[ignore = "EXPECTED RED: include arrays go stale on inner-row content updates (see module docs FINDING); F2 must fix and un-ignore"]
 fn subscription_output_differential_full_ops_including_filter_flips() {
     for seed in SEEDS {
         run_oracle(
@@ -1626,18 +1605,19 @@ fn subscription_output_differential_full_ops_including_filter_flips() {
             &memory_storage_factory,
             Fault::None,
             OpProfile::FullIncludingFilterFlips,
+            (EnginePath::PreciseDirty, EnginePath::PreciseDirty),
         );
     }
 }
 
-/// Minimal pin of the FINDING in the module docs: a child row's `is_deleted`
-/// flip must retract it from a `filter_eq("is_deleted", false)` include, and
-/// a plain content edit must be re-served. Today NEITHER happens — the
-/// include array is byte-stale forever (also via the remote sync-inbox
-/// path). Un-ignore together with the full-ops oracle when F2 lands.
+/// Minimal pin of the fixed FINDING (module docs): a child row's `is_deleted`
+/// flip must retract it from a `filter_eq("is_deleted", false)` include.
+/// Before F2 the include array was byte-stale forever on inner content
+/// updates (also via the remote sync-inbox path); the precise-dirty path
+/// forwards content marks into the include's subgraph instances.
 #[test]
-#[ignore = "EXPECTED RED: pins the include inner-update staleness bug (module docs FINDING); F2 must fix and un-ignore"]
-fn include_array_goes_stale_on_inner_row_content_update() {
+fn include_array_reflects_inner_row_content_update() {
+    let _precise = crate::query_manager::precise_dirty::force_precise_dirty(true);
     let sync_manager = SyncManager::new();
     let mut schema = Schema::new();
     schema.insert(
@@ -1728,7 +1708,8 @@ fn oracle_catches_an_engine_that_missed_a_write() {
         SEEDS[0],
         &memory_storage_factory,
         Fault::SkipOpOnB { op_index: 0 },
-        OpProfile::MembershipSafe,
+        OpProfile::FullIncludingFilterFlips,
+        (EnginePath::PreciseDirty, EnginePath::PreciseDirty),
     );
 }
 
@@ -1741,7 +1722,8 @@ fn oracle_catches_a_dropped_delta_batch() {
         SEEDS[0],
         &memory_storage_factory,
         Fault::DropFirstMutationUpdateOnB,
-        OpProfile::MembershipSafe,
+        OpProfile::FullIncludingFilterFlips,
+        (EnginePath::PreciseDirty, EnginePath::PreciseDirty),
     );
 }
 

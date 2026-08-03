@@ -1307,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn history_fastpath_declines_tier_confirmed_row_over_tier_hole() {
+    fn history_fastpath_tier_confirmed_row_dominates_tier_hole() {
         let _mode = force_history_fastpath(true);
         let descriptor = RowDescriptor::new(vec![
             ColumnDescriptor::new("title", ColumnType::Text),
@@ -1321,12 +1321,15 @@ mod tests {
             )
             .merge_strategy(ColumnMergeStrategy::GSet),
         ]);
-        // r2 is a tier hole: it never got confirmed, so r1 stays a concurrent
-        // tip of every tier-filtered frontier even though the chain is linear.
-        // The previous entry is still "clean" (no pointers, no ordinals)
-        // because the r1/r3 tier merge coincidentally equals r3 (zero counter
-        // delta, tag subset) — which is exactly why cleanliness of the entry
-        // cannot prove hole-freedom.
+        // r2 is a tier hole: it never got confirmed. Pre-v13-2 the one-step
+        // tier frontier resurfaced r1 as a concurrent tier tip beside every
+        // newer confirmed row, so a tier-satisfying append had to decline —
+        // no entry-local rule could know what hid behind the hole. Since
+        // v13-2 the tier frontier uses causal domination through the full
+        // history DAG: r1 is a proper ancestor of r3 (via the unconfirmed
+        // r2), so it is superseded at every tier r3 satisfies, holes
+        // included — and a new row that dominates the whole visible set
+        // provably dominates every tier set it enters.
         let r1 = root_batch(
             &descriptor,
             &[
@@ -1360,16 +1363,21 @@ mod tests {
             Some(DurabilityTier::GlobalServer),
         );
         let previous = rebuilt_entry(&descriptor, &[r1.clone(), r2.clone(), r3.clone()]);
+        // Causal domination makes the holed chain look linear at every tier:
+        // the global set {r1, r3} has the frontier {r3}, whose singleton
+        // preview matches the current row — the entry stays clean.
         assert_eq!(previous.worker_batch_id, None);
         assert_eq!(previous.global_batch_id, None);
         assert!(previous.winner_batch_pool.is_empty());
         assert_eq!(previous.global_winner_ordinals, None);
 
-        // A new globally confirmed row over a tier that already had satisfying
-        // rows must decline: the rebuild resurfaces r1 as a concurrent tier
-        // tip and stores a merged tier preview (populated pool/ordinals) that
-        // is not derivable from the previous entry. A design-literal
-        // "row satisfies tier ⇒ pointer None" fast entry would diverge here.
+        // A new globally confirmed row over the holed chain dominates every
+        // visible row (its parents cover the whole frontier), so the tier
+        // frontier collapses to the new row and the fast path proves the
+        // clean entry in O(1) — byte-equal to the full rebuild. Pre-v13-2
+        // this had to decline and pay an O(depth) rebuild (r1 resurfaced as
+        // a concurrent tier tip and its counter delta was even
+        // double-counted into the merged preview).
         let c = serial_batch(
             &r3,
             &descriptor,
@@ -1381,12 +1389,15 @@ mod tests {
             40,
             Some(DurabilityTier::GlobalServer),
         );
-        assert_eq!(try_serial_fastpath_entry(Some(&previous), &c), None);
+        let fast = try_serial_fastpath_entry(Some(&previous), &c)
+            .expect("tier-satisfying append over a holed chain takes the fast path");
 
         let rebuilt = rebuilt_entry(&descriptor, &[r1, r2, r3, c.clone()]);
-        assert_eq!(rebuilt.global_batch_id, Some(c.batch_id()));
-        assert!(rebuilt.global_winner_ordinals.is_some());
-        assert!(!rebuilt.winner_batch_pool.is_empty());
+        assert_eq!(fast, rebuilt);
+        assert_eq!(rebuilt.current_row, c);
+        assert_eq!(rebuilt.global_batch_id, None);
+        assert_eq!(rebuilt.global_winner_ordinals, None);
+        assert!(rebuilt.winner_batch_pool.is_empty());
     }
 
     #[test]
@@ -1897,10 +1908,13 @@ mod tests {
         assert_eq!(fast.edge_batch_id, None);
         assert_eq!(fast.global_batch_id, None);
 
-        // Next serial append re-arms the pointers (Fix A carry), and the
-        // following confirmation must DECLINE: a `Some` pointer cannot prove
-        // the tier set holds no hole-hidden concurrent tips, even though the
-        // full rebuild happens to resolve back to None here.
+        // Next serial append re-arms the pointers (Fix A carry). The
+        // following confirmation is the B3 confirm-over-confirmed-chain case
+        // (v13-2): the confirmed sole tip causally dominates every visible
+        // row, so each tier set it enters collapses to it and the pointers
+        // flip to None in O(1), byte-equal to the full rebuild. This exact
+        // shape used to decline on the `Some` pointer and pay an O(depth)
+        // rebuild per confirm (the flatness-gate wall).
         let c = serial_batch(
             &confirmed,
             &descriptor,
@@ -1913,13 +1927,14 @@ mod tests {
         assert_eq!(previous.global_batch_id, Some(b.batch_id()));
 
         let confirmed_c = c.accepted_transaction_output(DurabilityTier::GlobalServer);
-        assert_eq!(
-            try_in_place_tip_update_entry(Some(&previous), &c, &confirmed_c),
-            None
-        );
+        let fast = try_in_place_tip_update_entry(Some(&previous), &c, &confirmed_c)
+            .expect("confirm over a confirmed linear chain takes the in-place fast path");
         let full = rebuilt_entry(&descriptor, &[a, confirmed, confirmed_c.clone()]);
+        assert_eq!(fast, full);
         assert_eq!(full.current_row, confirmed_c);
-        assert_eq!(full.global_batch_id, None);
+        assert_eq!(fast.worker_batch_id, None);
+        assert_eq!(fast.edge_batch_id, None);
+        assert_eq!(fast.global_batch_id, None);
     }
 
     #[test]
@@ -1958,14 +1973,17 @@ mod tests {
     }
 
     #[test]
-    fn in_place_fastpath_declines_tier_confirmation_over_tier_hole() {
+    fn in_place_fastpath_tier_confirmation_dominates_tier_hole() {
         let _mode = force_history_fastpath(true);
         let descriptor = counter_descriptor();
-        // r2 is a tier hole: confirming r3 makes the global-filtered frontier
-        // {r1, r3} (r3's parent r2 is not in the tier set, so r1 resurfaces),
-        // and the counter delta forces a REAL merged preview with
-        // pool/ordinals — the concrete divergence an in-place claim (pointer
-        // None or carried Some(r1)) would produce.
+        // r2 is a tier hole. Pre-v13-2's one-step tier frontier resurfaced
+        // r1 as a concurrent global tip when r3 got confirmed ({r1, r3}, r2
+        // not in the tier set) and merged it — double-counting r1's counter
+        // delta into the preview — so the in-place path had to decline on
+        // the carried `Some(r1)` pointer. Under causal domination (v13-2)
+        // r1 is a proper ancestor of r3 through the full DAG, the confirmed
+        // tip dominates the whole tier set, and the O(1) claim is provable
+        // and byte-equal to the rebuild.
         let r1 = root_batch(
             &descriptor,
             &[Value::Text("task".into()), Value::Integer(2)],
@@ -1992,17 +2010,15 @@ mod tests {
         assert!(previous.winner_batch_pool.is_empty());
 
         let confirmed = r3.accepted_transaction_output(DurabilityTier::GlobalServer);
-        assert_eq!(
-            try_in_place_tip_update_entry(Some(&previous), &r3, &confirmed),
-            None
-        );
+        let fast = try_in_place_tip_update_entry(Some(&previous), &r3, &confirmed)
+            .expect("tier confirmation over a holed chain takes the in-place fast path");
 
-        let full = rebuilt_entry(&descriptor, &[r1, r2, confirmed]);
-        assert!(
-            full.global_winner_ordinals.is_some(),
-            "the rebuild needs a merged global preview: {full:?}"
-        );
-        assert!(!full.winner_batch_pool.is_empty());
+        let full = rebuilt_entry(&descriptor, &[r1, r2, confirmed.clone()]);
+        assert_eq!(fast, full);
+        assert_eq!(full.current_row, confirmed);
+        assert_eq!(full.global_batch_id, None);
+        assert_eq!(full.global_winner_ordinals, None);
+        assert!(full.winner_batch_pool.is_empty());
     }
 
     #[test]

@@ -28,12 +28,16 @@
 //! the full path, which is always correct.
 //!
 //! Why the per-tier carry-forward is subtle: the rebuild computes each tier
-//! preview over the *tier-filtered* row set, and filtering can disconnect a
-//! linear chain — a tier-satisfying ancestor whose descendants are not
-//! tier-confirmed ("tier hole") re-surfaces as a concurrent tier tip whose
-//! merge output depends on deep history. [`carried_tier_pointer`] therefore
-//! only handles the transitions whose outcome is provable from the previous
-//! entry, and declines the rest (see its doc comment for the case analysis).
+//! preview over the *tier-filtered* row set. Since v13-2 the tier frontier
+//! uses causal domination through the full history DAG
+//! (`resolution::build_computed_visible_preview`): a tier-satisfying version
+//! whose lineage a newer tier-satisfying version builds on is superseded at
+//! that tier even when the chain between them is not tier-confirmed. That
+//! makes a row which dominates the whole visible set provably dominate every
+//! tier set it enters, so tier-ENTERING transitions are O(1)
+//! (`carried_tier_pointer` / [`in_place_tier_pointer`], the B3 wall fix).
+//! Tier-LEAVING transitions can still expose rows the entry never tracked
+//! and always decline to the full rebuild.
 
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
@@ -299,14 +303,22 @@ fn parents_cover_frontier_exactly(parents: &[BatchId], frontier: &[BatchId]) -> 
 ///     `x`). Note this deliberately refines the design sketch's "old tip
 ///     satisfies ⇒ point at old tip": when a pointer is already present it is
 ///     the rebuild's answer, the old tip is not.
-/// - `C` satisfies the tier: S gains `C`. If S was provably empty before
-///   (old pointer `None` and `B` not satisfying), the new tier preview is
-///   `{C}` which matches the new current row ⇒ `None`. Otherwise older
-///   tier-satisfying rows may hide behind tier holes and re-surface as
-///   concurrent tier tips (the tier-filtered frontier is
-///   `{C} ∪ (tips(S) \ parents)`), whose merge needs full history — decline.
-///   See `history_fastpath_declines_tier_satisfying_row_over_tier_hole` for a
-///   concrete divergence this rules out.
+/// - `C` satisfies the tier ⇒ the new tier preview is `{C}` and the pointer
+///   is `None`, unconditionally (v13-2, the B3 tier-pointer wall). Proof
+///   under the tier frontier's causal-domination semantics
+///   (`build_computed_visible_preview`, `required_tier == Some(..)`): the
+///   caller's frontier-coverage guard makes `C.parents` equal the whole
+///   unfiltered visible frontier. Every visible row is an ancestor of some
+///   frontier tip — follow its visible parent-naming chain upward; the
+///   history DAG is finite and acyclic (parents are existence-validated at
+///   apply time), so the chain terminates at an un-named row, i.e. a tip —
+///   and every tip is a parent of `C`, so EVERY visible row is a proper
+///   ancestor of `C`. `S ∪ {C}` therefore has the causal frontier `{C}`:
+///   all of S is dominated, and nothing can dominate the brand-new `C`.
+///   The rebuilt candidate is the singleton preview of the new current row
+///   ⇒ pointer `None`. This holds regardless of tier holes below — the
+///   pre-v13-2 one-step frontier resurfaced hole-hidden ancestors and made
+///   this case undecidable from the entry, which was the wall.
 fn carried_tier_pointer(
     row: &StoredRowBatch,
     old_tip: &StoredRowBatch,
@@ -315,11 +327,7 @@ fn carried_tier_pointer(
 ) -> Option<Option<BatchId>> {
     let old_tip_satisfies = tier_satisfies(old_tip.confirmed_tier, tier);
     if tier_satisfies(row.confirmed_tier, tier) {
-        if !old_tip_satisfies && previous_pointer.is_none() {
-            Some(None)
-        } else {
-            None
-        }
+        Some(None)
     } else if old_tip_satisfies && previous_pointer.is_none() {
         Some(Some(old_tip.batch_id()))
     } else {
@@ -455,29 +463,30 @@ fn same_row_except_state_and_tier(existing: &StoredRowBatch, row: &StoredRowBatc
 /// ranking are untouched). Case analysis against the rebuild
 /// (`preview_override_sidecar` over `build_computed_visible_preview`):
 ///
-/// - membership unchanged (`old_sat == new_sat`): the tier frontier keeps the
-///   exact same batch-id structure.
-///   - pointer `None` + T in the tier set: the old tier preview matched the
-///     current preview, i.e. equalled T with an empty winner trail — every
-///     column winner was T itself, so the re-run merge outputs T' exactly
-///     (min-tier over contributors {T'} = T'.tier) and still matches ⇒ stays
-///     `None`.
-///   - pointer `None` + T outside the tier set: matching the current preview
-///     is impossible for a candidate whose metadata row is in S (batch ids
-///     are unique), so S was provably empty and stays empty ⇒ stays `None`.
-///   - pointer `Some(x)`: the old preview was row x with every column winner
-///     on x — T contributed values but won nothing, so flipping its
-///     state/tier leaves the merged output (including its min-tier, computed
-///     over contributors all equal to x) byte-identical ⇒ carried verbatim.
+/// - membership unchanged (`old_sat == new_sat`): the tier set keeps the
+///   exact same rows (T ∈ S in neither or both versions, and only its
+///   state/tier — no merge input — moved), so the candidate preview is
+///   unchanged ⇒ carried verbatim (`None` stays `None`, `Some(x)` stays
+///   `Some(x)`).
 /// - T' enters the tier (`!old_sat && new_sat` — the tier-confirmation hot
-///   case): provable only when S was provably empty (pointer `None`, per the
-///   argument above): the tier set becomes `{T'}`, whose preview matches the
-///   new current row ⇒ `None`. With a `Some(x)` pointer, x's chain is still
-///   in the tier set and tier holes can resurface concurrent tier tips
-///   beside T' (`x ∈ T.parents` does NOT rule out a hole sibling that is not
-///   a parent of T) ⇒ decline; the rebuild may need a merged preview with
-///   pool/ordinals. Pinned by
-///   `in_place_fastpath_declines_tier_confirmation_over_tier_hole`.
+///   case) ⇒ the new tier preview is `{T'}` and the pointer is `None`,
+///   unconditionally (v13-2, the B3 tier-pointer wall). Proof under the
+///   tier frontier's causal-domination semantics
+///   (`build_computed_visible_preview`, `required_tier == Some(..)`): T is
+///   the SOLE unfiltered frontier tip, so every other visible row is a
+///   proper ancestor of T — follow its visible parent-naming chain upward;
+///   the DAG is finite and acyclic, so the chain ends at the only un-named
+///   row, T. Hence every member of S (all visible) is dominated by
+///   T' ∈ S ∪ {T'}, nothing can dominate the sole tip T' itself, and the
+///   causal tier frontier is exactly `{T'}` — whose singleton preview
+///   matches the new current row ⇒ `None`. This holds for pointer `None`
+///   (empty S) and pointer `Some(x)` alike, tier holes included: this is
+///   what makes confirm-over-confirmed-chain — the alternating
+///   append+confirm workload — O(1)
+///   (`append_confirm_per_write_at_edge_server_is_flat_in_history_depth`).
+///   Under the pre-v13-2 one-step tier frontier, `Some(x)` had to decline:
+///   a hole-hidden ancestor could resurface as a concurrent tier tip whose
+///   merge output depends on deep history.
 /// - T' leaves the tier (`old_sat && !new_sat`): a removal event — the new
 ///   tier frontier may expose rows the entry never tracked ⇒ decline.
 fn in_place_tier_pointer(
@@ -490,7 +499,7 @@ fn in_place_tier_pointer(
     let new_sat = tier_satisfies(row.confirmed_tier, tier);
     match (old_sat, new_sat) {
         (true, false) => None,
-        (false, true) => previous_pointer.is_none().then_some(None),
+        (false, true) => Some(None),
         _ => Some(previous_pointer),
     }
 }

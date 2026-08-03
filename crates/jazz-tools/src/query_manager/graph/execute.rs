@@ -88,7 +88,7 @@ impl QueryGraph {
             self.mark_downstream_dirty(node_id);
         }
 
-        self.mark_table_dependents_dirty(table);
+        self.mark_table_dependents_dirty(table, Some(ids));
     }
 
     /// Mark all index scan nodes for a table dirty.
@@ -116,12 +116,24 @@ impl QueryGraph {
             self.mark_downstream_dirty(node_id);
         }
 
-        self.mark_table_dependents_dirty(table);
+        self.mark_table_dependents_dirty(table, None);
     }
 
     /// The non-scan tail shared by [`Self::mark_dirty_for_table`] and
     /// [`Self::mark_rows_changed_for_table`].
-    fn mark_table_dependents_dirty(&mut self, table: &str) {
+    ///
+    /// `changed_rows` carries the row-precise changed ids when the caller has
+    /// them (F2, include-plan-sharing design §5/§9): array subquery nodes
+    /// forward them into their reused subgraph instances so the next settle
+    /// re-evaluates only the touched rows instead of `mark_all_dirty`-ing
+    /// every instance. `None` (table-level dirt with no row information)
+    /// forwards a table-level full-rescan mark instead
+    /// (`note_inner_table_dirty`).
+    fn mark_table_dependents_dirty(
+        &mut self,
+        table: &str,
+        changed_rows: Option<&AHashSet<ObjectId>>,
+    ) {
         // Mark array subquery nodes whose inner table changed
         // Collect node_ids first to avoid borrow conflict
         let affected_array_subqueries: Vec<NodeId> = self
@@ -138,15 +150,30 @@ impl QueryGraph {
 
         for node_id in affected_array_subqueries {
             self.mark_dirty(node_id);
-            // Mark the node as needing inner re-evaluation
+            // Mark the node as needing inner re-evaluation. With row-precise
+            // ids the node also threads membership marks into its cached
+            // subgraph instances (recursively — nested include tables are
+            // registered against the outer node, and the instance graphs
+            // route them onward through their own dependents).
             if let Some(GraphNode::ArraySubquery(node)) = self.get_node_mut(node_id) {
-                node.mark_inner_dirty();
+                match changed_rows {
+                    Some(ids) => node.note_inner_rows_changed(table, ids),
+                    None => node.note_inner_table_dirty(table),
+                }
             }
             // Propagate dirty marks to downstream nodes (Output, etc.)
             self.mark_downstream_dirty(node_id);
         }
 
-        // Mark PolicyFilter nodes whose policy dependency tables changed
+        // Mark PolicyFilter nodes whose policy dependency tables changed.
+        //
+        // DELIBERATE ASYMMETRY (F2, design §9): policy filters, magic columns
+        // and recursive relations keep the coarse table-level channel —
+        // `changed_rows` is not threaded into them. Their re-evaluation is a
+        // policy/dependency re-check over rows the node already holds (point
+        // reads at eval time), not a per-outer-row plan settle, so the F2
+        // pathology (O(rows x plan) work per tick) does not apply; making
+        // them row-precise is F3 scope (reverse correlation index).
         let affected_policy_filters: Vec<NodeId> = self
             .policy_filter_tables
             .iter()
@@ -243,108 +270,144 @@ impl QueryGraph {
 
     /// Mark a row ID as updated for content checking.
     /// This tells MaterializeNodes to check if the row's content has changed.
-    pub fn mark_row_updated(&mut self, id: ObjectId) {
-        // First pass: mark the ID as updated in each MaterializeNode and collect node IDs
-        let materialize_node_ids: Vec<NodeId> = self
+    /// With precise dirtiness enabled, array subquery nodes forward the mark
+    /// into their cached subgraph instances so include-inner materializers
+    /// re-load content for rows they already hold (the staleness fix — FINDING
+    /// manifestation 1 in `manager_tests/subscription_output_oracle.rs`).
+    ///
+    /// Only nodes that actually TRACK one of the ids are dirtied — a mark for
+    /// an id nobody holds cannot produce a delta, and dirtying regardless
+    /// would make every uncorrelated write re-settle every include instance
+    /// (an O(instances x result) allocation churn per write, measured by
+    /// `tests/subquery_compile_allocations.rs`). Returns whether any node was
+    /// marked, so nested forwarding propagates trackedness upward.
+    pub fn mark_row_updated(&mut self, id: ObjectId) -> bool {
+        // First pass: mark the ID as updated in each MaterializeNode and
+        // each ArraySubqueryNode's instances, collecting node IDs.
+        let marked_node_ids: Vec<NodeId> = self
             .nodes
             .iter_mut()
             .enumerate()
-            .filter_map(|(idx, compact)| {
-                if let GraphNode::Materialize(mat_node) = &mut compact.node {
-                    mat_node.mark_updated(id);
-                    Some(NodeId(idx as u64))
-                } else {
-                    None
+            .filter_map(|(idx, compact)| match &mut compact.node {
+                GraphNode::Materialize(mat_node) => {
+                    mat_node.mark_updated(id).then_some(NodeId(idx as u64))
                 }
+                GraphNode::ArraySubquery(subquery_node) => subquery_node
+                    .forward_row_updated(id)
+                    .then_some(NodeId(idx as u64)),
+                _ => None,
             })
             .collect();
 
         // Second pass: mark dirty and propagate downstream
-        for node_id in materialize_node_ids {
+        let any_marked = !marked_node_ids.is_empty();
+        for node_id in marked_node_ids {
             self.mark_dirty(node_id);
             self.mark_downstream_dirty(node_id);
         }
+        any_marked
     }
 
     /// Mark multiple row IDs as updated, dirtying each materializer once.
-    pub fn mark_rows_updated(&mut self, ids: &AHashSet<ObjectId>) {
+    /// See [`Self::mark_row_updated`] for the array-subquery forwarding and
+    /// the tracked-only dirtying rule.
+    pub fn mark_rows_updated(&mut self, ids: &AHashSet<ObjectId>) -> bool {
         if ids.is_empty() {
-            return;
+            return false;
         }
 
-        let materialize_node_ids: Vec<NodeId> = self
+        let marked_node_ids: Vec<NodeId> = self
             .nodes
             .iter_mut()
             .enumerate()
-            .filter_map(|(idx, compact)| {
-                if let GraphNode::Materialize(mat_node) = &mut compact.node {
+            .filter_map(|(idx, compact)| match &mut compact.node {
+                GraphNode::Materialize(mat_node) => {
+                    let mut tracked = false;
                     for id in ids {
-                        mat_node.mark_updated(*id);
+                        tracked |= mat_node.mark_updated(*id);
                     }
-                    Some(NodeId(idx as u64))
-                } else {
-                    None
+                    tracked.then_some(NodeId(idx as u64))
                 }
+                GraphNode::ArraySubquery(subquery_node) => subquery_node
+                    .forward_rows_updated(ids)
+                    .then_some(NodeId(idx as u64)),
+                _ => None,
             })
             .collect();
 
-        for node_id in materialize_node_ids {
+        let any_marked = !marked_node_ids.is_empty();
+        for node_id in marked_node_ids {
             self.mark_dirty(node_id);
             self.mark_downstream_dirty(node_id);
         }
+        any_marked
     }
 
     /// Mark a row ID as deleted for removal delta emission.
     /// This tells MaterializeNodes to emit a removal delta for this row.
-    pub fn mark_row_deleted(&mut self, id: ObjectId) {
-        // First pass: mark the ID as deleted in each MaterializeNode and collect node IDs
-        let materialize_node_ids: Vec<NodeId> = self
+    /// With precise dirtiness enabled, array subquery nodes forward the mark
+    /// into their cached subgraph instances (include-inner rows are held by
+    /// the instance materializers, not by this graph's own). Tracked-only
+    /// dirtying as in [`Self::mark_row_updated`].
+    pub fn mark_row_deleted(&mut self, id: ObjectId) -> bool {
+        // First pass: mark the ID as deleted in each MaterializeNode and
+        // each ArraySubqueryNode's instances, collecting node IDs.
+        let marked_node_ids: Vec<NodeId> = self
             .nodes
             .iter_mut()
             .enumerate()
-            .filter_map(|(idx, compact)| {
-                if let GraphNode::Materialize(mat_node) = &mut compact.node {
-                    mat_node.mark_deleted(id);
-                    Some(NodeId(idx as u64))
-                } else {
-                    None
+            .filter_map(|(idx, compact)| match &mut compact.node {
+                GraphNode::Materialize(mat_node) => {
+                    mat_node.mark_deleted(id).then_some(NodeId(idx as u64))
                 }
+                GraphNode::ArraySubquery(subquery_node) => subquery_node
+                    .forward_row_deleted(id)
+                    .then_some(NodeId(idx as u64)),
+                _ => None,
             })
             .collect();
 
         // Second pass: mark dirty and propagate downstream
-        for node_id in materialize_node_ids {
+        let any_marked = !marked_node_ids.is_empty();
+        for node_id in marked_node_ids {
             self.mark_dirty(node_id);
             self.mark_downstream_dirty(node_id);
         }
+        any_marked
     }
 
     /// Mark multiple row IDs as deleted, dirtying each materializer once.
-    pub fn mark_rows_deleted(&mut self, ids: &AHashSet<ObjectId>) {
+    /// See [`Self::mark_row_deleted`] for the array-subquery forwarding.
+    pub fn mark_rows_deleted(&mut self, ids: &AHashSet<ObjectId>) -> bool {
         if ids.is_empty() {
-            return;
+            return false;
         }
 
-        let materialize_node_ids: Vec<NodeId> = self
+        let marked_node_ids: Vec<NodeId> = self
             .nodes
             .iter_mut()
             .enumerate()
-            .filter_map(|(idx, compact)| {
-                if let GraphNode::Materialize(mat_node) = &mut compact.node {
+            .filter_map(|(idx, compact)| match &mut compact.node {
+                GraphNode::Materialize(mat_node) => {
+                    let mut tracked = false;
                     for id in ids {
-                        mat_node.mark_deleted(*id);
+                        tracked |= mat_node.mark_deleted(*id);
                     }
-                    Some(NodeId(idx as u64))
-                } else {
-                    None
+                    tracked.then_some(NodeId(idx as u64))
                 }
+                GraphNode::ArraySubquery(subquery_node) => subquery_node
+                    .forward_rows_deleted(ids)
+                    .then_some(NodeId(idx as u64)),
+                _ => None,
             })
             .collect();
 
-        for node_id in materialize_node_ids {
+        let any_marked = !marked_node_ids.is_empty();
+        for node_id in marked_node_ids {
             self.mark_dirty(node_id);
             self.mark_downstream_dirty(node_id);
         }
+        any_marked
     }
 
     /// Mark all nodes that depend on the given node as dirty (propagate forward).
@@ -838,23 +901,30 @@ impl QueryGraph {
                     if let Some(GraphNode::ArraySubquery(subquery_node)) =
                         self.get_node_mut(node_id)
                     {
-                        // Check if inner table changed - need to reevaluate all existing instances
-                        let mut delta = if subquery_node.is_inner_dirty() {
-                            subquery_node
-                                .reevaluate_all(storage, &mut |id, hint| row_loader(id, hint))
-                        } else {
-                            TupleDelta::new()
-                        };
-
-                        // Process outer input changes
-                        let outer_delta = subquery_node.process_with_context(
+                        // Outer input FIRST, inner re-evaluation second. The
+                        // reverse order rebuilt instances from a stale
+                        // outer-tuple snapshot when one settle carried both an
+                        // outer-row update and an inner change: the outer
+                        // path's retraction then missed `current_tuples` and
+                        // the same parent was served twice (FINDING
+                        // manifestation 3 in
+                        // `manager_tests/subscription_output_oracle.rs`).
+                        // Processing the outer delta first keeps instance
+                        // state in step with the input stream; re-evaluation
+                        // then works from current outer tuples and emits a
+                        // cleanly chained update.
+                        let mut delta = subquery_node.process_with_context(
                             input_delta,
                             storage,
                             &mut |id, hint| row_loader(id, hint),
                         );
 
-                        // Merge outer delta into combined delta
-                        delta.merge(outer_delta);
+                        // Re-evaluate existing instances if inner data changed
+                        if subquery_node.is_inner_dirty() {
+                            let reevaluated = subquery_node
+                                .reevaluate_all(storage, &mut |id, hint| row_loader(id, hint));
+                            delta.merge(reevaluated);
+                        }
                         tracing::debug!(
                             node_id = node_id.0,
                             node_type,
