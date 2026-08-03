@@ -130,7 +130,21 @@ impl QueryManager {
         )
         .map(|(_, row)| row.row_provenance())
         .or_else(|| {
+            // The visible-entry point read is the primary provenance source;
+            // this full-history scan should fire only for legacy rows that
+            // predate visible entries (healed lazily by the backfill in
+            // `load_previous_visible_entry` on their next write). Tripwire
+            // counter + log so a hot regression cannot hide (design rule:
+            // serving a query must not walk row history).
+            crate::row_histories::QUERY_PROVENANCE_HISTORY_SCANS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let table = storage.load_row_locator(object_id).ok().flatten()?.table;
+            tracing::debug!(
+                %object_id,
+                %branch_name,
+                table = %table,
+                "provenance lookup missed the visible entry; scanning row history"
+            );
             storage
                 .scan_history_row_batches(table.as_str(), object_id)
                 .ok()?

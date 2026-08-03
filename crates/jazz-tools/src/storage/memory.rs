@@ -930,6 +930,10 @@ impl Storage for MemoryStorage {
             current_row.confirmed_tier = current_tier;
             return Ok(Some(current_row));
         }
+        // Tripwire (history-fastpaths §6): see the counter's doc comment and
+        // the matching increment in the `storage_trait.rs` default impl.
+        crate::row_histories::QUERY_TIER_READ_HISTORY_SCANS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let context = resolve_history_row_write_context(self, table, &entry.current_row)?;
         let mut history_rows = regions.history_rows_for(branch, row_id);
         apply_batch_fate_tiers_to_rows(self, &mut history_rows)?;
@@ -3692,6 +3696,197 @@ mod tests {
         assert_eq!(
             decode_row(&user_descriptor, &global_preview.data).unwrap(),
             vec![Value::Text("legacy".into()), Value::Boolean(false)]
+        );
+    }
+
+    /// Divergence fixture for the history-fastpaths design (§6, "Fix C").
+    ///
+    /// The design proposed rewriting `load_visible_region_row_for_tier` to
+    /// resolve tier-gated reads through the `VisibleRowEntry` sidecar
+    /// (`batch_id_for_tier` / `materialize_preview_for_tier_with_storage`)
+    /// instead of scanning history. This test constructs BOTH answers over the
+    /// production-shaped direct-write chain and pins the fact that they
+    /// systematically DISAGREE, which blocks that rewrite:
+    ///
+    /// - the scan-based read overlays authoritative batch fates
+    ///   (`apply_batch_fate_tiers_to_rows`) — the tier system of record;
+    /// - the sidecar's per-tier pointers are computed from STORED
+    ///   `confirmed_tier` values at apply time, and direct-write rows are
+    ///   stored with `confirmed_tier: None` on every path (client publish in
+    ///   `runtime_core/writes.rs`, server inbox `apply_row_updated`, server
+    ///   `DurableDirect` fate application), so the sidecar sees no
+    ///   tier-satisfying row at all.
+    ///
+    /// The second half shows the two sources agree once stored tiers match
+    /// the fates (the `AcceptedTransaction` re-apply shape) — isolating the
+    /// divergence to the batch-fate overlay. If this test ever fails because
+    /// the sidecar became fate-aware, the Fix C tier-read rewrite is back on
+    /// the table.
+    #[test]
+    fn tier_read_batch_fate_overlay_diverges_from_visible_entry_sidecar() {
+        use crate::query_manager::types::{SchemaBuilder, TableSchema, Value};
+        use crate::row_histories::{RowState, VisibleRowEntry};
+
+        let mut storage = MemoryStorage::new();
+        let schema = SchemaBuilder::new()
+            .table(
+                TableSchema::builder("tasks")
+                    .column("title", ColumnType::Text)
+                    .column("done", ColumnType::Boolean),
+            )
+            .build();
+        let user_descriptor = schema[&"tasks".into()].columns.clone();
+        let schema_hash = persist_test_schema(&mut storage, &schema);
+        let row_id = ObjectId::new();
+        storage
+            .put_row_locator(
+                row_id,
+                Some(&RowLocator {
+                    table: "tasks".into(),
+                    origin_schema_hash: Some(schema_hash),
+                }),
+            )
+            .unwrap();
+
+        // Serial direct-write chain a → b → c, stored exactly as production
+        // stores direct rows: `confirmed_tier: None` everywhere.
+        let make_row = |parents: Vec<crate::row_histories::BatchId>,
+                        title: &str,
+                        done: bool,
+                        updated_at: u64,
+                        confirmed_tier: Option<DurabilityTier>| {
+            StoredRowBatch::new(
+                row_id,
+                "main",
+                parents,
+                encode_row(
+                    &user_descriptor,
+                    &[Value::Text(title.into()), Value::Boolean(done)],
+                )
+                .unwrap(),
+                if updated_at == 10 {
+                    RowProvenance::for_insert("alice".to_string(), updated_at)
+                } else {
+                    RowProvenance {
+                        created_by: "alice".to_string(),
+                        created_at: 10,
+                        updated_by: "alice".to_string(),
+                        updated_at,
+                    }
+                },
+                HashMap::new(),
+                RowState::VisibleDirect,
+                confirmed_tier,
+            )
+        };
+        let a = make_row(Vec::new(), "v1", false, 10, None);
+        let b = make_row(vec![a.batch_id()], "v2", true, 20, None);
+        let c = make_row(vec![b.batch_id()], "v3", false, 30, None);
+        let history = [a.clone(), b.clone(), c.clone()];
+        let entry = VisibleRowEntry::rebuild_with_descriptor(&user_descriptor, &history)
+            .unwrap()
+            .expect("visible entry");
+        storage
+            .append_history_region_rows("tasks", &history)
+            .unwrap();
+        storage
+            .upsert_visible_region_rows("tasks", std::slice::from_ref(&entry))
+            .unwrap();
+        // Batch fates — the tier system of record: a and b are globally
+        // durable, the tip c is only edge-confirmed (global ack in flight).
+        for (row, confirmed_tier) in [
+            (&a, DurabilityTier::GlobalServer),
+            (&b, DurabilityTier::GlobalServer),
+            (&c, DurabilityTier::EdgeServer),
+        ] {
+            storage
+                .upsert_authoritative_batch_fate(&BatchFate::DurableDirect {
+                    batch_id: row.batch_id,
+                    confirmed_tier,
+                })
+                .unwrap();
+        }
+
+        // Answer 1 — the production scan-based read: the latest globally
+        // durable version is b.
+        let scan_answer = Storage::load_visible_region_row_for_tier(
+            &storage,
+            "tasks",
+            "main",
+            row_id,
+            DurabilityTier::GlobalServer,
+        )
+        .unwrap()
+        .expect("scan finds the globally durable version");
+        assert_eq!(scan_answer.batch_id(), b.batch_id());
+        assert_eq!(
+            scan_answer.confirmed_tier,
+            Some(DurabilityTier::GlobalServer)
+        );
+
+        // Answer 2 — the sidecar: every per-tier pointer was computed from
+        // stored tiers (all `None`), so it claims NO globally durable version
+        // exists. This is the divergence that blocks the Fix C rewrite.
+        assert_eq!(entry.global_batch_id, None);
+        assert_eq!(entry.batch_id_for_tier(DurabilityTier::GlobalServer), None);
+        // Both stages of the proposed helper diverge: even the current-row
+        // check inside `materialize_preview_for_tier_with_storage` uses the
+        // stored tier, so the edge-tier read (which the fate-aware scan path
+        // serves from the tip) comes back empty as well.
+        assert_eq!(
+            entry
+                .materialize_preview_for_tier_with_storage(
+                    &storage,
+                    "tasks",
+                    &user_descriptor,
+                    DurabilityTier::EdgeServer,
+                )
+                .unwrap(),
+            None
+        );
+        let edge_scan_answer = Storage::load_visible_region_row_for_tier(
+            &storage,
+            "tasks",
+            "main",
+            row_id,
+            DurabilityTier::EdgeServer,
+        )
+        .unwrap()
+        .expect("scan serves the edge tier from the tip's fate");
+        assert_eq!(edge_scan_answer.batch_id(), c.batch_id());
+
+        // Control: with stored tiers stamped to MATCH the fates (the
+        // `AcceptedTransaction` re-apply shape) the sidecar and the scan give
+        // the same answer — the divergence above is exactly the fate overlay.
+        let a2 = make_row(
+            Vec::new(),
+            "v1",
+            false,
+            10,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let b2 = make_row(
+            vec![a2.batch_id()],
+            "v2",
+            true,
+            20,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let c2 = make_row(
+            vec![b2.batch_id()],
+            "v3",
+            false,
+            30,
+            Some(DurabilityTier::EdgeServer),
+        );
+        let stamped_history = [a2.clone(), b2.clone(), c2.clone()];
+        let stamped_entry =
+            VisibleRowEntry::rebuild_with_descriptor(&user_descriptor, &stamped_history)
+                .unwrap()
+                .expect("stamped visible entry");
+        assert_eq!(
+            stamped_entry.batch_id_for_tier(DurabilityTier::GlobalServer),
+            Some(b2.batch_id())
         );
     }
 

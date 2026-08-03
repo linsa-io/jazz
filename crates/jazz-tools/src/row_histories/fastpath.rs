@@ -64,6 +64,31 @@ pub static PATCH_FASTPATH_HITS: AtomicU64 = AtomicU64::new(0);
 /// Patches in the same population that still took the full-history rebuild.
 pub static PATCH_FASTPATH_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
+/// Hot-path scan tripwire: tier-gated query reads
+/// (`load_visible_region_row_for_tier`) that fell into the full
+/// `scan_history_region` because the current row's batch-fate tier does not
+/// satisfy the query's required tier.
+///
+/// Design rule (history-fastpaths §6): serving a query must not walk row
+/// history. This site could not be rewritten onto the `VisibleRowEntry`
+/// sidecar because the sidecar's per-tier pointers are computed from STORED
+/// `confirmed_tier` values while this read overlays authoritative batch
+/// fates — and direct-write rows are stored with `confirmed_tier: None`
+/// everywhere (client publish, server inbox, server fate application), so
+/// the two sources systematically disagree. See the divergence fixture
+/// `tier_read_batch_fate_overlay_diverges_from_visible_entry_sidecar` in
+/// `storage/memory.rs`. Until the sidecar is made fate-aware, this counter
+/// measures how often production tier reads still pay O(history).
+pub static QUERY_TIER_READ_HISTORY_SCANS: AtomicU64 = AtomicU64::new(0);
+
+/// Hot-path scan tripwire: provenance lookups during query serving
+/// (`current_row_provenance`, `query_manager/server_queries.rs`) that missed
+/// the visible-entry point read and fell back to a full
+/// `scan_history_row_batches`. Expected to fire only for legacy rows written
+/// before visible entries existed (the lazy backfill in
+/// `load_previous_visible_entry` heals them on the next write).
+pub static QUERY_PROVENANCE_HISTORY_SCANS: AtomicU64 = AtomicU64::new(0);
+
 /// Kill switch: `JAZZ_HISTORY_FASTPATH=0` (or `false`) forces the full path.
 /// Default is on. The env var is read once; tests use
 /// [`force_history_fastpath`] instead to avoid env races.

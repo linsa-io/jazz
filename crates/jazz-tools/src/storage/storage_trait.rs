@@ -1206,6 +1206,13 @@ pub trait Storage {
             current_row.confirmed_tier = current_tier;
             return Ok(Some(current_row));
         }
+        // Tripwire (history-fastpaths §6): a tier-gated query read is about to
+        // walk the row's full history. The `VisibleRowEntry` sidecar cannot
+        // serve this today because its per-tier pointers are computed from
+        // stored `confirmed_tier` values while this read's tier truth is the
+        // authoritative batch-fate table — see the counter's doc comment.
+        crate::row_histories::QUERY_TIER_READ_HISTORY_SCANS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut history_rows =
             self.scan_history_region(table, branch, HistoryScan::Row { row_id })?;
         apply_batch_fate_tiers_to_rows(self, &mut history_rows)?;

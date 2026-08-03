@@ -34,7 +34,8 @@ pub use codecs::{
 };
 pub use fastpath::{
     HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS, PATCH_FASTPATH_FALLBACKS,
-    PATCH_FASTPATH_HITS, history_fastpath_enabled,
+    PATCH_FASTPATH_HITS, QUERY_PROVENANCE_HISTORY_SCANS, QUERY_TIER_READ_HISTORY_SCANS,
+    history_fastpath_enabled,
 };
 #[cfg(any(test, feature = "test"))]
 pub use fastpath::{HistoryFastpathMode, force_history_fastpath};
@@ -1704,6 +1705,152 @@ mod tests {
                 prev = next;
             }
         }
+    }
+
+    /// Legacy-row backfill regression (history-fastpaths design §6).
+    ///
+    /// Rows written by pre-fork-era code (or raw storage writes) have history
+    /// rows but NO visible-region entry. The frontier-first read paths must
+    /// keep answering correctly for them via their scan fallbacks, and the
+    /// next `apply_row_batch` must lazily backfill the visible entry (the
+    /// `rebuild_visible_entry_from_history` fallback inside
+    /// `load_previous_visible_entry`), after which the O(1) serial fast path
+    /// becomes eligible.
+    #[test]
+    fn legacy_history_without_visible_entry_backfills_on_next_apply() {
+        // Held for the whole test: forces the fast path on AND serialises
+        // access to the global hit counter asserted below.
+        let _mode = force_history_fastpath(true);
+
+        let table = "legacy_docs";
+        let descriptor = user_descriptor();
+        let schema: Schema = [(TableName::new(table), TableSchema::new(descriptor.clone()))]
+            .into_iter()
+            .collect();
+        let mut storage = MemoryStorage::new();
+        let schema_hash = crate::test_support::persist_test_schema(&mut storage, &schema);
+        let branch = BranchName::new("main");
+
+        let a = root_batch(
+            &descriptor,
+            &[Value::Text("v1".into()), Value::Boolean(false)],
+            10,
+            None,
+        );
+        let row_id = a.row_id;
+        storage
+            .put_row_locator(
+                row_id,
+                Some(&RowLocator {
+                    table: table.into(),
+                    origin_schema_hash: Some(schema_hash),
+                }),
+            )
+            .expect("row locator should persist");
+        let b = serial_batch(
+            &a,
+            &descriptor,
+            &[Value::Text("v2".into()), Value::Boolean(true)],
+            20,
+            None,
+        );
+        // History only — deliberately NO visible-region entry.
+        storage
+            .append_history_region_rows(table, &[a.clone(), b.clone()])
+            .expect("append legacy history rows");
+
+        // Point reads see no visible entry (this is exactly the miss that
+        // routes the provenance path onto its scan fallback) …
+        assert_eq!(
+            storage
+                .load_visible_region_entry(table, "main", row_id)
+                .expect("load entry"),
+            None
+        );
+        assert_eq!(
+            storage
+                .load_visible_region_frontier(table, "main", row_id)
+                .expect("load frontier"),
+            None
+        );
+        // … but the scan fallbacks still answer correctly: the tip-ids read
+        // (frontier-first, scan as safety net) and the provenance-shaped
+        // "latest visible non-deleted row" scan both find b.
+        assert_eq!(
+            storage
+                .scan_row_branch_tip_ids(table, "main", row_id)
+                .expect("tip ids"),
+            vec![b.batch_id()]
+        );
+        let provenance_row = storage
+            .scan_history_row_batches(table, row_id)
+            .expect("scan history")
+            .into_iter()
+            .filter(|row| row.state.is_visible() && row.delete_kind.is_none())
+            .max_by_key(|row| (row.updated_at, row.batch_id()))
+            .expect("legacy row has a visible version");
+        assert_eq!(provenance_row.batch_id(), b.batch_id());
+
+        // Next apply: `load_previous_visible_entry` rebuilds the entry from
+        // history and the write persists it — the lazy backfill.
+        let c = serial_batch(
+            &b,
+            &descriptor,
+            &[Value::Text("v3".into()), Value::Boolean(false)],
+            30,
+            None,
+        );
+        apply_row_batch(&mut storage, row_id, &branch, c.clone(), &[])
+            .expect("apply over legacy history");
+
+        let history = storage
+            .scan_history_region(table, "main", HistoryScan::Row { row_id })
+            .expect("scan history after apply");
+        let expected = VisibleRowEntry::rebuild_with_descriptor(&descriptor, &history)
+            .expect("rebuild entry")
+            .expect("visible entry present");
+        let stored = storage
+            .load_visible_region_entry(table, "main", row_id)
+            .expect("load stored entry")
+            .expect("backfilled entry present");
+        assert_eq!(stored, expected, "backfilled entry diverges from rebuild");
+        assert_eq!(
+            storage
+                .load_visible_region_frontier(table, "main", row_id)
+                .expect("load frontier"),
+            Some(vec![c.batch_id()])
+        );
+        assert_eq!(
+            storage
+                .scan_row_branch_tip_ids(table, "main", row_id)
+                .expect("tip ids"),
+            vec![c.batch_id()]
+        );
+
+        // With the entry persisted, the next serial append takes the O(1)
+        // fast path.
+        let hits_before = HISTORY_FASTPATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let d = serial_batch(
+            &c,
+            &descriptor,
+            &[Value::Text("v4".into()), Value::Boolean(true)],
+            40,
+            None,
+        );
+        apply_row_batch(&mut storage, row_id, &branch, d.clone(), &[])
+            .expect("apply post-backfill serial append");
+        let hits_after = HISTORY_FASTPATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            hits_after > hits_before,
+            "post-backfill serial append should take the fast path \
+             (hits before {hits_before}, after {hits_after})"
+        );
+        let stored = storage
+            .load_visible_region_entry(table, "main", row_id)
+            .expect("load stored entry")
+            .expect("entry present after fast-path append");
+        assert_eq!(stored.current_row.batch_id(), d.batch_id());
+        assert_eq!(stored.branch_frontier, vec![d.batch_id()]);
     }
 
     // ─── in-place / patch fast paths ────────────────────────────────────────

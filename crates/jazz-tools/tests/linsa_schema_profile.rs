@@ -425,6 +425,15 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
         jazz_tools::row_histories::PATCH_FASTPATH_FALLBACKS.load(Ordering::Relaxed),
     );
 
+    // Hot-path scan tripwire (history-fastpaths §6): serving the phase C/D
+    // subscription graphs — every row has a visible entry — must not walk row
+    // history, neither through tier-gated reads nor through provenance
+    // fallbacks. Snapshot here, assert zero growth after phase D.
+    let tier_scans_before_subs =
+        jazz_tools::row_histories::QUERY_TIER_READ_HISTORY_SCANS.load(Ordering::Relaxed);
+    let provenance_scans_before_subs =
+        jazz_tools::row_histories::QUERY_PROVENANCE_HISTORY_SCANS.load(Ordering::Relaxed);
+
     // ── device 1: alice's app graph ────────────────────────────────────────
     let alice_client =
         connect_ready_user(&server, &schema, &alice.to_string(), "users", ready).await;
@@ -457,6 +466,24 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
         bob_subs.len(),
         live_mb(),
         live_mb() - before_bob
+    );
+
+    let tier_scans_after_subs =
+        jazz_tools::row_histories::QUERY_TIER_READ_HISTORY_SCANS.load(Ordering::Relaxed);
+    let provenance_scans_after_subs =
+        jazz_tools::row_histories::QUERY_PROVENANCE_HISTORY_SCANS.load(Ordering::Relaxed);
+    eprintln!(
+        "phase C/D query-serving scan tripwires: tier-read {} provenance {}",
+        tier_scans_after_subs - tier_scans_before_subs,
+        provenance_scans_after_subs - provenance_scans_before_subs,
+    );
+    assert_eq!(
+        tier_scans_after_subs, tier_scans_before_subs,
+        "tier-gated query reads walked row history during the subscription phases"
+    );
+    assert_eq!(
+        provenance_scans_after_subs, provenance_scans_before_subs,
+        "provenance lookups walked row history during the subscription phases"
     );
 
     // ── teardown: drop both devices, sweep, must release ───────────────────
