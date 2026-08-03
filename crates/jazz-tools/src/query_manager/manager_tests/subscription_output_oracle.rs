@@ -1,0 +1,1762 @@
+//! Randomized differential oracle for subscription OUTPUT streams (v13-1,
+//! include-plan-sharing design §6.1).
+//!
+//! Two independent `QueryManager` universes replay the SAME seeded mutation
+//! stream (inserts / updates / soft deletes on parent + child + nested-child
+//! tables, `is_deleted` filter flips, correlate-value moves) while serving
+//! include-bearing subscriptions: a 2-deep nested include
+//! (`parents -> children -> grandchildren`), `order_by` + `limit` on the
+//! outer query, and session-scoped SELECT policies ON (schema policies force
+//! `RowPolicyMode::Enforcing`). After EVERY mutation batch the full
+//! observable output — the initial snapshot and every subsequent delta batch
+//! — must be identical between the two engines, and must reconstruct both the
+//! engine's own materialized state and an independent generator-side model.
+//!
+//! Today both sides run the legacy evaluation path, which pins the harness
+//! green and freezes the output contract. When the F1 (shared subquery plans)
+//! and F2 (precise dirtiness) kill-switches land, [`EnginePath`] grows
+//! variants whose guards force each side's mode — the same plug shape as
+//! `force_history_fastpath` in `storage/conformance_differential.rs` — and
+//! the dual-run becomes legacy-vs-fastpath with zero harness changes.
+//!
+//! What is checked per batch, per subscription:
+//! - **A/B equality**: every `QueryUpdate` (RowDelta rows byte-for-byte,
+//!   ordered delta indices, descriptor) matches between the engines;
+//! - **stream completeness**: applying the emitted deltas to a client-side
+//!   mirror reproduces the engine's internal `current_ordered_ids` /
+//!   `current_visible_rows` exactly — a missed delta (F2's under-marking
+//!   class) desynchronizes the mirror and fails here;
+//! - **pre-image fidelity**: `removed`/`updated` rows must carry exactly the
+//!   bytes the client currently holds;
+//! - **model equality**: the decoded (parent, children, grandchildren) id
+//!   tree in mirror order equals the generator-side reference model —
+//!   including per-session policy visibility;
+//! - **initial-snapshot completeness / timeliness** (v13-0 census finding:
+//!   7/16 subs served empty results for minutes on cold open): a cold-open
+//!   subscription must emit its snapshot within ONE `process()` call, the
+//!   snapshot must be non-empty whenever seeded data matches, and it must
+//!   equal the model immediately;
+//! - **bounded convergence**: after a mutation batch the engines are pumped
+//!   in lockstep (every pass compared A-vs-B) and must go quiescent within
+//!   `SETTLE_PASS_BOUND` passes — include arrays legitimately settle one
+//!   pass behind their inner-table writes, but unbounded re-settling is the
+//!   spin failure mode.
+//!
+//! Delta-batch normalization (deliberate, minimal — exactly two legitimate
+//! nondeterminisms are pinned, nothing else is normalized):
+//! 1. the interleaving of updates across DIFFERENT subscriptions inside one
+//!    `process()` outbox (HashMap iteration order in the settle loop) —
+//!    updates are grouped per subscription before comparison;
+//! 2. row batch-id VALUES: every direct write mints its version identity
+//!    from `Uuid::now_v7()` at write time (`BatchId::new`), so two engines
+//!    replaying identical writes hold different 16-byte version tags.
+//!    Cross-engine row comparison is therefore modulo the batch-id value —
+//!    but its CHANGE structure still must match exactly: which rows appear
+//!    in `updated`, in which batches, is driven by batch-id transitions and
+//!    is compared verbatim. (The `WriteContext.batch_id` override cannot pin
+//!    the value: it means "staged transactional write" and flips rows to
+//!    `StagingPending`.)
+//! Everything else — batch boundaries, intra-batch vector order
+//! (deterministic: deltas are diffed against ordered previous state), row
+//! bytes, provenance (timestamps and authors are fixed via `WriteContext`
+//! overrides), descriptors — is compared exactly. Both the outer query and
+//! every include carry an `order_by` on a unique column, so engine output
+//! order is fully specified; harness rows never tie.
+//!
+//! Generator limitations (conscious, documented):
+//! - No hard deletes and no restores: those write paths mint provenance
+//!   timestamps from the wall clock (no `WriteContext` override), which would
+//!   make the two universes byte-diverge for reasons that are not bugs.
+//!   §6.2 fixtures cover them as pinned scenarios instead.
+//! - Single branch, no sync tiers: this oracle targets the local
+//!   subscription settle path; cross-tier delivery is exercised by the e2e
+//!   suites.
+//!
+//! FINDING (v13-1, caught by this oracle's model layer on its first run):
+//! content-only updates to an include's INNER rows never reach subscription
+//! outputs — the include array stays permanently stale, on the local-write
+//! path AND the remote sync-inbox path, through any number of settle passes.
+//! Root cause is exactly the scope cut §9/F2 names: row-precise changed ids
+//! are discarded at `mark_table_dependents_dirty` (`graph/execute.rs` — no
+//! ids parameter), so a reused subquery instance re-runs its correlate scan
+//! (membership refreshes) but its materialize state never re-loads content
+//! for ids it already holds; `process_with_context` likewise reuses the old
+//! array whenever the correlation value is unchanged. Consequences:
+//! - a child edit is invisible in every parent's include until the NEXT
+//!   membership change of that include;
+//! - an `is_deleted` FILTER FLIP is a content update, so rows flip in the
+//!   model but not in the engine — filter transitions are broken, not just
+//!   cosmetic staleness;
+//! - NESTED-include membership is stale too: a grandchild insert/move under
+//!   an unchanged child set never surfaces, because the nested subquery's
+//!   instance caches inside a reused outer instance never re-run their scans
+//!   (`mark_all_dirty` on the outer instance does not reach them — design
+//!   §9's "inner ArraySubqueryNodes own their own caches");
+//! - mixing an OUTER-row update with an inner membership change in ONE
+//!   settle corrupts the output tuple set: `reevaluate_all` runs before the
+//!   outer input delta and rebuilds from a stale outer-tuple snapshot, so
+//!   the outer path's retraction misses `current_tuples` and the same
+//!   parent is served twice (caught here as a double-booked ordered index
+//!   plus a stale `updated` pre-image).
+//! The green default therefore runs [`OpProfile::MembershipSafe`]: filter
+//! flips and nested-membership mutations excluded, and each mutation batch
+//! class-homogeneous (all-outer or all-inner). The FULL §6.2 op matrix runs
+//! as an `#[ignore]`d expected-red test plus a minimal pinned fixture, both
+//! of which F2's row-precise dirtiness must turn green and un-ignore.
+
+use std::collections::HashMap;
+
+use uuid::Uuid;
+
+use super::*;
+use crate::query_manager::graph_nodes::output::QuerySubscriptionId;
+use crate::query_manager::manager::QueryUpdate;
+use crate::query_manager::session::WriteContext;
+use crate::query_manager::types::{OrderedRowDelta, Row};
+
+const PARENT_TABLE: &str = "parents";
+const CHILD_TABLE: &str = "children";
+const GRANDCHILD_TABLE: &str = "grandchildren";
+
+const OWNERS: [&str; 2] = ["alice", "bob"];
+const AUTHORS: [&str; 2] = ["writer-a", "writer-b"];
+
+const PARENT_LIMIT: usize = 5;
+const MUTATION_BATCHES: usize = 48;
+const MAX_OPS_PER_BATCH: usize = 3;
+
+const MAX_PARENTS: usize = 14;
+const MAX_CHILDREN: usize = 36;
+const MAX_GRANDCHILDREN: usize = 28;
+
+/// A cold-open subscription must serve its first (complete) snapshot within
+/// this many `process()` calls. The v13-0 census run broke exactly this:
+/// subscriptions sat on empty results for minutes.
+const SETTLE_PROCESS_BOUND: usize = 1;
+
+/// After a mutation batch, both engines must emit all resulting deltas and
+/// go quiescent within this many settle passes. One `process()` can leave an
+/// include array a pass behind its inner-table write (the inner delta
+/// re-dirties the outer graph), so convergence is multi-pass but must stay
+/// tightly bounded — unbounded passes are the settle-spin failure mode.
+const SETTLE_PASS_BOUND: usize = 4;
+
+const SEEDS: [u64; 6] = [
+    0x5AB5_C21B_0000_0001,
+    0x5AB5_C21B_0000_0002,
+    0x5AB5_C21B_0000_0003,
+    0x5AB5_C21B_0000_0004,
+    0x0D1F_F5AB_0000_0005,
+    0x0D1F_F5AB_0000_0006,
+];
+
+// ============================================================================
+// Engine-path plug point for the F1/F2 kill-switch dual-runs.
+// ============================================================================
+
+/// Which evaluation path a differential side runs.
+///
+/// Today only `Legacy` exists and `engage()` is a no-op guard. When F1/F2
+/// land with test overrides (mirroring `force_history_fastpath`), this enum
+/// gains e.g. `SharedPlans` / `PreciseDirty` variants whose guards hold the
+/// corresponding kill-switch for the side's lifetime, and `run_oracle` is
+/// called with `(EnginePath::Legacy, EnginePath::SharedPlans)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnginePath {
+    Legacy,
+}
+
+struct EnginePathGuard;
+
+impl EnginePath {
+    fn engage(self) -> EnginePathGuard {
+        match self {
+            EnginePath::Legacy => EnginePathGuard,
+        }
+    }
+}
+
+/// Which mutation classes the generator draws from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpProfile {
+    /// Everything except `is_deleted` filter flips and nested-include
+    /// membership mutations — the op classes whose ID-tree effect the
+    /// pre-existing include-staleness bug swallows (see the FINDING in the
+    /// module docs). Green today; the regression floor.
+    MembershipSafe,
+    /// The full §6.2 op matrix including filter flips and grandchild
+    /// inserts/moves. EXPECTED RED until F2 threads row-precise changed ids
+    /// into include instances (nested ones included).
+    FullIncludingFilterFlips,
+}
+
+// ============================================================================
+// Deterministic randomness (same shape as storage/conformance_differential).
+// ============================================================================
+
+/// xorshift64* — deterministic, dependency-free.
+struct Prng(u64);
+
+impl Prng {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next_u64() % bound as u64) as usize
+    }
+
+    fn chance(&mut self, numerator: usize, denominator: usize) -> bool {
+        self.below(denominator) < numerator
+    }
+}
+
+/// Deterministic id mint: both engines see identical row and batch ids.
+struct IdMint {
+    seed: u64,
+    counter: u64,
+}
+
+impl IdMint {
+    fn next_uuid(&mut self) -> Uuid {
+        self.counter += 1;
+        Uuid::from_u128((u128::from(self.seed) << 64) | u128::from(self.counter))
+    }
+
+    fn next_object_id(&mut self) -> ObjectId {
+        ObjectId::from_uuid(self.next_uuid())
+    }
+}
+
+// ============================================================================
+// Schema and subscriptions.
+// ============================================================================
+
+fn owner_scoped_policies() -> TablePolicies {
+    TablePolicies::new()
+        .with_select(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]))
+        .with_insert(PolicyExpr::True)
+        .with_update(None, PolicyExpr::True)
+        .with_delete(PolicyExpr::True)
+}
+
+fn oracle_schema() -> Schema {
+    let mut schema = Schema::new();
+    schema.insert(
+        TableName::new(PARENT_TABLE),
+        TableSchema::with_policies(
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("title", ColumnType::Text),
+                ColumnDescriptor::new("ord", ColumnType::Integer),
+                ColumnDescriptor::new("owner_id", ColumnType::Text),
+            ]),
+            owner_scoped_policies(),
+        ),
+    );
+    schema.insert(
+        TableName::new(CHILD_TABLE),
+        TableSchema::with_policies(
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("title", ColumnType::Text),
+                ColumnDescriptor::new("ord", ColumnType::Integer),
+                ColumnDescriptor::new("owner_id", ColumnType::Text),
+                ColumnDescriptor::new("is_deleted", ColumnType::Boolean),
+                ColumnDescriptor::new("parent_id", ColumnType::Uuid),
+            ]),
+            owner_scoped_policies(),
+        ),
+    );
+    schema.insert(
+        TableName::new(GRANDCHILD_TABLE),
+        TableSchema::with_policies(
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("title", ColumnType::Text),
+                ColumnDescriptor::new("ord", ColumnType::Integer),
+                ColumnDescriptor::new("owner_id", ColumnType::Text),
+                ColumnDescriptor::new("child_id", ColumnType::Uuid),
+            ]),
+            owner_scoped_policies(),
+        ),
+    );
+    schema
+}
+
+/// Column index of the `children` include array in the combined parent
+/// descriptor (base columns first, include columns appended).
+const PARENT_INCLUDE_COLUMN: usize = 3;
+/// Column index of the `grandchildren` include array inside a child row.
+const CHILD_INCLUDE_COLUMN: usize = 5;
+
+#[derive(Clone, Copy, Debug)]
+struct SubSpec {
+    user: &'static str,
+    descending: bool,
+    limit: Option<usize>,
+}
+
+fn sub_specs() -> Vec<SubSpec> {
+    vec![
+        // The census shape: newest-first window with the nested include.
+        SubSpec {
+            user: "alice",
+            descending: true,
+            limit: Some(PARENT_LIMIT),
+        },
+        // Same include SHAPE, different session — the F1 plan-key leak class.
+        SubSpec {
+            user: "bob",
+            descending: true,
+            limit: Some(PARENT_LIMIT),
+        },
+        // Unwindowed ascending variant.
+        SubSpec {
+            user: "alice",
+            descending: false,
+            limit: None,
+        },
+    ]
+}
+
+// ============================================================================
+// Generator-side reference model.
+// ============================================================================
+
+#[derive(Clone, Debug)]
+struct ParentModel {
+    owner: &'static str,
+    ord: i32,
+    title: String,
+    deleted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ChildModel {
+    owner: &'static str,
+    ord: i32,
+    title: String,
+    flag_deleted: bool,
+    parent: ObjectId,
+    deleted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct GrandchildModel {
+    owner: &'static str,
+    ord: i32,
+    title: String,
+    child: ObjectId,
+    deleted: bool,
+}
+
+#[derive(Default)]
+struct Model {
+    parents: Vec<(ObjectId, ParentModel)>,
+    children: Vec<(ObjectId, ChildModel)>,
+    grandchildren: Vec<(ObjectId, GrandchildModel)>,
+}
+
+/// (parent, [(child, [grandchild])]) in exact expected output order.
+type ExpectedTree = Vec<(ObjectId, Vec<(ObjectId, Vec<ObjectId>)>)>;
+
+impl Model {
+    fn live_parents(&self) -> Vec<usize> {
+        (0..self.parents.len())
+            .filter(|index| !self.parents[*index].1.deleted)
+            .collect()
+    }
+
+    fn live_children(&self) -> Vec<usize> {
+        (0..self.children.len())
+            .filter(|index| !self.children[*index].1.deleted)
+            .collect()
+    }
+
+    fn live_grandchildren(&self) -> Vec<usize> {
+        (0..self.grandchildren.len())
+            .filter(|index| !self.grandchildren[*index].1.deleted)
+            .collect()
+    }
+
+    fn expected_tree(&self, spec: &SubSpec) -> ExpectedTree {
+        let mut parents: Vec<(ObjectId, &ParentModel)> = self
+            .parents
+            .iter()
+            .filter(|(_, parent)| !parent.deleted && parent.owner == spec.user)
+            .map(|(id, parent)| (*id, parent))
+            .collect();
+        parents.sort_by_key(|(_, parent)| parent.ord);
+        if spec.descending {
+            parents.reverse();
+        }
+        if let Some(limit) = spec.limit {
+            parents.truncate(limit);
+        }
+
+        parents
+            .into_iter()
+            .map(|(parent_id, _)| {
+                let mut children: Vec<(ObjectId, &ChildModel)> = self
+                    .children
+                    .iter()
+                    .filter(|(_, child)| {
+                        !child.deleted
+                            && !child.flag_deleted
+                            && child.parent == parent_id
+                            && child.owner == spec.user
+                    })
+                    .map(|(id, child)| (*id, child))
+                    .collect();
+                children.sort_by_key(|(_, child)| child.ord);
+                let children = children
+                    .into_iter()
+                    .map(|(child_id, _)| {
+                        let mut grandchildren: Vec<(ObjectId, &GrandchildModel)> = self
+                            .grandchildren
+                            .iter()
+                            .filter(|(_, grandchild)| {
+                                !grandchild.deleted
+                                    && grandchild.child == child_id
+                                    && grandchild.owner == spec.user
+                            })
+                            .map(|(id, grandchild)| (*id, grandchild))
+                            .collect();
+                        grandchildren.sort_by_key(|(_, grandchild)| grandchild.ord);
+                        (
+                            child_id,
+                            grandchildren.into_iter().map(|(id, _)| id).collect(),
+                        )
+                    })
+                    .collect();
+                (parent_id, children)
+            })
+            .collect()
+    }
+}
+
+fn parent_values(parent: &ParentModel) -> Vec<Value> {
+    vec![
+        Value::Text(parent.title.clone()),
+        Value::Integer(parent.ord),
+        Value::Text(parent.owner.to_string()),
+    ]
+}
+
+fn child_values(child: &ChildModel) -> Vec<Value> {
+    vec![
+        Value::Text(child.title.clone()),
+        Value::Integer(child.ord),
+        Value::Text(child.owner.to_string()),
+        Value::Boolean(child.flag_deleted),
+        Value::Uuid(child.parent),
+    ]
+}
+
+fn grandchild_values(grandchild: &GrandchildModel) -> Vec<Value> {
+    vec![
+        Value::Text(grandchild.title.clone()),
+        Value::Integer(grandchild.ord),
+        Value::Text(grandchild.owner.to_string()),
+        Value::Uuid(grandchild.child),
+    ]
+}
+
+// ============================================================================
+// Mutation stream.
+// ============================================================================
+
+/// One deterministic write, fully stamped: both engines replay it with
+/// identical row id, provenance author, and timestamp (`WriteContext`
+/// overrides), so their storage states match modulo engine-minted batch ids
+/// (see the module docs on normalization).
+struct StampedOp {
+    kind: StampedOpKind,
+    label: &'static str,
+    ts: u64,
+    author: &'static str,
+}
+
+enum StampedOpKind {
+    Insert {
+        table: &'static str,
+        id: ObjectId,
+        values: Vec<Value>,
+    },
+    Update {
+        id: ObjectId,
+        values: Vec<Value>,
+    },
+    SoftDelete {
+        id: ObjectId,
+    },
+}
+
+struct OpGenerator {
+    prng: Prng,
+    mint: IdMint,
+    next_ts: u64,
+    next_ord: i32,
+    op_serial: u64,
+    profile: OpProfile,
+}
+
+impl OpGenerator {
+    fn new(seed: u64, profile: OpProfile) -> Self {
+        Self {
+            prng: Prng::new(seed),
+            mint: IdMint { seed, counter: 0 },
+            next_ts: 1_000_000,
+            next_ord: 100,
+            op_serial: 0,
+            profile,
+        }
+    }
+
+    fn stamp(&mut self, kind: StampedOpKind, label: &'static str) -> StampedOp {
+        self.next_ts += 10;
+        self.op_serial += 1;
+        StampedOp {
+            kind,
+            label,
+            ts: self.next_ts,
+            author: AUTHORS[(self.op_serial % 2) as usize],
+        }
+    }
+
+    fn next_ord(&mut self) -> i32 {
+        self.next_ord += 1;
+        self.next_ord
+    }
+
+    fn owner(&mut self) -> &'static str {
+        OWNERS[self.prng.below(OWNERS.len())]
+    }
+
+    fn insert_parent(&mut self, model: &mut Model, owner: &'static str) -> StampedOp {
+        let id = self.mint.next_object_id();
+        let parent = ParentModel {
+            owner,
+            ord: self.next_ord(),
+            title: format!("p{}", self.op_serial),
+            deleted: false,
+        };
+        let values = parent_values(&parent);
+        model.parents.push((id, parent));
+        self.stamp(
+            StampedOpKind::Insert {
+                table: PARENT_TABLE,
+                id,
+                values,
+            },
+            "insert-parent",
+        )
+    }
+
+    fn insert_child(&mut self, model: &mut Model, forced_parent: Option<ObjectId>) -> StampedOp {
+        let id = self.mint.next_object_id();
+        let parent = forced_parent.unwrap_or_else(|| {
+            // 1-in-6 dangling correlate value: a UUID no parent row carries.
+            if model.parents.is_empty() || self.prng.chance(1, 6) {
+                self.mint.next_object_id()
+            } else {
+                model.parents[self.prng.below(model.parents.len())].0
+            }
+        });
+        let owner = if self.prng.chance(4, 5) {
+            model
+                .parents
+                .iter()
+                .find(|(parent_id, _)| *parent_id == parent)
+                .map(|(_, parent)| parent.owner)
+                .unwrap_or_else(|| OWNERS[self.prng.below(OWNERS.len())])
+        } else {
+            // Cross-owner child: parent visible, child policy-hidden.
+            self.owner()
+        };
+        let child = ChildModel {
+            owner,
+            ord: self.next_ord(),
+            title: format!("c{}", self.op_serial),
+            flag_deleted: false,
+            parent,
+            deleted: false,
+        };
+        let values = child_values(&child);
+        model.children.push((id, child));
+        self.stamp(
+            StampedOpKind::Insert {
+                table: CHILD_TABLE,
+                id,
+                values,
+            },
+            "insert-child",
+        )
+    }
+
+    fn insert_grandchild(
+        &mut self,
+        model: &mut Model,
+        forced_child: Option<ObjectId>,
+    ) -> StampedOp {
+        let id = self.mint.next_object_id();
+        let child = forced_child.unwrap_or_else(|| {
+            if model.children.is_empty() || self.prng.chance(1, 6) {
+                self.mint.next_object_id()
+            } else {
+                model.children[self.prng.below(model.children.len())].0
+            }
+        });
+        let owner = if self.prng.chance(4, 5) {
+            model
+                .children
+                .iter()
+                .find(|(child_id, _)| *child_id == child)
+                .map(|(_, child)| child.owner)
+                .unwrap_or_else(|| OWNERS[self.prng.below(OWNERS.len())])
+        } else {
+            self.owner()
+        };
+        let grandchild = GrandchildModel {
+            owner,
+            ord: self.next_ord(),
+            title: format!("g{}", self.op_serial),
+            child,
+            deleted: false,
+        };
+        let values = grandchild_values(&grandchild);
+        model.grandchildren.push((id, grandchild));
+        self.stamp(
+            StampedOpKind::Insert {
+                table: GRANDCHILD_TABLE,
+                id,
+                values,
+            },
+            "insert-grandchild",
+        )
+    }
+
+    /// One mutation batch (1..=`MAX_OPS_PER_BATCH` ops).
+    ///
+    /// `MembershipSafe` batches are CLASS-HOMOGENEOUS — all-outer (parents
+    /// table) or all-inner (children table) — because mixing the classes in
+    /// one settle corrupts the engine's output tuple set today (FINDING,
+    /// third manifestation): the settle runs `reevaluate_all` BEFORE the
+    /// outer input delta, rebuilding an instance's output from its stale
+    /// outer-tuple snapshot; the outer-update path then retracts a tuple
+    /// that is no longer in `current_tuples`, the removal misses, and the
+    /// same parent is served twice with divergent contents (observed as a
+    /// double-booked ordered index plus a stale `updated` pre-image).
+    fn batch_ops(&mut self, model: &mut Model) -> Vec<StampedOp> {
+        let count = 1 + self.prng.below(MAX_OPS_PER_BATCH);
+        match self.profile {
+            OpProfile::FullIncludingFilterFlips => {
+                (0..count).map(|_| self.mutation(model)).collect()
+            }
+            OpProfile::MembershipSafe => {
+                if self.prng.chance(2, 5) {
+                    (0..count).map(|_| self.outer_mutation(model)).collect()
+                } else {
+                    (0..count).map(|_| self.inner_mutation(model)).collect()
+                }
+            }
+        }
+    }
+
+    /// One parents-table mutation (fallbacks stay within the outer class).
+    fn outer_mutation(&mut self, model: &mut Model) -> StampedOp {
+        let roll = self.prng.below(100);
+        let live_parents = model.live_parents();
+        match roll {
+            0..25 => {
+                if model.parents.len() < MAX_PARENTS {
+                    let owner = self.owner();
+                    self.insert_parent(model, owner)
+                } else {
+                    self.move_parent_ord(model, &live_parents)
+                }
+            }
+            25..50 => self.update_parent_title(model, &live_parents),
+            50..85 => self.move_parent_ord(model, &live_parents),
+            _ => self.soft_delete_parent(model, &live_parents),
+        }
+    }
+
+    /// One children-table mutation (fallbacks stay within the inner class).
+    fn inner_mutation(&mut self, model: &mut Model) -> StampedOp {
+        let roll = self.prng.below(100);
+        let live_children = model.live_children();
+        match roll {
+            0..30 => {
+                if model.children.len() < MAX_CHILDREN {
+                    self.insert_child(model, None)
+                } else {
+                    self.move_child_parent(model, &live_children)
+                }
+            }
+            30..45 => self.update_child_title(model, &live_children),
+            45..80 => self.move_child_parent(model, &live_children),
+            _ => self.soft_delete_child(model, &live_children),
+        }
+    }
+
+    /// One random mutation from the full matrix; falls back to inserts when
+    /// a target pool is empty or capped, so an op is always produced.
+    fn mutation(&mut self, model: &mut Model) -> StampedOp {
+        let roll = self.prng.below(100);
+        let live_parents = model.live_parents();
+        let live_children = model.live_children();
+        let live_grandchildren = model.live_grandchildren();
+        match roll {
+            // insert parent
+            0..8 => {
+                if model.parents.len() < MAX_PARENTS {
+                    let owner = self.owner();
+                    self.insert_parent(model, owner)
+                } else {
+                    self.move_parent_ord(model, &live_parents)
+                }
+            }
+            // insert child
+            8..20 => {
+                if model.children.len() < MAX_CHILDREN {
+                    self.insert_child(model, None)
+                } else {
+                    self.move_child_parent(model, &live_children)
+                }
+            }
+            // insert grandchild (FullIncludingFilterFlips only: nested-include
+            // membership changes under an unchanged child set are swallowed by
+            // the same staleness bug — the nested subquery's instance caches
+            // inside a reused outer instance never re-run their scans)
+            20..28 => match self.profile {
+                OpProfile::FullIncludingFilterFlips
+                    if model.grandchildren.len() < MAX_GRANDCHILDREN =>
+                {
+                    self.insert_grandchild(model, None)
+                }
+                OpProfile::FullIncludingFilterFlips => {
+                    self.move_grandchild(model, &live_grandchildren)
+                }
+                OpProfile::MembershipSafe => self.insert_child(model, None),
+            },
+            // parent content update
+            28..36 => self.update_parent_title(model, &live_parents),
+            // parent order move (window churn under order_by + limit)
+            36..48 => self.move_parent_ord(model, &live_parents),
+            // child content update
+            48..54 => self.update_child_title(model, &live_children),
+            // include-filter flip (FullIncludingFilterFlips only: the flip's
+            // membership effect is swallowed by the include-staleness bug —
+            // see the FINDING in the module docs)
+            54..66 => match self.profile {
+                OpProfile::FullIncludingFilterFlips => self.flip_child_flag(model, &live_children),
+                OpProfile::MembershipSafe => self.move_child_parent(model, &live_children),
+            },
+            // correlate-value move: child re-homed to another parent
+            66..78 => self.move_child_parent(model, &live_children),
+            // correlate-value move on the nested include (Full only — see the
+            // grandchild-insert arm above)
+            78..85 => match self.profile {
+                OpProfile::FullIncludingFilterFlips => {
+                    self.move_grandchild(model, &live_grandchildren)
+                }
+                OpProfile::MembershipSafe => self.move_child_parent(model, &live_children),
+            },
+            // soft deletes
+            85..91 => self.soft_delete_parent(model, &live_parents),
+            _ => self.soft_delete_child(model, &live_children),
+        }
+    }
+
+    fn update_parent_title(&mut self, model: &mut Model, live: &[usize]) -> StampedOp {
+        if live.is_empty() {
+            let owner = self.owner();
+            return self.insert_parent(model, owner);
+        }
+        let index = live[self.prng.below(live.len())];
+        let (id, parent) = &mut model.parents[index];
+        parent.title = format!("p{}", self.op_serial + 1);
+        let (id, values) = (*id, parent_values(parent));
+        self.stamp(StampedOpKind::Update { id, values }, "update-parent-title")
+    }
+
+    fn move_parent_ord(&mut self, model: &mut Model, live: &[usize]) -> StampedOp {
+        if live.is_empty() {
+            let owner = self.owner();
+            return self.insert_parent(model, owner);
+        }
+        let index = live[self.prng.below(live.len())];
+        let ord = self.next_ord();
+        let (id, parent) = &mut model.parents[index];
+        parent.ord = ord;
+        let (id, values) = (*id, parent_values(parent));
+        self.stamp(StampedOpKind::Update { id, values }, "move-parent-ord")
+    }
+
+    fn update_child_title(&mut self, model: &mut Model, live: &[usize]) -> StampedOp {
+        if live.is_empty() {
+            return self.insert_child(model, None);
+        }
+        let index = live[self.prng.below(live.len())];
+        let (id, child) = &mut model.children[index];
+        child.title = format!("c{}", self.op_serial + 1);
+        let (id, values) = (*id, child_values(child));
+        self.stamp(StampedOpKind::Update { id, values }, "update-child-title")
+    }
+
+    fn flip_child_flag(&mut self, model: &mut Model, live: &[usize]) -> StampedOp {
+        if live.is_empty() {
+            return self.insert_child(model, None);
+        }
+        let index = live[self.prng.below(live.len())];
+        let (id, child) = &mut model.children[index];
+        child.flag_deleted = !child.flag_deleted;
+        let (id, values) = (*id, child_values(child));
+        self.stamp(
+            StampedOpKind::Update { id, values },
+            "flip-child-is-deleted",
+        )
+    }
+
+    fn move_child_parent(&mut self, model: &mut Model, live: &[usize]) -> StampedOp {
+        if live.is_empty() || model.parents.is_empty() {
+            return self.insert_child(model, None);
+        }
+        let index = live[self.prng.below(live.len())];
+        let parent = if self.prng.chance(1, 8) {
+            self.mint.next_object_id()
+        } else {
+            model.parents[self.prng.below(model.parents.len())].0
+        };
+        let (id, child) = &mut model.children[index];
+        child.parent = parent;
+        let (id, values) = (*id, child_values(child));
+        self.stamp(StampedOpKind::Update { id, values }, "move-child-parent")
+    }
+
+    fn move_grandchild(&mut self, model: &mut Model, live: &[usize]) -> StampedOp {
+        if live.is_empty() || model.children.is_empty() {
+            return self.insert_grandchild(model, None);
+        }
+        let index = live[self.prng.below(live.len())];
+        let child = if self.prng.chance(1, 8) {
+            self.mint.next_object_id()
+        } else {
+            model.children[self.prng.below(model.children.len())].0
+        };
+        let (id, grandchild) = &mut model.grandchildren[index];
+        grandchild.child = child;
+        let (id, values) = (*id, grandchild_values(grandchild));
+        self.stamp(
+            StampedOpKind::Update { id, values },
+            "move-grandchild-child",
+        )
+    }
+
+    /// Soft-deleted rows stay deleted (no restore op — see module docs), so
+    /// keep a floor of live parents/children for the other ops to target.
+    fn soft_delete_parent(&mut self, model: &mut Model, live: &[usize]) -> StampedOp {
+        if live.len() <= 3 {
+            let owner = self.owner();
+            return self.insert_parent(model, owner);
+        }
+        let index = live[self.prng.below(live.len())];
+        let (id, parent) = &mut model.parents[index];
+        parent.deleted = true;
+        let id = *id;
+        self.stamp(StampedOpKind::SoftDelete { id }, "soft-delete-parent")
+    }
+
+    fn soft_delete_child(&mut self, model: &mut Model, live: &[usize]) -> StampedOp {
+        if live.len() <= 4 {
+            return self.insert_child(model, None);
+        }
+        let index = live[self.prng.below(live.len())];
+        let (id, child) = &mut model.children[index];
+        child.deleted = true;
+        let id = *id;
+        self.stamp(StampedOpKind::SoftDelete { id }, "soft-delete-child")
+    }
+
+    /// Deterministic cold-open dataset: every subscription's snapshot is
+    /// non-empty (both owners get parents with visible children and
+    /// grandchildren), plus a few randomized extras.
+    fn seed_ops(&mut self, model: &mut Model) -> Vec<StampedOp> {
+        let mut ops = Vec::new();
+        for round in 0..4 {
+            let owner = OWNERS[round % 2];
+            ops.push(self.insert_parent(model, owner));
+            let parent_id = model.parents.last().expect("parent just inserted").0;
+            for _ in 0..2 {
+                ops.push(self.insert_child(model, Some(parent_id)));
+                let child_id = model.children.last().expect("child just inserted").0;
+                ops.push(self.insert_grandchild(model, Some(child_id)));
+            }
+        }
+        for _ in 0..6 {
+            let op = self.mutation(model);
+            ops.push(op);
+        }
+        ops
+    }
+}
+
+// ============================================================================
+// Engine wrapper + client-side mirror.
+// ============================================================================
+
+#[derive(Default)]
+struct Mirror {
+    descriptor: Option<RowDescriptor>,
+    ordered: Vec<ObjectId>,
+    rows: HashMap<ObjectId, Row>,
+}
+
+impl Mirror {
+    /// Apply one emitted update exactly as a client would, with pre-image
+    /// checks: `removed`/`updated` must carry the bytes the client holds.
+    fn apply_update(&mut self, context: &str, update: &QueryUpdate) {
+        match &self.descriptor {
+            None => self.descriptor = Some(update.descriptor.clone()),
+            Some(descriptor) => assert!(
+                *descriptor == update.descriptor,
+                "{context}: subscription-oracle divergence: descriptor changed mid-stream"
+            ),
+        }
+
+        for row in &update.delta.removed {
+            let held = self.rows.remove(&row.id).unwrap_or_else(|| {
+                panic!(
+                    "{context}: subscription-oracle divergence: removed row {} was never delivered",
+                    row.id
+                )
+            });
+            assert!(
+                held == *row,
+                "{context}: subscription-oracle divergence: removed row {} pre-image differs from \
+                 client-held state\nheld: {held:?}\nsent: {row:?}",
+                row.id
+            );
+        }
+        for (old, new) in &update.delta.updated {
+            let held = self.rows.get(&old.id).unwrap_or_else(|| {
+                panic!(
+                    "{context}: subscription-oracle divergence: updated row {} was never delivered",
+                    old.id
+                )
+            });
+            assert!(
+                *held == *old,
+                "{context}: subscription-oracle divergence: updated row {} pre-image differs from \
+                 client-held state\nheld: {held:?}\nsent old: {old:?}",
+                old.id
+            );
+            self.rows.insert(new.id, new.clone());
+        }
+        for row in &update.delta.added {
+            let previous = self.rows.insert(row.id, row.clone());
+            assert!(
+                previous.is_none(),
+                "{context}: subscription-oracle divergence: added row {} was already held",
+                row.id
+            );
+        }
+
+        self.ordered = apply_ordered_delta(context, &self.ordered, &update.ordered_delta);
+        assert_eq!(
+            self.ordered.len(),
+            self.rows.len(),
+            "{context}: subscription-oracle divergence: ordered ids and row map disagree after \
+             applying the delta"
+        );
+        for id in &self.ordered {
+            assert!(
+                self.rows.contains_key(id),
+                "{context}: subscription-oracle divergence: ordered id {id} has no row"
+            );
+        }
+    }
+
+    /// Decode the mirrored rows into the (parent, children, grandchildren)
+    /// id tree, in mirror order.
+    fn tree(&self, context: &str) -> ExpectedTree {
+        if self.ordered.is_empty() {
+            return Vec::new();
+        }
+        let descriptor = self
+            .descriptor
+            .as_ref()
+            .unwrap_or_else(|| panic!("{context}: mirror holds rows but saw no descriptor"));
+        self.ordered
+            .iter()
+            .map(|parent_id| {
+                let row = &self.rows[parent_id];
+                let values = decode_row(descriptor, &row.data)
+                    .unwrap_or_else(|err| panic!("{context}: decode parent row failed: {err}"));
+                let children = include_array(context, &values, PARENT_INCLUDE_COLUMN)
+                    .iter()
+                    .map(|child| {
+                        let (child_id, child_values) = as_included_row(context, child);
+                        let grandchildren =
+                            include_array(context, child_values, CHILD_INCLUDE_COLUMN)
+                                .iter()
+                                .map(|grandchild| as_included_row(context, grandchild).0)
+                                .collect();
+                        (child_id, grandchildren)
+                    })
+                    .collect();
+                (*parent_id, children)
+            })
+            .collect()
+    }
+}
+
+fn include_array<'a>(context: &str, values: &'a [Value], column: usize) -> &'a [Value] {
+    match values.get(column) {
+        Some(Value::Array(items)) => items,
+        other => panic!("{context}: expected include array at column {column}, got {other:?}"),
+    }
+}
+
+fn as_included_row<'a>(context: &str, value: &'a Value) -> (ObjectId, &'a Vec<Value>) {
+    match value {
+        Value::Row {
+            id: Some(id),
+            values,
+        } => (*id, values),
+        other => panic!("{context}: expected included row with id, got {other:?}"),
+    }
+}
+
+/// Reconstruct the post order from the pre order and an ordered delta, with
+/// index-correctness checks. Survivor rows keep their relative order; every
+/// added/updated entry names its exact post index.
+fn apply_ordered_delta(context: &str, pre: &[ObjectId], delta: &OrderedRowDelta) -> Vec<ObjectId> {
+    use std::collections::HashSet;
+
+    let removed: HashSet<ObjectId> = delta.removed.iter().map(|entry| entry.id).collect();
+    for entry in &delta.removed {
+        assert_eq!(
+            pre.get(entry.index),
+            Some(&entry.id),
+            "{context}: subscription-oracle divergence: removed index {} does not address row {}",
+            entry.index,
+            entry.id
+        );
+    }
+    let repositioned: HashSet<ObjectId> = delta.updated.iter().map(|entry| entry.id).collect();
+    for entry in &delta.updated {
+        assert_eq!(
+            pre.get(entry.old_index),
+            Some(&entry.id),
+            "{context}: subscription-oracle divergence: updated old index {} does not address \
+             row {}",
+            entry.old_index,
+            entry.id
+        );
+    }
+
+    let survivors: Vec<ObjectId> = pre
+        .iter()
+        .filter(|id| !removed.contains(id) && !repositioned.contains(id))
+        .copied()
+        .collect();
+    let total = survivors.len() + delta.updated.len() + delta.added.len();
+    let mut slots: Vec<Option<ObjectId>> = vec![None; total];
+    for entry in &delta.added {
+        assert!(
+            entry.index < total && slots[entry.index].is_none(),
+            "{context}: subscription-oracle divergence: added index {} is out of range or double-\
+             booked (total {total})",
+            entry.index
+        );
+        slots[entry.index] = Some(entry.id);
+    }
+    for entry in &delta.updated {
+        assert!(
+            entry.new_index < total && slots[entry.new_index].is_none(),
+            "{context}: subscription-oracle divergence: updated new index {} is out of range or \
+             double-booked (total {total})",
+            entry.new_index
+        );
+        slots[entry.new_index] = Some(entry.id);
+    }
+    let mut survivors = survivors.into_iter();
+    let post: Vec<ObjectId> = slots
+        .into_iter()
+        .map(|slot| {
+            slot.unwrap_or_else(|| {
+                survivors.next().unwrap_or_else(|| {
+                    panic!(
+                        "{context}: subscription-oracle divergence: ordered delta leaves \
+                         unfillable holes"
+                    )
+                })
+            })
+        })
+        .collect();
+    assert!(
+        survivors.next().is_none(),
+        "{context}: subscription-oracle divergence: ordered delta drops surviving rows"
+    );
+    post
+}
+
+struct Engine<H: Storage> {
+    qm: QueryManager,
+    storage: H,
+    branch: String,
+    write_schema: Schema,
+    subs: Vec<QuerySubscriptionId>,
+    mirrors: Vec<Mirror>,
+    name: &'static str,
+    _path: EnginePathGuard,
+}
+
+impl<H: Storage> Engine<H> {
+    fn new(
+        name: &'static str,
+        path: EnginePath,
+        schema: &Schema,
+        make_storage: &dyn Fn(&Schema) -> H,
+    ) -> Self {
+        let mut qm = QueryManager::new(SyncManager::new());
+        qm.set_current_schema(schema.clone(), "dev", "main");
+        let storage = make_storage(&qm.schema_context().current_schema);
+        let branch = get_branch(&qm);
+        let write_schema = (*qm.schema).clone();
+        Self {
+            qm,
+            storage,
+            branch,
+            write_schema,
+            subs: Vec::new(),
+            mirrors: Vec::new(),
+            name,
+            _path: path.engage(),
+        }
+    }
+
+    fn subscribe_all(&mut self, context: &str) {
+        for spec in sub_specs() {
+            let builder = self.qm.query(PARENT_TABLE);
+            let builder = if spec.descending {
+                builder.order_by_desc("ord")
+            } else {
+                builder.order_by("ord")
+            };
+            let builder = match spec.limit {
+                Some(limit) => builder.limit(limit),
+                None => builder,
+            };
+            let query = builder
+                .with_array("children", |sub| {
+                    sub.from(CHILD_TABLE)
+                        .correlate("parent_id", "parents.id")
+                        .filter_eq("is_deleted", Value::Boolean(false))
+                        .order_by("ord")
+                        .with_array("grandchildren", |sub2| {
+                            sub2.from(GRANDCHILD_TABLE)
+                                .correlate("child_id", "children.id")
+                                .order_by("ord")
+                        })
+                })
+                .build();
+            let sub_id = self
+                .qm
+                .subscribe_with_session(query, Some(PolicySession::new(spec.user)), None)
+                .unwrap_or_else(|err| {
+                    panic!("{context}: engine {}: subscribe failed: {err:?}", self.name)
+                });
+            self.subs.push(sub_id);
+            self.mirrors.push(Mirror::default());
+        }
+    }
+
+    fn apply(&mut self, context: &str, op: &StampedOp) {
+        let write_context = WriteContext {
+            session: None,
+            attribution: Some(op.author.to_string()),
+            updated_at: Some(op.ts),
+            batch_mode: None,
+            // NEVER set batch_id here: it flips the write to StagingPending
+            // (open transaction batch), not a direct visible write.
+            batch_id: None,
+            target_branch_name: None,
+        };
+        match &op.kind {
+            StampedOpKind::Insert { table, id, values } => {
+                self.qm
+                    .insert_on_branch_with_schema_and_write_context_and_id(
+                        &mut self.storage,
+                        table,
+                        &self.branch.clone(),
+                        values,
+                        Some(*id),
+                        &self.write_schema.clone(),
+                        Some(&write_context),
+                        true,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "{context}: engine {}: [{}] insert into {table} failed: {err:?}",
+                            self.name, op.label
+                        )
+                    });
+            }
+            StampedOpKind::Update { id, values } => {
+                self.qm
+                    .update_with_write_context(&mut self.storage, *id, values, Some(&write_context))
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "{context}: engine {}: [{}] update of {id} failed: {err:?}",
+                            self.name, op.label
+                        )
+                    });
+            }
+            StampedOpKind::SoftDelete { id } => {
+                self.qm
+                    .delete_with_write_context(&mut self.storage, *id, Some(&write_context))
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "{context}: engine {}: [{}] soft delete of {id} failed: {err:?}",
+                            self.name, op.label
+                        )
+                    });
+            }
+        }
+    }
+
+    /// One settle pass; returns this pass's updates grouped per subscription.
+    /// A single `process()` emits at most one update per subscription — the
+    /// grouping is the ONLY normalization applied (see module docs).
+    fn process_and_take(&mut self, context: &str) -> HashMap<u64, QueryUpdate> {
+        self.qm.process(&mut self.storage);
+        let mut grouped: HashMap<u64, QueryUpdate> = HashMap::new();
+        for update in self.qm.take_updates() {
+            let key = update.subscription_id.0;
+            assert!(
+                !grouped.contains_key(&key),
+                "{context}: engine {}: subscription {key} emitted more than one update in a \
+                 single process() — the harness's one-batch-per-pass grouping no longer holds",
+                self.name
+            );
+            grouped.insert(key, update);
+        }
+        grouped
+    }
+
+    fn assert_mirror_matches_engine(&self, context: &str, sub_index: usize) {
+        let sub_id = self.subs[sub_index];
+        let subscription = self
+            .qm
+            .subscriptions
+            .get(&sub_id)
+            .unwrap_or_else(|| panic!("{context}: engine {}: subscription lost", self.name));
+        let mirror = &self.mirrors[sub_index];
+        assert_eq!(
+            mirror.ordered, subscription.current_ordered_ids,
+            "{context}: engine {}: the emitted delta stream does not reconstruct the engine's \
+             ordered result — a delta batch was missed or wrong",
+            self.name
+        );
+        assert!(
+            mirror.rows == subscription.current_visible_rows,
+            "{context}: engine {}: the emitted delta stream does not reconstruct the engine's \
+             visible rows — a delta batch was missed or wrong",
+            self.name
+        );
+    }
+}
+
+// ============================================================================
+// Fault injection (mutation-validation of the oracle itself).
+// ============================================================================
+
+/// Deliberate breakage for the `#[should_panic]` validation tests: each fault
+/// simulates a bug class the oracle exists to catch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    None,
+    /// Engine B silently misses one write — the data-divergence class.
+    SkipOpOnB {
+        op_index: usize,
+    },
+    /// Engine B drops one emitted delta batch — the missed-delta
+    /// (F2 under-marking) class.
+    DropFirstMutationUpdateOnB,
+}
+
+// ============================================================================
+// The oracle run.
+// ============================================================================
+
+/// Cross-engine row identity: everything except the engine-minted batch-id
+/// value (see the module docs on normalization).
+type RowFingerprint = (
+    ObjectId,
+    crate::query_manager::types::RowBytes,
+    RowProvenance,
+);
+
+fn row_fingerprint(row: &Row) -> RowFingerprint {
+    (row.id, row.data.clone(), row.provenance.clone())
+}
+
+fn rows_fingerprint(rows: &[Row]) -> Vec<RowFingerprint> {
+    rows.iter().map(row_fingerprint).collect()
+}
+
+fn assert_updates_equal(context: &str, a: &QueryUpdate, b: &QueryUpdate) {
+    assert!(
+        a.descriptor == b.descriptor,
+        "{context}: subscription-oracle divergence: descriptors differ"
+    );
+    let updated_a: Vec<(RowFingerprint, RowFingerprint)> = a
+        .delta
+        .updated
+        .iter()
+        .map(|(old, new)| (row_fingerprint(old), row_fingerprint(new)))
+        .collect();
+    let updated_b: Vec<(RowFingerprint, RowFingerprint)> = b
+        .delta
+        .updated
+        .iter()
+        .map(|(old, new)| (row_fingerprint(old), row_fingerprint(new)))
+        .collect();
+    assert!(
+        rows_fingerprint(&a.delta.added) == rows_fingerprint(&b.delta.added)
+            && rows_fingerprint(&a.delta.removed) == rows_fingerprint(&b.delta.removed)
+            && a.delta.moved == b.delta.moved
+            && updated_a == updated_b,
+        "{context}: subscription-oracle divergence: row deltas differ\nA: {:?}\nB: {:?}",
+        a.delta,
+        b.delta
+    );
+    let ordered_a = ordered_delta_fingerprint(&a.ordered_delta);
+    let ordered_b = ordered_delta_fingerprint(&b.ordered_delta);
+    assert!(
+        ordered_a == ordered_b,
+        "{context}: subscription-oracle divergence: ordered deltas differ\nA: {ordered_a:?}\nB: {ordered_b:?}"
+    );
+}
+
+type OrderedDeltaFingerprint = (
+    Vec<(ObjectId, usize, RowFingerprint)>,
+    Vec<(ObjectId, usize)>,
+    Vec<(ObjectId, usize, usize, Option<RowFingerprint>)>,
+    bool,
+);
+
+fn ordered_delta_fingerprint(delta: &OrderedRowDelta) -> OrderedDeltaFingerprint {
+    (
+        delta
+            .added
+            .iter()
+            .map(|entry| (entry.id, entry.index, row_fingerprint(&entry.row)))
+            .collect(),
+        delta
+            .removed
+            .iter()
+            .map(|entry| (entry.id, entry.index))
+            .collect(),
+        delta
+            .updated
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.old_index,
+                    entry.new_index,
+                    entry.row.as_ref().map(row_fingerprint),
+                )
+            })
+            .collect(),
+        delta.pending,
+    )
+}
+
+/// The v13-0 finding, as a dedicated assertion: a cold-open snapshot may not
+/// be empty when seeded data matches the subscription.
+fn assert_initial_snapshot_completeness(
+    context: &str,
+    expected: &ExpectedTree,
+    update: &QueryUpdate,
+) {
+    if !expected.is_empty() {
+        assert!(
+            !update.delta.added.is_empty(),
+            "{context}: initial snapshot is empty but seeded data matches — a cold-open \
+             subscription must serve matching rows in its first emit (v13-0 census finding: \
+             7/16 subs served empty results for minutes)"
+        );
+    }
+}
+
+fn run_oracle<H: Storage>(
+    seed: u64,
+    make_storage: &dyn Fn(&Schema) -> H,
+    fault: Fault,
+    profile: OpProfile,
+) {
+    let schema = oracle_schema();
+    let specs = sub_specs();
+    let mut engine_a = Engine::new("A", EnginePath::Legacy, &schema, make_storage);
+    let mut engine_b = Engine::new("B", EnginePath::Legacy, &schema, make_storage);
+    let mut model = Model::default();
+    let mut generator = OpGenerator::new(seed, profile);
+    let mut op_index = 0usize;
+    let mut drop_pending = fault == Fault::DropFirstMutationUpdateOnB;
+
+    let apply_everywhere = |context: &str,
+                            engine_a: &mut Engine<H>,
+                            engine_b: &mut Engine<H>,
+                            op: &StampedOp,
+                            op_index: &mut usize| {
+        engine_a.apply(context, op);
+        if fault
+            != (Fault::SkipOpOnB {
+                op_index: *op_index,
+            })
+        {
+            engine_b.apply(context, op);
+        }
+        *op_index += 1;
+    };
+
+    // ---- Seed phase (cold-open dataset exists BEFORE any subscription) ----
+    let context = format!("seed {seed:#x} seed-phase");
+    for op in generator.seed_ops(&mut model) {
+        apply_everywhere(&context, &mut engine_a, &mut engine_b, &op, &mut op_index);
+    }
+    let leftover_a = engine_a.process_and_take(&context);
+    let leftover_b = engine_b.process_and_take(&context);
+    assert!(
+        leftover_a.is_empty() && leftover_b.is_empty(),
+        "{context}: updates emitted before any subscription existed"
+    );
+
+    // ---- Cold open: subscribe, then at most SETTLE_PROCESS_BOUND passes ----
+    let context = format!("seed {seed:#x} cold-open");
+    engine_a.subscribe_all(&context);
+    engine_b.subscribe_all(&context);
+    let mut updates_a = HashMap::new();
+    let mut updates_b = HashMap::new();
+    for _pass in 0..SETTLE_PROCESS_BOUND {
+        updates_a.extend(engine_a.process_and_take(&context));
+        updates_b.extend(engine_b.process_and_take(&context));
+        if updates_a.len() == specs.len() && updates_b.len() == specs.len() {
+            break;
+        }
+    }
+    for (sub_index, spec) in specs.iter().enumerate() {
+        let sub_context = format!("{context} sub#{sub_index} ({spec:?})");
+        let key = engine_a.subs[sub_index].0;
+        let update_a = updates_a.get(&key).unwrap_or_else(|| {
+            panic!(
+                "{sub_context}: no initial snapshot within {SETTLE_PROCESS_BOUND} process() \
+                 pass(es) — settle-to-first-emit bound violated (v13-0 census finding)"
+            )
+        });
+        let update_b = updates_b.get(&key).unwrap_or_else(|| {
+            panic!(
+                "{sub_context}: subscription-oracle divergence: engine B produced no initial \
+                 snapshot while engine A did"
+            )
+        });
+        assert_updates_equal(&sub_context, update_a, update_b);
+        let expected = model.expected_tree(spec);
+        assert_initial_snapshot_completeness(&sub_context, &expected, update_a);
+        engine_a.mirrors[sub_index].apply_update(&sub_context, update_a);
+        engine_b.mirrors[sub_index].apply_update(&sub_context, update_b);
+        engine_a.assert_mirror_matches_engine(&sub_context, sub_index);
+        engine_b.assert_mirror_matches_engine(&sub_context, sub_index);
+        assert_eq!(
+            engine_a.mirrors[sub_index].tree(&sub_context),
+            expected,
+            "{sub_context}: subscription-oracle model mismatch: initial snapshot does not match \
+             the reference model"
+        );
+    }
+
+    // ---- Mutation phase ----
+    for batch in 0..MUTATION_BATCHES {
+        let context = format!("seed {seed:#x} batch #{batch}");
+        for op in generator.batch_ops(&mut model) {
+            let op_context = format!("{context} [{}]", op.label);
+            apply_everywhere(
+                &op_context,
+                &mut engine_a,
+                &mut engine_b,
+                &op,
+                &mut op_index,
+            );
+        }
+
+        // Settle passes: one `process()` can leave include arrays a pass
+        // behind their inner-table writes (the inner delta re-dirties the
+        // outer graph), so pump BOTH engines in lockstep until quiescent —
+        // comparing every pass — and bound the pass count. The model check
+        // then runs against the quiesced state.
+        let mut passes = 0usize;
+        loop {
+            let pass_context = format!("{context} settle-pass #{passes}");
+            let updates_a = engine_a.process_and_take(&pass_context);
+            let mut updates_b = engine_b.process_and_take(&pass_context);
+            if drop_pending && !updates_b.is_empty() {
+                let dropped = *updates_b.keys().min().expect("non-empty update map");
+                updates_b.remove(&dropped);
+                drop_pending = false;
+            }
+
+            let mut keys_a: Vec<u64> = updates_a.keys().copied().collect();
+            let mut keys_b: Vec<u64> = updates_b.keys().copied().collect();
+            keys_a.sort_unstable();
+            keys_b.sort_unstable();
+            assert_eq!(
+                keys_a, keys_b,
+                "{pass_context}: subscription-oracle divergence: the sets of subscriptions \
+                 emitting updates differ between the engines"
+            );
+
+            for key in keys_a.iter().copied() {
+                let sub_index = engine_a
+                    .subs
+                    .iter()
+                    .position(|sub_id| sub_id.0 == key)
+                    .expect("update for an unknown subscription");
+                let sub_context = format!("{pass_context} sub#{sub_index}");
+                assert_updates_equal(&sub_context, &updates_a[&key], &updates_b[&key]);
+                engine_a.mirrors[sub_index].apply_update(&sub_context, &updates_a[&key]);
+                engine_b.mirrors[sub_index].apply_update(&sub_context, &updates_b[&key]);
+            }
+
+            if keys_a.is_empty() {
+                break;
+            }
+            passes += 1;
+            assert!(
+                passes <= SETTLE_PASS_BOUND,
+                "{context}: engines did not quiesce within {SETTLE_PASS_BOUND} settle passes \
+                 after one mutation batch"
+            );
+        }
+
+        // Model + engine-state checks run for EVERY subscription, updated or
+        // not: a change the engine failed to emit (under-marking) leaves the
+        // mirror stale and fails the model comparison right here.
+        for (sub_index, spec) in specs.iter().enumerate() {
+            let sub_context = format!("{context} sub#{sub_index} ({spec:?})");
+            engine_a.assert_mirror_matches_engine(&sub_context, sub_index);
+            engine_b.assert_mirror_matches_engine(&sub_context, sub_index);
+            assert_eq!(
+                engine_a.mirrors[sub_index].tree(&sub_context),
+                model.expected_tree(spec),
+                "{sub_context}: subscription-oracle model mismatch after mutation batch"
+            );
+        }
+    }
+}
+
+fn memory_storage_factory(schema: &Schema) -> MemoryStorage {
+    seeded_memory_storage(schema)
+}
+
+// ============================================================================
+// Tests.
+// ============================================================================
+
+#[test]
+fn subscription_output_differential_random_ops_memory() {
+    for seed in SEEDS {
+        run_oracle(
+            seed,
+            &memory_storage_factory,
+            Fault::None,
+            OpProfile::MembershipSafe,
+        );
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn subscription_output_differential_random_ops_rocksdb() {
+    use crate::storage::RocksDBStorage;
+    use crate::test_support::persist_test_schema;
+
+    let factory = |schema: &Schema| {
+        let dir = tempfile::TempDir::new().expect("tempdir for rocksdb oracle");
+        let path = dir.path().join("subscription-oracle.rocksdb");
+        let mut storage =
+            RocksDBStorage::open(&path, 8 * 1024 * 1024).expect("open rocksdb oracle storage");
+        // Keep the directory alive for the whole process; the OS reclaims it.
+        std::mem::forget(dir);
+        persist_test_schema(&mut storage, schema);
+        storage
+    };
+    // Two seeds: rocksdb runs the identical logic through the persistent
+    // backend; the memory run carries the seed breadth.
+    for seed in &SEEDS[..2] {
+        run_oracle(*seed, &factory, Fault::None, OpProfile::MembershipSafe);
+    }
+}
+
+/// The FULL §6.2 op matrix, filter flips included.
+///
+/// EXPECTED RED: pinned by
+/// `include_array_goes_stale_on_inner_row_content_update` below — content
+/// updates (and therefore `is_deleted` filter transitions) on include-inner
+/// rows never reach subscription outputs. F2's row-precise dirtiness must
+/// make this green and un-ignore it; from then on it IS the oracle and the
+/// `MembershipSafe` run becomes redundant.
+#[test]
+#[ignore = "EXPECTED RED: include arrays go stale on inner-row content updates (see module docs FINDING); F2 must fix and un-ignore"]
+fn subscription_output_differential_full_ops_including_filter_flips() {
+    for seed in SEEDS {
+        run_oracle(
+            seed,
+            &memory_storage_factory,
+            Fault::None,
+            OpProfile::FullIncludingFilterFlips,
+        );
+    }
+}
+
+/// Minimal pin of the FINDING in the module docs: a child row's `is_deleted`
+/// flip must retract it from a `filter_eq("is_deleted", false)` include, and
+/// a plain content edit must be re-served. Today NEITHER happens — the
+/// include array is byte-stale forever (also via the remote sync-inbox
+/// path). Un-ignore together with the full-ops oracle when F2 lands.
+#[test]
+#[ignore = "EXPECTED RED: pins the include inner-update staleness bug (module docs FINDING); F2 must fix and un-ignore"]
+fn include_array_goes_stale_on_inner_row_content_update() {
+    let sync_manager = SyncManager::new();
+    let mut schema = Schema::new();
+    schema.insert(
+        TableName::new("parents"),
+        RowDescriptor::new(vec![ColumnDescriptor::new("ord", ColumnType::Integer)]).into(),
+    );
+    schema.insert(
+        TableName::new("children"),
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("ord", ColumnType::Integer),
+            ColumnDescriptor::new("is_deleted", ColumnType::Boolean),
+            ColumnDescriptor::new("parent_id", ColumnType::Uuid),
+        ])
+        .into(),
+    );
+    let (mut qm, mut storage) = create_query_manager(sync_manager, schema);
+    let parent = qm
+        .insert(&mut storage, "parents", &[Value::Integer(1)])
+        .unwrap();
+    let child = qm
+        .insert(
+            &mut storage,
+            "children",
+            &[
+                Value::Integer(2),
+                Value::Boolean(false),
+                Value::Uuid(parent.row_id),
+            ],
+        )
+        .unwrap();
+    let query = qm
+        .query("parents")
+        .with_array("children", |sub| {
+            sub.from("children")
+                .correlate("parent_id", "parents.id")
+                .filter_eq("is_deleted", Value::Boolean(false))
+                .order_by("ord")
+        })
+        .build();
+    let sub_id = qm.subscribe(query).unwrap();
+    qm.process(&mut storage);
+    let initial = qm.take_updates();
+    let initial = initial
+        .iter()
+        .find(|update| update.subscription_id == sub_id)
+        .expect("initial snapshot");
+    let values = decode_row(&initial.descriptor, &initial.delta.added[0].data).unwrap();
+    assert_eq!(
+        values[1].as_array().map(<[Value]>::len),
+        Some(1),
+        "child starts inside the include"
+    );
+
+    // Flip the include's filter column on the child.
+    qm.update(
+        &mut storage,
+        child.row_id,
+        &[
+            Value::Integer(2),
+            Value::Boolean(true),
+            Value::Uuid(parent.row_id),
+        ],
+    )
+    .unwrap();
+    for _ in 0..SETTLE_PASS_BOUND {
+        qm.process(&mut storage);
+    }
+    qm.take_updates();
+
+    let results = qm.get_subscription_results(sub_id);
+    let include = results[0].1[1]
+        .as_array()
+        .expect("include column stays an array");
+    assert!(
+        include.is_empty(),
+        "a child whose is_deleted flipped to true must leave the \
+         filter_eq(is_deleted, false) include; the engine still serves {include:?}"
+    );
+}
+
+/// Mutation-validation: an engine that silently misses a write must be
+/// caught. Op #0 is the first seeded parent, so engine B's cold-open
+/// snapshot diverges immediately.
+#[test]
+#[should_panic(expected = "subscription-oracle divergence")]
+fn oracle_catches_an_engine_that_missed_a_write() {
+    run_oracle(
+        SEEDS[0],
+        &memory_storage_factory,
+        Fault::SkipOpOnB { op_index: 0 },
+        OpProfile::MembershipSafe,
+    );
+}
+
+/// Mutation-validation: a dropped delta batch (the F2 under-marking symptom)
+/// must be caught by the stream comparison.
+#[test]
+#[should_panic(expected = "subscription-oracle divergence")]
+fn oracle_catches_a_dropped_delta_batch() {
+    run_oracle(
+        SEEDS[0],
+        &memory_storage_factory,
+        Fault::DropFirstMutationUpdateOnB,
+        OpProfile::MembershipSafe,
+    );
+}
+
+/// Mutation-validation: the empty-cold-open detector itself (v13-0 finding).
+#[test]
+#[should_panic(expected = "initial snapshot is empty but seeded data matches")]
+fn oracle_catches_an_empty_initial_snapshot() {
+    use crate::query_manager::types::RowDelta;
+
+    let expected: ExpectedTree = vec![(ObjectId::new(), Vec::new())];
+    let empty_update = QueryUpdate {
+        subscription_id: QuerySubscriptionId(0),
+        delta: RowDelta::new(),
+        ordered_delta: OrderedRowDelta::default(),
+        descriptor: RowDescriptor::new(vec![]),
+    };
+    assert_initial_snapshot_completeness("validation", &expected, &empty_update);
+}
