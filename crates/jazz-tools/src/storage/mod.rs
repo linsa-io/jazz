@@ -11,6 +11,8 @@
 
 #[cfg(test)]
 pub mod conformance;
+#[cfg(test)]
+pub mod conformance_differential;
 mod key_codec;
 mod memory;
 mod opfs_btree;

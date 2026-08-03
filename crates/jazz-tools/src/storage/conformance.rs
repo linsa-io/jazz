@@ -1621,6 +1621,13 @@ macro_rules! storage_conformance_tests {
             fn alice_bob_branch_isolation() {
                 conformance::test_alice_bob_branch_isolation(&$factory);
             }
+
+            #[test]
+            fn visible_entry_differential_random_ops() {
+                $crate::storage::conformance_differential::test_visible_entry_differential_random_ops(
+                    &$factory,
+                );
+            }
         }
     };
 }
