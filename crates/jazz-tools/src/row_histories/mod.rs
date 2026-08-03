@@ -1,7 +1,7 @@
 //! Row-history data types, codecs, and the algorithms that turn them into the
 //! row a reader sees and the writes a sync target receives.
 //!
-//! Split into four submodules so each concern is independently navigable:
+//! Split into five submodules so each concern is independently navigable:
 //! - [`types`]: data types (BatchId, RowState, QueryRowBatch, StoredRowBatch,
 //!   RowMetadata, VisibleRowEntry, error types)
 //! - [`codecs`]: descriptor builders and flat-row encode/decode
@@ -9,12 +9,16 @@
 //!   ancestor, per-column merge, delete-winner, computed visible preview. No
 //!   storage access; called by both `mutations` and `types` (via
 //!   `VisibleRowEntry::rebuild_*`).
+//! - [`fastpath`]: pure O(1) serial-write construction of the next
+//!   `VisibleRowEntry` (guards + tier-pointer carry-forward), its kill switch
+//!   and telemetry counters. No storage access.
 //! - [`mutations`]: the storage-mutating verbs (`apply_row_batch`,
 //!   `patch_row_batch_state`) and their direct support — load history,
-//!   recompute visibility via `resolution`, write through `Storage`, emit a
-//!   `RowVisibilityChange`.
+//!   recompute visibility via `resolution` (or `fastpath` when eligible),
+//!   write through `Storage`, emit a `RowVisibilityChange`.
 
 mod codecs;
+mod fastpath;
 mod mutations;
 mod resolution;
 mod types;
@@ -28,6 +32,9 @@ pub use codecs::{
     encode_flat_history_row, encode_flat_visible_row_entry, history_row_physical_descriptor,
     visible_row_physical_descriptor,
 };
+pub use fastpath::{HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS, history_fastpath_enabled};
+#[cfg(any(test, feature = "test"))]
+pub use fastpath::{HistoryFastpathMode, force_history_fastpath};
 pub(crate) use mutations::{ApplyRowBatchWithContext, apply_row_batch_with_context};
 pub use mutations::{apply_row_batch, patch_row_batch_state};
 pub(crate) use resolution::visible_row_preview_from_history_rows;
@@ -42,13 +49,16 @@ mod tests {
 
     use uuid::Uuid;
 
+    use super::fastpath::try_serial_fastpath_entry;
     use super::*;
-    use crate::metadata::{DeleteKind, RowProvenance};
-    use crate::object::ObjectId;
+    use crate::metadata::{DeleteKind, MetadataKey, RowProvenance};
+    use crate::object::{BranchName, ObjectId};
     use crate::query_manager::types::{
-        ColumnDescriptor, ColumnMergeStrategy, ColumnType, RowDescriptor, Value,
+        ColumnDescriptor, ColumnMergeStrategy, ColumnType, RowDescriptor, Schema, TableName,
+        TableSchema, Value,
     };
     use crate::row_format::{decode_row, encode_row};
+    use crate::storage::{MemoryStorage, RowLocator, Storage};
     use crate::sync_manager::DurabilityTier;
 
     fn visible_row(updated_at: u64, confirmed_tier: Option<DurabilityTier>) -> StoredRowBatch {
@@ -1146,6 +1156,551 @@ mod tests {
         assert_eq!(state.len(), 1);
         assert_eq!(tier.len(), 1);
         assert_eq!(delete_kind.len(), 1);
+    }
+
+    // ─── serial-write fast path ─────────────────────────────────────────────
+    //
+    // Fixtures for `fastpath::try_serial_fastpath_entry`. The bar throughout:
+    // a constructed fast entry must equal `rebuild_with_descriptor` over the
+    // full history byte for byte, and every unprovable shape must decline.
+    // (The randomized cross-check lives in `storage::conformance_differential`.)
+
+    fn root_batch(
+        descriptor: &RowDescriptor,
+        values: &[Value],
+        updated_at: u64,
+        confirmed_tier: Option<DurabilityTier>,
+    ) -> StoredRowBatch {
+        StoredRowBatch::new(
+            ObjectId::new(),
+            "main",
+            Vec::new(),
+            encode_row(descriptor, values).expect("encode root row"),
+            RowProvenance::for_insert("alice".to_string(), updated_at),
+            HashMap::new(),
+            RowState::VisibleDirect,
+            confirmed_tier,
+        )
+    }
+
+    fn serial_batch(
+        prev: &StoredRowBatch,
+        descriptor: &RowDescriptor,
+        values: &[Value],
+        updated_at: u64,
+        confirmed_tier: Option<DurabilityTier>,
+    ) -> StoredRowBatch {
+        StoredRowBatch::new(
+            prev.row_id,
+            "main",
+            vec![prev.batch_id()],
+            encode_row(descriptor, values).expect("encode serial row"),
+            RowProvenance::for_update(&prev.row_provenance(), "bob".to_string(), updated_at),
+            HashMap::new(),
+            RowState::VisibleDirect,
+            confirmed_tier,
+        )
+    }
+
+    fn rebuilt_entry(descriptor: &RowDescriptor, history: &[StoredRowBatch]) -> VisibleRowEntry {
+        VisibleRowEntry::rebuild_with_descriptor(descriptor, history)
+            .expect("rebuild visible entry")
+            .expect("history has a visible row")
+    }
+
+    #[test]
+    fn history_fastpath_matches_full_rebuild_on_tier_sparse_serial_chain() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = user_descriptor();
+        let a = root_batch(
+            &descriptor,
+            &[Value::Text("v1".into()), Value::Boolean(false)],
+            10,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let b = serial_batch(
+            &a,
+            &descriptor,
+            &[Value::Text("v2".into()), Value::Boolean(true)],
+            20,
+            Some(DurabilityTier::EdgeServer),
+        );
+        let previous = rebuilt_entry(&descriptor, &[a.clone(), b.clone()]);
+        assert_eq!(previous.worker_batch_id, None);
+        assert_eq!(previous.edge_batch_id, None);
+        assert_eq!(previous.global_batch_id, Some(a.batch_id()));
+
+        // Unconfirmed serial append: old tip becomes the worker/edge pointer,
+        // the deeper global pointer is carried verbatim.
+        let c = serial_batch(
+            &b,
+            &descriptor,
+            &[Value::Text("v3".into()), Value::Boolean(false)],
+            30,
+            None,
+        );
+        let fast = try_serial_fastpath_entry(Some(&previous), &c)
+            .expect("unconfirmed serial append takes the fast path");
+        let mut history = vec![a.clone(), b.clone(), c.clone()];
+        assert_eq!(fast, rebuilt_entry(&descriptor, &history));
+        assert_eq!(fast.branch_frontier, vec![c.batch_id()]);
+        assert_eq!(fast.worker_batch_id, Some(b.batch_id()));
+        assert_eq!(fast.edge_batch_id, Some(b.batch_id()));
+        assert_eq!(fast.global_batch_id, Some(a.batch_id()));
+
+        // Extending past an unconfirmed tip carries every pointer verbatim.
+        let d = serial_batch(
+            &c,
+            &descriptor,
+            &[Value::Text("v4".into()), Value::Boolean(true)],
+            40,
+            None,
+        );
+        let fast = try_serial_fastpath_entry(Some(&fast), &d)
+            .expect("second unconfirmed serial append takes the fast path");
+        history.push(d.clone());
+        assert_eq!(fast, rebuilt_entry(&descriptor, &history));
+        assert_eq!(fast.worker_batch_id, Some(b.batch_id()));
+        assert_eq!(fast.edge_batch_id, Some(b.batch_id()));
+        assert_eq!(fast.global_batch_id, Some(a.batch_id()));
+    }
+
+    #[test]
+    fn history_fastpath_clears_pointers_when_confirmed_row_tops_unconfirmed_chain() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = user_descriptor();
+        let a = root_batch(
+            &descriptor,
+            &[Value::Text("v1".into()), Value::Boolean(false)],
+            10,
+            None,
+        );
+        let b = serial_batch(
+            &a,
+            &descriptor,
+            &[Value::Text("v2".into()), Value::Boolean(true)],
+            20,
+            None,
+        );
+        let previous = rebuilt_entry(&descriptor, &[a.clone(), b.clone()]);
+
+        // No older batch is confirmed anywhere (provably empty tier sets), so
+        // a globally confirmed new row satisfies every tier itself: all three
+        // pointers must be None, matching the full rebuild.
+        let c = serial_batch(
+            &b,
+            &descriptor,
+            &[Value::Text("v3".into()), Value::Boolean(false)],
+            30,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let fast = try_serial_fastpath_entry(Some(&previous), &c)
+            .expect("confirmed row over an unconfirmed chain takes the fast path");
+        assert_eq!(fast, rebuilt_entry(&descriptor, &[a, b, c]));
+        assert_eq!(fast.worker_batch_id, None);
+        assert_eq!(fast.edge_batch_id, None);
+        assert_eq!(fast.global_batch_id, None);
+    }
+
+    #[test]
+    fn history_fastpath_declines_tier_confirmed_row_over_tier_hole() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = RowDescriptor::new(vec![
+            ColumnDescriptor::new("title", ColumnType::Text),
+            ColumnDescriptor::new("count", ColumnType::Integer)
+                .merge_strategy(ColumnMergeStrategy::Counter),
+            ColumnDescriptor::new(
+                "tags",
+                ColumnType::Array {
+                    element: Box::new(ColumnType::Text),
+                },
+            )
+            .merge_strategy(ColumnMergeStrategy::GSet),
+        ]);
+        // r2 is a tier hole: it never got confirmed, so r1 stays a concurrent
+        // tip of every tier-filtered frontier even though the chain is linear.
+        // The previous entry is still "clean" (no pointers, no ordinals)
+        // because the r1/r3 tier merge coincidentally equals r3 (zero counter
+        // delta, tag subset) — which is exactly why cleanliness of the entry
+        // cannot prove hole-freedom.
+        let r1 = root_batch(
+            &descriptor,
+            &[
+                Value::Text("r1".into()),
+                Value::Integer(0),
+                Value::Array(vec![Value::Text("red".into())]),
+            ],
+            10,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let r2 = serial_batch(
+            &r1,
+            &descriptor,
+            &[
+                Value::Text("r2".into()),
+                Value::Integer(0),
+                Value::Array(vec![Value::Text("red".into())]),
+            ],
+            20,
+            None,
+        );
+        let r3 = serial_batch(
+            &r2,
+            &descriptor,
+            &[
+                Value::Text("r3".into()),
+                Value::Integer(5),
+                Value::Array(vec![Value::Text("blue".into()), Value::Text("red".into())]),
+            ],
+            30,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let previous = rebuilt_entry(&descriptor, &[r1.clone(), r2.clone(), r3.clone()]);
+        assert_eq!(previous.worker_batch_id, None);
+        assert_eq!(previous.global_batch_id, None);
+        assert!(previous.winner_batch_pool.is_empty());
+        assert_eq!(previous.global_winner_ordinals, None);
+
+        // A new globally confirmed row over a tier that already had satisfying
+        // rows must decline: the rebuild resurfaces r1 as a concurrent tier
+        // tip and stores a merged tier preview (populated pool/ordinals) that
+        // is not derivable from the previous entry. A design-literal
+        // "row satisfies tier ⇒ pointer None" fast entry would diverge here.
+        let c = serial_batch(
+            &r3,
+            &descriptor,
+            &[
+                Value::Text("c".into()),
+                Value::Integer(7),
+                Value::Array(vec![Value::Text("green".into())]),
+            ],
+            40,
+            Some(DurabilityTier::GlobalServer),
+        );
+        assert_eq!(try_serial_fastpath_entry(Some(&previous), &c), None);
+
+        let rebuilt = rebuilt_entry(&descriptor, &[r1, r2, r3, c.clone()]);
+        assert_eq!(rebuilt.global_batch_id, Some(c.batch_id()));
+        assert!(rebuilt.global_winner_ordinals.is_some());
+        assert!(!rebuilt.winner_batch_pool.is_empty());
+    }
+
+    #[test]
+    fn history_fastpath_requires_exact_frontier_coverage() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = user_descriptor();
+        let base = root_batch(
+            &descriptor,
+            &[Value::Text("task".into()), Value::Boolean(false)],
+            10,
+            Some(DurabilityTier::Local),
+        );
+        let left = serial_batch(
+            &base,
+            &descriptor,
+            &[Value::Text("left-title".into()), Value::Boolean(false)],
+            20,
+            Some(DurabilityTier::Local),
+        );
+        let right = serial_batch(
+            &base,
+            &descriptor,
+            &[Value::Text("task".into()), Value::Boolean(true)],
+            21,
+            Some(DurabilityTier::Local),
+        );
+        let previous = rebuilt_entry(&descriptor, &[base.clone(), left.clone(), right.clone()]);
+        assert_eq!(
+            previous.branch_frontier,
+            vec![left.batch_id(), right.batch_id()]
+        );
+        assert!(previous.current_winner_ordinals.is_some());
+
+        let extend = |parents: Vec<BatchId>| {
+            StoredRowBatch::new(
+                base.row_id,
+                "main",
+                parents,
+                encode_row(
+                    &descriptor,
+                    &[Value::Text("next".into()), Value::Boolean(true)],
+                )
+                .expect("encode extension row"),
+                RowProvenance::for_update(&base.row_provenance(), "carol".to_string(), 30),
+                HashMap::new(),
+                RowState::VisibleDirect,
+                None,
+            )
+        };
+
+        // Single-parent append on a two-tip row: parents ⊂ frontier, decline.
+        assert_eq!(
+            try_serial_fastpath_entry(Some(&previous), &extend(vec![right.batch_id()])),
+            None
+        );
+        // Duplicate parents never count as covering the frontier.
+        assert_eq!(
+            try_serial_fastpath_entry(
+                Some(&previous),
+                &extend(vec![right.batch_id(), right.batch_id()])
+            ),
+            None
+        );
+        // An explicit merge-commit naming every tip passes the set-equality
+        // guard, but a live two-tip row carries merged-preview pool/ordinals
+        // from its concurrent state, so the never-forked guard declines — in
+        // practice merge-commits take the full path.
+        assert_eq!(
+            try_serial_fastpath_entry(
+                Some(&previous),
+                &extend(vec![left.batch_id(), right.batch_id()])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn history_fastpath_declines_staging_delete_and_cross_branch_writes() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = user_descriptor();
+        let a = root_batch(
+            &descriptor,
+            &[Value::Text("v1".into()), Value::Boolean(false)],
+            10,
+            None,
+        );
+        let b = serial_batch(
+            &a,
+            &descriptor,
+            &[Value::Text("v2".into()), Value::Boolean(true)],
+            20,
+            None,
+        );
+        let previous = rebuilt_entry(&descriptor, &[a.clone(), b.clone()]);
+
+        // StagingPending must never become `current_row` through a shortcut:
+        // it contributes nothing to the frontier, and shortcutting it would
+        // make a staged batch publicly visible (supersede logic also stays on
+        // the full path by construction).
+        let mut staged = serial_batch(
+            &b,
+            &descriptor,
+            &[Value::Text("staged".into()), Value::Boolean(false)],
+            30,
+            None,
+        );
+        staged.state = RowState::StagingPending;
+        assert_eq!(try_serial_fastpath_entry(Some(&previous), &staged), None);
+
+        let mut rejected = staged.clone();
+        rejected.state = RowState::Rejected;
+        assert_eq!(try_serial_fastpath_entry(Some(&previous), &rejected), None);
+
+        // Deletes interact with the delete-winner preview overlay: full path.
+        let soft_delete = StoredRowBatch::new(
+            a.row_id,
+            "main",
+            vec![b.batch_id()],
+            encode_row(
+                &descriptor,
+                &[Value::Text("gone".into()), Value::Boolean(false)],
+            )
+            .expect("encode delete row"),
+            RowProvenance::for_update(&a.row_provenance(), "carol".to_string(), 31),
+            HashMap::from([(MetadataKey::Delete.to_string(), "soft".to_string())]),
+            RowState::VisibleDirect,
+            None,
+        );
+        assert_eq!(
+            try_serial_fastpath_entry(Some(&previous), &soft_delete),
+            None
+        );
+
+        // Writes on another branch never consult this branch's entry.
+        let mut cross_branch = serial_batch(
+            &b,
+            &descriptor,
+            &[Value::Text("branched".into()), Value::Boolean(true)],
+            32,
+            None,
+        );
+        cross_branch.branch =
+            crate::query_manager::types::SharedString::from("feature".to_string());
+        assert_eq!(
+            try_serial_fastpath_entry(Some(&previous), &cross_branch),
+            None
+        );
+
+        // Without a previous entry there is nothing to carry forward.
+        let fresh = serial_batch(
+            &b,
+            &descriptor,
+            &[Value::Text("fresh".into()), Value::Boolean(true)],
+            33,
+            None,
+        );
+        assert_eq!(try_serial_fastpath_entry(None, &fresh), None);
+    }
+
+    #[test]
+    fn history_fastpath_declines_linear_extension_after_resolved_fork_with_live_preview() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = counter_descriptor();
+        let base = root_batch(
+            &descriptor,
+            &[Value::Text("task".into()), Value::Integer(5)],
+            10,
+            Some(DurabilityTier::EdgeServer),
+        );
+        let left = serial_batch(
+            &base,
+            &descriptor,
+            &[Value::Text("task".into()), Value::Integer(7)],
+            20,
+            Some(DurabilityTier::EdgeServer),
+        );
+        let right = serial_batch(
+            &base,
+            &descriptor,
+            &[Value::Text("task".into()), Value::Integer(4)],
+            21,
+            Some(DurabilityTier::EdgeServer),
+        );
+        // The merge-commit resolves the fork on the unfiltered view, but the
+        // edge-tier preview still merges {left, right} concurrently (the merge
+        // commit is only Local-confirmed), keeping pool/ordinals live.
+        let merge = StoredRowBatch::new(
+            base.row_id,
+            "main",
+            vec![left.batch_id(), right.batch_id()],
+            encode_row(
+                &descriptor,
+                &[Value::Text("task".into()), Value::Integer(6)],
+            )
+            .expect("encode merge row"),
+            RowProvenance::for_update(&base.row_provenance(), "carol".to_string(), 30),
+            HashMap::new(),
+            RowState::VisibleDirect,
+            Some(DurabilityTier::Local),
+        );
+        let history = vec![base.clone(), left.clone(), right.clone(), merge.clone()];
+        let previous = rebuilt_entry(&descriptor, &history);
+        assert_eq!(previous.current_row.batch_id(), merge.batch_id());
+        assert_eq!(previous.branch_frontier, vec![merge.batch_id()]);
+        assert!(previous.edge_winner_ordinals.is_some());
+        assert!(!previous.winner_batch_pool.is_empty());
+
+        // Linear extension over the resolved fork: guards 1–5 pass, the
+        // never-forked guard declines, and the full path keeps the live
+        // merged tier preview intact.
+        let c = serial_batch(
+            &merge,
+            &descriptor,
+            &[Value::Text("task".into()), Value::Integer(6)],
+            40,
+            None,
+        );
+        assert_eq!(try_serial_fastpath_entry(Some(&previous), &c), None);
+
+        let mut extended = history;
+        extended.push(c.clone());
+        let rebuilt = rebuilt_entry(&descriptor, &extended);
+        assert_eq!(rebuilt.current_row.batch_id(), c.batch_id());
+        assert_eq!(rebuilt.worker_batch_id, Some(merge.batch_id()));
+        assert!(rebuilt.edge_winner_ordinals.is_some());
+        assert_eq!(rebuilt.winner_batch_pool, previous.winner_batch_pool);
+    }
+
+    #[test]
+    fn history_fastpath_serial_appends_through_storage_hit_and_match_rebuild() {
+        let table = "fastpath_docs";
+        let descriptor = user_descriptor();
+        let schema: Schema = [(TableName::new(table), TableSchema::new(descriptor.clone()))]
+            .into_iter()
+            .collect();
+        let mut storage = MemoryStorage::new();
+        let schema_hash = crate::test_support::persist_test_schema(&mut storage, &schema);
+        let branch = BranchName::new("main");
+
+        let root = root_batch(
+            &descriptor,
+            &[Value::Text("v0".into()), Value::Boolean(false)],
+            10,
+            None,
+        );
+        let row_id = root.row_id;
+        storage
+            .put_row_locator(
+                row_id,
+                Some(&RowLocator {
+                    table: table.into(),
+                    origin_schema_hash: Some(schema_hash),
+                }),
+            )
+            .expect("row locator should persist");
+
+        let assert_stored_matches_rebuild = |storage: &MemoryStorage| {
+            let history = storage
+                .scan_history_region(table, "main", HistoryScan::Row { row_id })
+                .expect("scan history");
+            let expected = VisibleRowEntry::rebuild_with_descriptor(&descriptor, &history)
+                .expect("rebuild entry")
+                .expect("visible entry present");
+            let stored = storage
+                .load_visible_region_entry(table, "main", row_id)
+                .expect("load stored entry")
+                .expect("stored entry present");
+            assert_eq!(stored, expected, "stored entry diverges from rebuild");
+        };
+
+        // Fast path forced ON: every serial append after the first must hit,
+        // and the stored entry must stay byte-equal to the full rebuild.
+        let mut prev = root.clone();
+        {
+            let _mode = force_history_fastpath(true);
+            let hits_before = HISTORY_FASTPATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            apply_row_batch(&mut storage, row_id, &branch, root, &[]).expect("apply root");
+            for i in 0..6u64 {
+                let next = serial_batch(
+                    &prev,
+                    &descriptor,
+                    &[
+                        Value::Text(format!("v{}", i + 1)),
+                        Value::Boolean(i % 2 == 0),
+                    ],
+                    20 + 10 * i,
+                    None,
+                );
+                apply_row_batch(&mut storage, row_id, &branch, next.clone(), &[])
+                    .expect("apply serial append");
+                assert_stored_matches_rebuild(&storage);
+                prev = next;
+            }
+            let hits_after = HISTORY_FASTPATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                hits_after >= hits_before + 6,
+                "expected all 6 serial appends to take the fast path \
+                 (hits before {hits_before}, after {hits_after})"
+            );
+        }
+
+        // Kill switch (forced OFF): same writes, same stored bytes.
+        {
+            let _mode = force_history_fastpath(false);
+            for i in 0..3u64 {
+                let next = serial_batch(
+                    &prev,
+                    &descriptor,
+                    &[Value::Text(format!("off{i}")), Value::Boolean(i % 2 == 1)],
+                    100 + 10 * i,
+                    None,
+                );
+                apply_row_batch(&mut storage, row_id, &branch, next.clone(), &[])
+                    .expect("apply serial append with fast path off");
+                assert_stored_matches_rebuild(&storage);
+                prev = next;
+            }
+        }
     }
 
     #[test]

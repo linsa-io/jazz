@@ -42,8 +42,9 @@ use crate::query_manager::types::{
 };
 use crate::row_format::encode_row;
 use crate::row_histories::{
-    BatchId, HistoryScan, RowState, StoredRowBatch, VisibleRowEntry, apply_row_batch,
-    decode_flat_visible_row_entry, encode_flat_visible_row_entry, patch_row_batch_state,
+    BatchId, HISTORY_FASTPATH_HITS, HistoryScan, RowState, StoredRowBatch, VisibleRowEntry,
+    apply_row_batch, decode_flat_visible_row_entry, encode_flat_visible_row_entry,
+    force_history_fastpath, patch_row_batch_state,
 };
 use crate::storage::{RowLocator, Storage};
 use crate::sync_manager::DurabilityTier;
@@ -72,9 +73,28 @@ const TIERS: [DurabilityTier; 3] = [
 ];
 
 /// Entry point invoked by `storage_conformance_tests!` for every backend.
+///
+/// Dual run: the invariant must hold with the serial-write fast path enabled
+/// (the default — this is the direct equivalence proof for the fast path) AND
+/// with it disabled (pins the full path unchanged). The forced-mode guard
+/// also serialises differential runs across backends so their overrides never
+/// interleave.
 pub fn test_visible_entry_differential_random_ops(factory: &dyn Fn() -> Box<dyn Storage>) {
-    for seed in SEEDS {
-        SeedRun::new(factory(), seed).run();
+    use std::sync::atomic::Ordering;
+
+    for fastpath_enabled in [true, false] {
+        let _mode = force_history_fastpath(fastpath_enabled);
+        let hits_before = HISTORY_FASTPATH_HITS.load(Ordering::Relaxed);
+        for seed in SEEDS {
+            SeedRun::new(factory(), seed).run();
+        }
+        if fastpath_enabled {
+            assert!(
+                HISTORY_FASTPATH_HITS.load(Ordering::Relaxed) > hits_before,
+                "differential run with the fast path enabled never took it — \
+                 the equivalence check would prove nothing"
+            );
+        }
     }
 }
 

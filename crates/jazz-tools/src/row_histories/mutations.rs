@@ -14,11 +14,16 @@
 //! Pure visibility/merge math lives in [`super::resolution`]; this module
 //! only orchestrates: load → mutate → recompute → write.
 
+use std::sync::atomic::Ordering;
+
 use crate::object::{BranchName, ObjectId};
 use crate::query_manager::types::{RowDescriptor, SharedString};
 use crate::storage::{IndexMutation, PreparedRowWriteContext, RowLocator, Storage, StorageError};
 use crate::sync_manager::DurabilityTier;
 
+use super::fastpath::{
+    HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS, try_serial_fastpath_entry,
+};
 use super::resolution::visible_entry_from_history_rows;
 use super::types::{
     ApplyRowBatchResult, BatchId, HistoryScan, RowHistoryError, RowState, RowVisibilityChange,
@@ -241,33 +246,56 @@ pub(crate) fn apply_row_batch_with_context<H: Storage>(
             )))
         })?
     } else {
-        let mut patched_history = load_branch_history(io, &table, object_id, &branch)?;
-
-        if let Some(existing_row) = io
+        // Point lookup first: an identical already-applied batch is an
+        // idempotent no-op; the same batch id with different content is an
+        // in-place replace and always takes the full path.
+        let existing_row = io
             .load_history_row_batch(&table, branch_name.as_str(), object_id, batch_id)
-            .map_err(RowHistoryError::StorageError)?
-            && existing_row == row
-        {
+            .map_err(RowHistoryError::StorageError)?;
+        if existing_row.as_ref() == Some(&row) {
             return Ok(ApplyRowBatchResult {
                 batch_id,
                 row_locator,
                 visibility_change: None,
             });
         }
-        if let Some(existing) = patched_history
-            .iter_mut()
-            .find(|candidate| candidate.batch_id() == batch_id)
-        {
-            *existing = row.clone();
+
+        let fast_entry = if existing_row.is_none() {
+            try_serial_fastpath_entry(previous_entry.as_ref(), &row)
         } else {
-            patched_history.push(row.clone());
+            None
+        };
+        // Telemetry over the population the fast path targets (previous entry
+        // present, incoming row visible) so fallbacks measure real misses, not
+        // staging or first-write traffic.
+        if previous_entry.is_some() && row.state.is_visible() {
+            let counter = if fast_entry.is_some() {
+                &HISTORY_FASTPATH_HITS
+            } else {
+                &HISTORY_FASTPATH_FALLBACKS
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
         }
-        visible_entry_from_history_rows(context.user_descriptor().as_ref(), &patched_history)
-            .map_err(|err| {
-                RowHistoryError::StorageError(StorageError::IoError(format!(
-                    "rebuild visible entry after append: {err}"
-                )))
-            })?
+
+        if let Some(entry) = fast_entry {
+            Some(entry)
+        } else {
+            let mut patched_history = load_branch_history(io, &table, object_id, &branch)?;
+            if let Some(existing) = patched_history
+                .iter_mut()
+                .find(|candidate| candidate.batch_id() == batch_id)
+            {
+                *existing = row.clone();
+            } else {
+                patched_history.push(row.clone());
+            }
+            visible_entry_from_history_rows(context.user_descriptor().as_ref(), &patched_history)
+                .map_err(|err| {
+                    RowHistoryError::StorageError(StorageError::IoError(format!(
+                        "rebuild visible entry after append: {err}"
+                    )))
+                })?
+        }
     };
     let current_visible = current_entry
         .as_ref()
