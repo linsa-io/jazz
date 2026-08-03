@@ -42,8 +42,8 @@ use crate::query_manager::types::{
 };
 use crate::row_format::encode_row;
 use crate::row_histories::{
-    BatchId, HISTORY_FASTPATH_HITS, HistoryScan, RowState, StoredRowBatch, VisibleRowEntry,
-    apply_row_batch, decode_flat_visible_row_entry, encode_flat_visible_row_entry,
+    BatchId, HISTORY_FASTPATH_HITS, HistoryScan, PATCH_FASTPATH_HITS, RowState, StoredRowBatch,
+    VisibleRowEntry, apply_row_batch, decode_flat_visible_row_entry, encode_flat_visible_row_entry,
     force_history_fastpath, patch_row_batch_state,
 };
 use crate::storage::{RowLocator, Storage};
@@ -84,15 +84,21 @@ pub fn test_visible_entry_differential_random_ops(factory: &dyn Fn() -> Box<dyn 
 
     for fastpath_enabled in [true, false] {
         let _mode = force_history_fastpath(fastpath_enabled);
-        let hits_before = HISTORY_FASTPATH_HITS.load(Ordering::Relaxed);
+        let apply_hits_before = HISTORY_FASTPATH_HITS.load(Ordering::Relaxed);
+        let patch_hits_before = PATCH_FASTPATH_HITS.load(Ordering::Relaxed);
         for seed in SEEDS {
             SeedRun::new(factory(), seed).run();
         }
         if fastpath_enabled {
             assert!(
-                HISTORY_FASTPATH_HITS.load(Ordering::Relaxed) > hits_before,
-                "differential run with the fast path enabled never took it — \
-                 the equivalence check would prove nothing"
+                HISTORY_FASTPATH_HITS.load(Ordering::Relaxed) > apply_hits_before,
+                "differential run with the fast path enabled never took the \
+                 apply fast path — the equivalence check would prove nothing"
+            );
+            assert!(
+                PATCH_FASTPATH_HITS.load(Ordering::Relaxed) > patch_hits_before,
+                "differential run with the fast path enabled never took the \
+                 patch fast path — the equivalence check would prove nothing"
             );
         }
     }

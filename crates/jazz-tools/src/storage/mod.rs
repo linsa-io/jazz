@@ -2399,6 +2399,14 @@ pub(crate) fn patch_row_region_rows_by_batch_with_storage<H: Storage + ?Sized>(
     Ok(())
 }
 
+/// Full-scan patch variant, deliberately WITHOUT the fast paths of its hot
+/// sibling `row_histories::patch_row_batch_state`: its only production
+/// reachability is `MemoryStorage::patch_exact_row_batch_for_schema_hash` ←
+/// `runtime_core/ticks.rs` local-batch rejection cleanup, and `→ Rejected`
+/// transitions are always-full-path by design even on the hot sibling
+/// (removing a batch from the visible set can expose a hidden ancestor as
+/// the new winner). If a visible-preserving caller ever appears here, port
+/// the fast-path routing from `patch_row_batch_state`.
 pub(crate) fn patch_exact_row_batch_with_storage<H: Storage + ?Sized>(
     storage: &mut H,
     table: &str,

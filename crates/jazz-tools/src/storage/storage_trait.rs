@@ -1411,6 +1411,14 @@ pub trait Storage {
             .is_some())
     }
 
+    /// Full-scan patch variant, deliberately WITHOUT the fast paths of its
+    /// hot sibling `row_histories::patch_row_batch_state`: every production
+    /// caller (`runtime_core/ticks.rs` local-batch rejection cleanup) patches
+    /// `→ Rejected`, which is always-full-path by design even on the hot
+    /// sibling — removing a batch from the visible set can expose a hidden
+    /// ancestor as the new winner. If a visible-preserving caller ever
+    /// appears here, port the fast-path routing from
+    /// `patch_row_batch_state`.
     #[allow(clippy::too_many_arguments)]
     fn patch_exact_row_batch_for_schema_hash(
         &mut self,

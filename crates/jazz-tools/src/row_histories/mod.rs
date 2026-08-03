@@ -32,7 +32,10 @@ pub use codecs::{
     encode_flat_history_row, encode_flat_visible_row_entry, history_row_physical_descriptor,
     visible_row_physical_descriptor,
 };
-pub use fastpath::{HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS, history_fastpath_enabled};
+pub use fastpath::{
+    HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS, PATCH_FASTPATH_FALLBACKS,
+    PATCH_FASTPATH_HITS, history_fastpath_enabled,
+};
 #[cfg(any(test, feature = "test"))]
 pub use fastpath::{HistoryFastpathMode, force_history_fastpath};
 pub(crate) use mutations::{ApplyRowBatchWithContext, apply_row_batch_with_context};
@@ -49,7 +52,7 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::fastpath::try_serial_fastpath_entry;
+    use super::fastpath::{try_in_place_tip_update_entry, try_serial_fastpath_entry};
     use super::*;
     use crate::metadata::{DeleteKind, MetadataKey, RowProvenance};
     use crate::object::{BranchName, ObjectId};
@@ -1701,6 +1704,488 @@ mod tests {
                 prev = next;
             }
         }
+    }
+
+    // ─── in-place / patch fast paths ────────────────────────────────────────
+    //
+    // Fixtures for `fastpath::try_in_place_tip_update_entry` and the routing
+    // in `patch_row_batch_state`. Same bar as the serial fixtures: a fast
+    // entry must equal the full rebuild byte for byte, every unprovable shape
+    // must decline, and `→ Rejected` must always take the full path.
+
+    #[test]
+    fn in_place_fastpath_tier_confirmation_matches_full_rebuild() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = user_descriptor();
+        let a = root_batch(
+            &descriptor,
+            &[Value::Text("v1".into()), Value::Boolean(false)],
+            10,
+            None,
+        );
+        let b = serial_batch(
+            &a,
+            &descriptor,
+            &[Value::Text("v2".into()), Value::Boolean(true)],
+            20,
+            None,
+        );
+        let previous = rebuilt_entry(&descriptor, &[a.clone(), b.clone()]);
+        assert_eq!(previous.worker_batch_id, None);
+        assert_eq!(previous.edge_batch_id, None);
+        assert_eq!(previous.global_batch_id, None);
+
+        // Tier confirmation of the tip over an all-unconfirmed chain: every
+        // tier set was provably empty (pointer None, old version
+        // unsatisfying), so the confirmed tip satisfies each tier itself.
+        let confirmed = b.accepted_transaction_output(DurabilityTier::GlobalServer);
+        let fast = try_in_place_tip_update_entry(Some(&previous), &b, &confirmed)
+            .expect("tier confirmation of the sole tip takes the in-place fast path");
+        assert_eq!(
+            fast,
+            rebuilt_entry(&descriptor, &[a.clone(), confirmed.clone()])
+        );
+        assert_eq!(fast.branch_frontier, vec![b.batch_id()]);
+        assert_eq!(fast.worker_batch_id, None);
+        assert_eq!(fast.edge_batch_id, None);
+        assert_eq!(fast.global_batch_id, None);
+
+        // Next serial append re-arms the pointers (Fix A carry), and the
+        // following confirmation must DECLINE: a `Some` pointer cannot prove
+        // the tier set holds no hole-hidden concurrent tips, even though the
+        // full rebuild happens to resolve back to None here.
+        let c = serial_batch(
+            &confirmed,
+            &descriptor,
+            &[Value::Text("v3".into()), Value::Boolean(false)],
+            30,
+            None,
+        );
+        let previous = rebuilt_entry(&descriptor, &[a.clone(), confirmed.clone(), c.clone()]);
+        assert_eq!(previous.worker_batch_id, Some(b.batch_id()));
+        assert_eq!(previous.global_batch_id, Some(b.batch_id()));
+
+        let confirmed_c = c.accepted_transaction_output(DurabilityTier::GlobalServer);
+        assert_eq!(
+            try_in_place_tip_update_entry(Some(&previous), &c, &confirmed_c),
+            None
+        );
+        let full = rebuilt_entry(&descriptor, &[a, confirmed, confirmed_c.clone()]);
+        assert_eq!(full.current_row, confirmed_c);
+        assert_eq!(full.global_batch_id, None);
+    }
+
+    #[test]
+    fn in_place_fastpath_carries_pointers_when_tier_membership_unchanged() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = user_descriptor();
+        let a = root_batch(
+            &descriptor,
+            &[Value::Text("v1".into()), Value::Boolean(false)],
+            10,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let b = serial_batch(
+            &a,
+            &descriptor,
+            &[Value::Text("v2".into()), Value::Boolean(true)],
+            20,
+            Some(DurabilityTier::Local),
+        );
+        let previous = rebuilt_entry(&descriptor, &[a.clone(), b.clone()]);
+        assert_eq!(previous.worker_batch_id, None);
+        assert_eq!(previous.edge_batch_id, Some(a.batch_id()));
+        assert_eq!(previous.global_batch_id, Some(a.batch_id()));
+
+        // Same-tier re-confirmation (state VisibleDirect → VisibleTransactional,
+        // tier unchanged): membership is unchanged for every tier, so all
+        // pointers carry verbatim — including the deep `Some(a)` ones.
+        let flipped = b.accepted_transaction_output(DurabilityTier::Local);
+        assert!(flipped.state != b.state, "state must actually change");
+        let fast = try_in_place_tip_update_entry(Some(&previous), &b, &flipped)
+            .expect("membership-preserving state flip takes the in-place fast path");
+        assert_eq!(fast, rebuilt_entry(&descriptor, &[a.clone(), flipped]));
+        assert_eq!(fast.worker_batch_id, None);
+        assert_eq!(fast.edge_batch_id, Some(a.batch_id()));
+        assert_eq!(fast.global_batch_id, Some(a.batch_id()));
+    }
+
+    #[test]
+    fn in_place_fastpath_declines_tier_confirmation_over_tier_hole() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = counter_descriptor();
+        // r2 is a tier hole: confirming r3 makes the global-filtered frontier
+        // {r1, r3} (r3's parent r2 is not in the tier set, so r1 resurfaces),
+        // and the counter delta forces a REAL merged preview with
+        // pool/ordinals — the concrete divergence an in-place claim (pointer
+        // None or carried Some(r1)) would produce.
+        let r1 = root_batch(
+            &descriptor,
+            &[Value::Text("task".into()), Value::Integer(2)],
+            10,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let r2 = serial_batch(
+            &r1,
+            &descriptor,
+            &[Value::Text("task".into()), Value::Integer(5)],
+            20,
+            None,
+        );
+        let r3 = serial_batch(
+            &r2,
+            &descriptor,
+            &[Value::Text("task".into()), Value::Integer(7)],
+            30,
+            None,
+        );
+        let previous = rebuilt_entry(&descriptor, &[r1.clone(), r2.clone(), r3.clone()]);
+        assert_eq!(previous.global_batch_id, Some(r1.batch_id()));
+        assert_eq!(previous.global_winner_ordinals, None);
+        assert!(previous.winner_batch_pool.is_empty());
+
+        let confirmed = r3.accepted_transaction_output(DurabilityTier::GlobalServer);
+        assert_eq!(
+            try_in_place_tip_update_entry(Some(&previous), &r3, &confirmed),
+            None
+        );
+
+        let full = rebuilt_entry(&descriptor, &[r1, r2, confirmed]);
+        assert!(
+            full.global_winner_ordinals.is_some(),
+            "the rebuild needs a merged global preview: {full:?}"
+        );
+        assert!(!full.winner_batch_pool.is_empty());
+    }
+
+    #[test]
+    fn in_place_fastpath_declines_non_tip_forked_lowered_and_content_shapes() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = user_descriptor();
+        let a = root_batch(
+            &descriptor,
+            &[Value::Text("v1".into()), Value::Boolean(false)],
+            10,
+            None,
+        );
+        let b = serial_batch(
+            &a,
+            &descriptor,
+            &[Value::Text("v2".into()), Value::Boolean(true)],
+            20,
+            None,
+        );
+        let previous = rebuilt_entry(&descriptor, &[a.clone(), b.clone()]);
+
+        // Confirming a NON-tip batch: the frontier guard declines.
+        let confirmed_a = a.accepted_transaction_output(DurabilityTier::GlobalServer);
+        assert_eq!(
+            try_in_place_tip_update_entry(Some(&previous), &a, &confirmed_a),
+            None
+        );
+
+        // Content changed beyond state/tier: declines even on the tip.
+        let mut retitled = b.accepted_transaction_output(DurabilityTier::GlobalServer);
+        retitled.data = encode_row(
+            &descriptor,
+            &[Value::Text("rewritten".into()), Value::Boolean(true)],
+        )
+        .expect("encode replacement row")
+        .into();
+        assert_eq!(
+            try_in_place_tip_update_entry(Some(&previous), &b, &retitled),
+            None
+        );
+
+        // Visible → invisible and invisible → visible are other paths'
+        // business (full path and publish fast path respectively).
+        let mut rejected = b.clone();
+        rejected.state = RowState::Rejected;
+        assert_eq!(
+            try_in_place_tip_update_entry(Some(&previous), &b, &rejected),
+            None
+        );
+        let mut staged_existing = b.clone();
+        staged_existing.state = RowState::StagingPending;
+        assert_eq!(
+            try_in_place_tip_update_entry(Some(&previous), &staged_existing, &b),
+            None
+        );
+
+        // Tier LOWERING (leaves the tier set): a removal event — declines.
+        let mut b_global = b.clone();
+        b_global.confirmed_tier = Some(DurabilityTier::GlobalServer);
+        let mut b_edge = b.clone();
+        b_edge.confirmed_tier = Some(DurabilityTier::EdgeServer);
+        let previous_global = rebuilt_entry(&descriptor, &[a.clone(), b_global.clone()]);
+        assert_eq!(
+            try_in_place_tip_update_entry(Some(&previous_global), &b_global, &b_edge),
+            None
+        );
+
+        // Without a previous entry there is nothing to update in place.
+        let confirmed_b = b.accepted_transaction_output(DurabilityTier::GlobalServer);
+        assert_eq!(try_in_place_tip_update_entry(None, &b, &confirmed_b), None);
+
+        // A forked (two-tip) entry declines via the frontier guard.
+        let left = serial_batch(
+            &a,
+            &descriptor,
+            &[Value::Text("left".into()), Value::Boolean(false)],
+            21,
+            None,
+        );
+        let forked = rebuilt_entry(&descriptor, &[a, b.clone(), left]);
+        assert_eq!(forked.branch_frontier.len(), 2);
+        assert_eq!(
+            try_in_place_tip_update_entry(Some(&forked), &b, &confirmed_b),
+            None
+        );
+    }
+
+    #[test]
+    fn patch_fastpath_staging_publish_and_tier_bump_hit_through_storage() {
+        let _mode = force_history_fastpath(true);
+        let table = "patch_fastpath_docs";
+        let descriptor = user_descriptor();
+        let schema: Schema = [(TableName::new(table), TableSchema::new(descriptor.clone()))]
+            .into_iter()
+            .collect();
+        let mut storage = MemoryStorage::new();
+        let schema_hash = crate::test_support::persist_test_schema(&mut storage, &schema);
+        let branch = BranchName::new("main");
+
+        let root = root_batch(
+            &descriptor,
+            &[Value::Text("v0".into()), Value::Boolean(false)],
+            10,
+            None,
+        );
+        let row_id = root.row_id;
+        storage
+            .put_row_locator(
+                row_id,
+                Some(&RowLocator {
+                    table: table.into(),
+                    origin_schema_hash: Some(schema_hash),
+                }),
+            )
+            .expect("row locator should persist");
+        apply_row_batch(&mut storage, row_id, &branch, root.clone(), &[]).expect("apply root");
+
+        let assert_stored_matches_rebuild = |storage: &MemoryStorage| {
+            let history = storage
+                .scan_history_region(table, "main", HistoryScan::Row { row_id })
+                .expect("scan history");
+            let expected = VisibleRowEntry::rebuild_with_descriptor(&descriptor, &history)
+                .expect("rebuild entry")
+                .expect("visible entry present");
+            let stored = storage
+                .load_visible_region_entry(table, "main", row_id)
+                .expect("load stored entry")
+                .expect("stored entry present");
+            assert_eq!(stored, expected, "stored entry diverges from rebuild");
+            expected
+        };
+
+        let mut staged = serial_batch(
+            &root,
+            &descriptor,
+            &[Value::Text("staged".into()), Value::Boolean(true)],
+            20,
+            None,
+        );
+        staged.state = RowState::StagingPending;
+        apply_row_batch(&mut storage, row_id, &branch, staged.clone(), &[]).expect("apply staged");
+
+        use std::sync::atomic::Ordering;
+        let hits_before = PATCH_FASTPATH_HITS.load(Ordering::Relaxed);
+        let fallbacks_before = PATCH_FASTPATH_FALLBACKS.load(Ordering::Relaxed);
+
+        // Staging publish (`runtime_core/writes.rs` shape): parents cover the
+        // frontier, never-forked ⇒ the publish rides the domination fast path.
+        let change = patch_row_batch_state(
+            &mut storage,
+            row_id,
+            &branch,
+            staged.batch_id(),
+            Some(RowState::VisibleDirect),
+            None,
+        )
+        .expect("publish staged batch")
+        .expect("publish changes visibility");
+        assert_eq!(change.row.batch_id(), staged.batch_id());
+        let entry = assert_stored_matches_rebuild(&storage);
+        assert_eq!(entry.current_row.batch_id(), staged.batch_id());
+        assert_eq!(entry.branch_frontier, vec![staged.batch_id()]);
+
+        // Pure tier bump on the (now published) tip: the in-place fast path.
+        patch_row_batch_state(
+            &mut storage,
+            row_id,
+            &branch,
+            staged.batch_id(),
+            None,
+            Some(DurabilityTier::GlobalServer),
+        )
+        .expect("tier bump on tip");
+        let entry = assert_stored_matches_rebuild(&storage);
+        assert_eq!(
+            entry.current_row.confirmed_tier,
+            Some(DurabilityTier::GlobalServer)
+        );
+        assert_eq!(entry.worker_batch_id, None);
+        assert_eq!(entry.global_batch_id, None);
+
+        assert_eq!(
+            PATCH_FASTPATH_HITS.load(Ordering::Relaxed),
+            hits_before + 2,
+            "publish and tier bump should both hit the patch fast path"
+        );
+        assert_eq!(
+            PATCH_FASTPATH_FALLBACKS.load(Ordering::Relaxed),
+            fallbacks_before
+        );
+
+        // Publish with a concurrent visible sibling: the flip IS a fork
+        // event — the fast path declines and the full path merges both tips.
+        let mut staged_two = serial_batch(
+            &staged,
+            &descriptor,
+            &[Value::Text("staged-two".into()), Value::Boolean(false)],
+            30,
+            None,
+        );
+        staged_two.state = RowState::StagingPending;
+        apply_row_batch(&mut storage, row_id, &branch, staged_two.clone(), &[])
+            .expect("apply second staged batch");
+        let sibling = serial_batch(
+            &staged,
+            &descriptor,
+            &[Value::Text("sibling".into()), Value::Boolean(true)],
+            31,
+            None,
+        );
+        apply_row_batch(&mut storage, row_id, &branch, sibling.clone(), &[])
+            .expect("apply visible sibling");
+
+        patch_row_batch_state(
+            &mut storage,
+            row_id,
+            &branch,
+            staged_two.batch_id(),
+            Some(RowState::VisibleDirect),
+            None,
+        )
+        .expect("publish staged batch with concurrent sibling");
+        let entry = assert_stored_matches_rebuild(&storage);
+        assert_eq!(entry.branch_frontier.len(), 2, "both tips must survive");
+        assert_eq!(
+            PATCH_FASTPATH_FALLBACKS.load(Ordering::Relaxed),
+            fallbacks_before + 1,
+            "the forked publish must fall back to the full path"
+        );
+    }
+
+    #[test]
+    fn patch_fastpath_rejection_of_sole_tip_reexposes_ancestor() {
+        let _mode = force_history_fastpath(true);
+        let table = "patch_reject_docs";
+        let descriptor = user_descriptor();
+        let schema: Schema = [(TableName::new(table), TableSchema::new(descriptor.clone()))]
+            .into_iter()
+            .collect();
+        let mut storage = MemoryStorage::new();
+        let schema_hash = crate::test_support::persist_test_schema(&mut storage, &schema);
+        let branch = BranchName::new("main");
+
+        let a = root_batch(
+            &descriptor,
+            &[Value::Text("v1".into()), Value::Boolean(false)],
+            10,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let row_id = a.row_id;
+        storage
+            .put_row_locator(
+                row_id,
+                Some(&RowLocator {
+                    table: table.into(),
+                    origin_schema_hash: Some(schema_hash),
+                }),
+            )
+            .expect("row locator should persist");
+        apply_row_batch(&mut storage, row_id, &branch, a.clone(), &[]).expect("apply a");
+        let b = serial_batch(
+            &a,
+            &descriptor,
+            &[Value::Text("v2".into()), Value::Boolean(true)],
+            20,
+            None,
+        );
+        apply_row_batch(&mut storage, row_id, &branch, b.clone(), &[]).expect("apply b");
+
+        use std::sync::atomic::Ordering;
+        let hits_before = PATCH_FASTPATH_HITS.load(Ordering::Relaxed);
+        let fallbacks_before = PATCH_FASTPATH_FALLBACKS.load(Ordering::Relaxed);
+
+        // Rejecting the sole frontier tip must take the full path and
+        // re-expose the superseded ancestor as the visible row.
+        let change = patch_row_batch_state(
+            &mut storage,
+            row_id,
+            &branch,
+            b.batch_id(),
+            Some(RowState::Rejected),
+            None,
+        )
+        .expect("reject tip")
+        .expect("rejection changes visibility");
+        assert_eq!(change.row.batch_id(), a.batch_id());
+        assert_eq!(
+            change.previous_row.as_ref().map(|row| row.batch_id()),
+            Some(b.batch_id())
+        );
+
+        let history = storage
+            .scan_history_region(table, "main", HistoryScan::Row { row_id })
+            .expect("scan history");
+        let expected = VisibleRowEntry::rebuild_with_descriptor(&descriptor, &history)
+            .expect("rebuild entry")
+            .expect("visible entry present");
+        let stored = storage
+            .load_visible_region_entry(table, "main", row_id)
+            .expect("load stored entry")
+            .expect("stored entry present");
+        assert_eq!(stored, expected);
+        assert_eq!(stored.current_row.batch_id(), a.batch_id());
+        assert_eq!(stored.branch_frontier, vec![a.batch_id()]);
+
+        // Rejections are full-path by design: not part of the fast-path
+        // population, so neither counter moves.
+        assert_eq!(PATCH_FASTPATH_HITS.load(Ordering::Relaxed), hits_before);
+        assert_eq!(
+            PATCH_FASTPATH_FALLBACKS.load(Ordering::Relaxed),
+            fallbacks_before
+        );
+
+        // Rejecting the re-exposed root empties the visible set entirely.
+        let change = patch_row_batch_state(
+            &mut storage,
+            row_id,
+            &branch,
+            a.batch_id(),
+            Some(RowState::Rejected),
+            None,
+        )
+        .expect("reject root");
+        assert_eq!(change, None);
+        assert_eq!(
+            storage
+                .load_visible_region_entry(table, "main", row_id)
+                .expect("load stored entry"),
+            None
+        );
     }
 
     #[test]

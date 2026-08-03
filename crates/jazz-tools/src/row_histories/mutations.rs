@@ -22,7 +22,8 @@ use crate::storage::{IndexMutation, PreparedRowWriteContext, RowLocator, Storage
 use crate::sync_manager::DurabilityTier;
 
 use super::fastpath::{
-    HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS, try_serial_fastpath_entry,
+    HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS, PATCH_FASTPATH_FALLBACKS,
+    PATCH_FASTPATH_HITS, try_in_place_tip_update_entry, try_serial_fastpath_entry,
 };
 use super::resolution::visible_entry_from_history_rows;
 use super::types::{
@@ -247,8 +248,7 @@ pub(crate) fn apply_row_batch_with_context<H: Storage>(
         })?
     } else {
         // Point lookup first: an identical already-applied batch is an
-        // idempotent no-op; the same batch id with different content is an
-        // in-place replace and always takes the full path.
+        // idempotent no-op.
         let existing_row = io
             .load_history_row_batch(&table, branch_name.as_str(), object_id, batch_id)
             .map_err(RowHistoryError::StorageError)?;
@@ -260,10 +260,26 @@ pub(crate) fn apply_row_batch_with_context<H: Storage>(
             });
         }
 
-        let fast_entry = if existing_row.is_none() {
-            try_serial_fastpath_entry(previous_entry.as_ref(), &row)
-        } else {
-            None
+        let fast_entry = match existing_row.as_ref() {
+            // Brand-new batch: the serial-append fast path.
+            None => try_serial_fastpath_entry(previous_entry.as_ref(), &row),
+            // Same batch id with different content — an in-place replace.
+            // Two provable re-apply shapes get a fast path; everything else
+            // takes the full path.
+            Some(existing) if !existing.state.is_visible() => {
+                // Publish-shaped re-apply (`DurableDirect` /
+                // `AcceptedTransaction` fates over a staged row): the stored
+                // version is invisible, so the previous entry is oblivious
+                // to this batch — replacing it with a visible row is the
+                // same domination event as inserting a fresh visible row.
+                try_serial_fastpath_entry(previous_entry.as_ref(), &row)
+            }
+            Some(existing) => {
+                // Visible → visible with only `state`/`confirmed_tier`
+                // changed (tier confirmations re-applied via
+                // `accepted_transaction_output`): in-place tip update.
+                try_in_place_tip_update_entry(previous_entry.as_ref(), existing, &row)
+            }
         };
         // Telemetry over the population the fast path targets (previous entry
         // present, incoming row visible) so fallbacks measure real misses, not
@@ -374,14 +390,14 @@ pub fn patch_row_batch_state<H: Storage>(
     let row_locator = row_locator_from_storage(io, object_id)?;
     let table = row_locator.table.to_string();
     let branch = SharedString::from(branch_name.as_str().to_string());
-    let mut patched_row = io
+    let original_row = io
         .load_history_row_batch(&table, branch_name.as_str(), object_id, batch_id)
         .map_err(RowHistoryError::StorageError)?
         .ok_or(RowHistoryError::ObjectNotFound(object_id))?;
-    if patched_row.branch.as_str() != branch_name.as_str() {
+    if original_row.branch.as_str() != branch_name.as_str() {
         return Ok(None);
     }
-    let context = crate::storage::resolve_history_row_write_context(io, &table, &patched_row)
+    let context = crate::storage::resolve_history_row_write_context(io, &table, &original_row)
         .map_err(RowHistoryError::StorageError)?;
     let previous_entry = load_previous_visible_entry(
         io,
@@ -394,6 +410,7 @@ pub fn patch_row_batch_state<H: Storage>(
         .as_ref()
         .map(|entry| entry.current_row.clone());
 
+    let mut patched_row = original_row.clone();
     if let Some(state) = state {
         patched_row.state = state;
     }
@@ -403,21 +420,60 @@ pub fn patch_row_batch_state<H: Storage>(
         (None, incoming) => incoming,
     };
 
-    let mut history_rows = load_branch_history(io, &table, object_id, &branch)?;
-    let Some(existing) = history_rows
-        .iter_mut()
-        .find(|candidate| candidate.batch_id() == batch_id)
-    else {
-        return Err(RowHistoryError::ObjectNotFound(object_id));
+    // Routing decision, in order:
+    // - Patched state NOT visible (`→ Rejected`, `→ Superseded` — including
+    //   any visible→non-visible flip): ALWAYS the full path. Removing a batch
+    //   from the visible set can expose a previously hidden ancestor as the
+    //   new winner, which no O(1) entry update can compute. First-class
+    //   invariant of the design, not an optimisation miss.
+    // - Previously invisible → now visible (staging publish after local
+    //   durability, `runtime_core/writes.rs`): a domination event over the
+    //   pre-flip frontier — identical math to inserting a fresh visible row,
+    //   shared with the serial-append fast path.
+    // - Visible → visible (pure `confirmed_tier` bump; no production caller
+    //   today): in-place tip update, provable only when the batch is the sole
+    //   frontier tip of a never-forked entry. A bump on a non-tip batch or on
+    //   a pooled merge contributor takes the full path (recomputing a merged
+    //   tier preview over the bounded `winner_batch_pool` is a possible
+    //   future refinement — design doc §5).
+    let fast_entry = if !patched_row.state.is_visible() {
+        None
+    } else if !original_row.state.is_visible() {
+        try_serial_fastpath_entry(previous_entry.as_ref(), &patched_row)
+    } else {
+        try_in_place_tip_update_entry(previous_entry.as_ref(), &original_row, &patched_row)
     };
-    *existing = patched_row.clone();
-    let patched_entry =
-        visible_entry_from_history_rows(context.user_descriptor().as_ref(), &history_rows)
-            .map_err(|err| {
+    // Telemetry over the population the patch fast paths target (previous
+    // entry present, PATCHED row visible). Transitions out of the visible set
+    // are full-path by design and deliberately not counted as fallbacks.
+    if previous_entry.is_some() && patched_row.state.is_visible() {
+        let counter = if fast_entry.is_some() {
+            &PATCH_FASTPATH_HITS
+        } else {
+            &PATCH_FASTPATH_FALLBACKS
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let patched_entry = if fast_entry.is_some() {
+        fast_entry
+    } else {
+        let mut history_rows = load_branch_history(io, &table, object_id, &branch)?;
+        let Some(existing) = history_rows
+            .iter_mut()
+            .find(|candidate| candidate.batch_id() == batch_id)
+        else {
+            return Err(RowHistoryError::ObjectNotFound(object_id));
+        };
+        *existing = patched_row.clone();
+        visible_entry_from_history_rows(context.user_descriptor().as_ref(), &history_rows).map_err(
+            |err| {
                 RowHistoryError::StorageError(StorageError::IoError(format!(
                     "rebuild visible entry after patch: {err}"
                 )))
-            })?;
+            },
+        )?
+    };
     let visible_entries: Vec<_> = patched_entry.iter().cloned().collect();
     if patched_entry.is_some() {
         io.apply_row_mutation(

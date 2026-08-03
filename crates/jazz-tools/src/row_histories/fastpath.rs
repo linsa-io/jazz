@@ -1,12 +1,25 @@
-//! Serial-write fast path for [`apply_row_batch`](super::apply_row_batch).
+//! History fast paths for [`apply_row_batch`](super::apply_row_batch) and
+//! [`patch_row_batch_state`](super::patch_row_batch_state).
 //!
-//! A new visible batch whose parent set equals the entire previous branch
-//! frontier dominates every old tip: after insertion the frontier is exactly
-//! `{row}` and the unfiltered visible preview is the row itself. For such
-//! writes on never-forked rows the next [`VisibleRowEntry`] is derivable from
-//! the previous entry plus the incoming row alone — no
-//! `load_branch_history` / full `visible_entry_from_history_rows` rebuild,
-//! turning serial appends from O(history) to O(1).
+//! Two O(1) constructions of the next [`VisibleRowEntry`], both bypassing
+//! `load_branch_history` / full `visible_entry_from_history_rows` rebuilds:
+//!
+//! - [`try_serial_fastpath_entry`] — a visible batch whose parent set equals
+//!   the entire previous branch frontier dominates every old tip: after
+//!   insertion the frontier is exactly `{row}` and the unfiltered visible
+//!   preview is the row itself. Serves both fresh serial appends and
+//!   invisible→visible flips of an existing batch (staging publishes), which
+//!   are the same domination event because the previous entry never saw the
+//!   invisible version.
+//! - [`try_in_place_tip_update_entry`] — the SAME batch id with only
+//!   `state`/`confirmed_tier` changed while it is the sole frontier tip
+//!   (tier confirmations): `current_row` swaps in place, the frontier is
+//!   unchanged.
+//!
+//! Visible→non-visible flips (`→ Rejected`/`→ Superseded`) NEVER get a fast
+//! path: removing a batch from the visible set can expose a previously
+//! hidden ancestor as the new winner, which no O(1) entry update can
+//! compute. That routing decision lives at the call sites in `mutations.rs`.
 //!
 //! The bar is byte-exactness: the constructed entry must equal the full
 //! rebuild bit for bit (enforced after every op by the randomized differential
@@ -33,10 +46,23 @@ use super::codecs::tier_satisfies;
 use super::types::{BatchId, StoredRowBatch, VisibleRowEntry};
 
 /// Applies that constructed the visible entry without a history rebuild.
+/// Population: previous entry present, incoming row visible — covering fresh
+/// serial appends, publish-shaped re-applies (invisible stored version
+/// flipped visible) and in-place tier confirmations.
 pub static HISTORY_FASTPATH_HITS: AtomicU64 = AtomicU64::new(0);
 /// Applies in the targeted population (previous entry present, incoming row
 /// visible) that still took the full-history path.
 pub static HISTORY_FASTPATH_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Patches (`patch_row_batch_state`) that constructed the visible entry
+/// without a history rebuild. Population: previous entry present and the
+/// PATCHED row visible — i.e. staging publishes and tier bumps. Transitions
+/// that land outside the visible set (`→ Rejected` / `→ Superseded`) are
+/// routed to the full path by design and are NOT part of this population, so
+/// fallbacks measure real misses.
+pub static PATCH_FASTPATH_HITS: AtomicU64 = AtomicU64::new(0);
+/// Patches in the same population that still took the full-history rebuild.
+pub static PATCH_FASTPATH_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Kill switch: `JAZZ_HISTORY_FASTPATH=0` (or `false`) forces the full path.
 /// Default is on. The env var is read once; tests use
@@ -112,10 +138,25 @@ pub use test_override::{HistoryFastpathMode, force_history_fastpath};
 /// Attempt the O(1) serial-write construction of the next [`VisibleRowEntry`].
 ///
 /// Returns `None` when any eligibility guard misses; the caller then takes the
-/// full-history rebuild. Caller obligations (checked upstream in
-/// `apply_row_batch_with_context`): the row is not a known-new object, its
-/// batch id is not already present in history, and parent existence was
-/// validated.
+/// full-history rebuild.
+///
+/// Two caller shapes are admitted — they differ only in the caller's
+/// obligations, never in the math:
+///
+/// - a NEW visible row not yet present in history (serial append). Caller
+///   obligations (checked upstream in `apply_row_batch_with_context`): the
+///   row is not a known-new object, its batch id is absent from history, and
+///   parent existence was validated.
+/// - an EXISTING history row whose stored version is NOT visible, replaced by
+///   a visible version (staging publish via `patch_row_batch_state`, or a
+///   `DurableDirect`/`AcceptedTransaction` fate re-apply over a staged row).
+///   The previous entry was computed over visible rows only, so it is
+///   oblivious to the invisible stored version — flipping it visible is the
+///   same domination event as inserting a fresh visible row. A visible
+///   descendant already naming this batch as parent cannot slip through: it
+///   would have to postdate this batch (parents are existence-validated at
+///   apply time), while the frontier-coverage guard forces every frontier tip
+///   to be one of this batch's own parents, all of which predate it.
 pub(super) fn try_serial_fastpath_entry(
     previous_entry: Option<&VisibleRowEntry>,
     row: &StoredRowBatch,
@@ -258,5 +299,173 @@ fn carried_tier_pointer(
         Some(Some(old_tip.batch_id()))
     } else {
         Some(previous_pointer)
+    }
+}
+
+/// Attempt the O(1) in-place tip update: the SAME batch id re-applied (via
+/// `accepted_transaction_output` tier confirmations) or patched (pure
+/// `confirmed_tier` bump) with only `state`/`confirmed_tier` changed, while it
+/// is the sole frontier tip of a never-forked entry and stays visible.
+///
+/// The unfiltered preview of a sole-tip entry IS the tip row, before and
+/// after the flip, so `current_row` is replaced in place and the frontier is
+/// unchanged (`[batch_id]`). Only the per-tier sidecar needs care — see
+/// [`in_place_tier_pointer`] for the case analysis. Returns `None` when any
+/// guard misses; the caller then takes the full rebuild.
+pub(super) fn try_in_place_tip_update_entry(
+    previous_entry: Option<&VisibleRowEntry>,
+    existing_row: &StoredRowBatch,
+    row: &StoredRowBatch,
+) -> Option<VisibleRowEntry> {
+    if !history_fastpath_enabled() {
+        return None;
+    }
+    // Both versions must be visible. Invisible → visible is a publish
+    // (domination) event served by `try_serial_fastpath_entry`; visible →
+    // invisible is a removal event that can expose a previously hidden
+    // ancestor as the new winner and always takes the full path.
+    if !existing_row.state.is_visible() || !row.state.is_visible() {
+        return None;
+    }
+    // Deletes interact with the delete-winner overlay of every preview.
+    if row.delete_kind.is_some() {
+        return None;
+    }
+    // Only `state`/`confirmed_tier` may differ. A content change re-runs
+    // every merge the tip participates in (a tier preview that coincided
+    // with the tip can stop coinciding), which is not provable from the
+    // entry alone.
+    if !same_row_except_state_and_tier(existing_row, row) {
+        return None;
+    }
+    let previous = previous_entry?;
+    if previous.current_row.branch != row.branch {
+        return None;
+    }
+    let batch_id = row.batch_id();
+    // The batch must be the SOLE frontier tip. `current_row` carrying this
+    // batch id alone is not enough: a multi-tip frontier can coincidentally
+    // normalise its merged preview onto this batch while concurrent state
+    // hides behind it.
+    if previous.branch_frontier.as_slice() != [batch_id]
+        || previous.current_row.batch_id() != batch_id
+    {
+        return None;
+    }
+    // Never-forked precondition — same rationale as the serial fast path.
+    if !previous.winner_batch_pool.is_empty()
+        || previous.current_winner_ordinals.is_some()
+        || previous.worker_winner_ordinals.is_some()
+        || previous.edge_winner_ordinals.is_some()
+        || previous.global_winner_ordinals.is_some()
+        || previous.merge_artifacts.is_some()
+    {
+        return None;
+    }
+
+    let worker_batch_id = in_place_tier_pointer(
+        existing_row,
+        row,
+        DurabilityTier::Local,
+        previous.worker_batch_id,
+    )?;
+    let edge_batch_id = in_place_tier_pointer(
+        existing_row,
+        row,
+        DurabilityTier::EdgeServer,
+        previous.edge_batch_id,
+    )?;
+    let global_batch_id = in_place_tier_pointer(
+        existing_row,
+        row,
+        DurabilityTier::GlobalServer,
+        previous.global_batch_id,
+    )?;
+
+    Some(VisibleRowEntry {
+        current_row: row.clone(),
+        branch_frontier: vec![batch_id],
+        worker_batch_id,
+        edge_batch_id,
+        global_batch_id,
+        winner_batch_pool: Vec::new(),
+        current_winner_ordinals: None,
+        worker_winner_ordinals: None,
+        edge_winner_ordinals: None,
+        global_winner_ordinals: None,
+        merge_artifacts: None,
+    })
+}
+
+/// Byte-equality on every field except `state` and `confirmed_tier` — the
+/// only fields a tier confirmation or state patch may legally change without
+/// disturbing merge inputs (values, parents, provenance ordering keys,
+/// delete ranking).
+fn same_row_except_state_and_tier(existing: &StoredRowBatch, row: &StoredRowBatch) -> bool {
+    existing.row_id == row.row_id
+        && existing.batch_id == row.batch_id
+        && existing.branch == row.branch
+        && existing.parents == row.parents
+        && existing.updated_at == row.updated_at
+        && existing.created_by == row.created_by
+        && existing.created_at == row.created_at
+        && existing.updated_by == row.updated_by
+        && existing.delete_kind == row.delete_kind
+        && existing.is_deleted == row.is_deleted
+        && existing.data == row.data
+        && existing.metadata == row.metadata
+}
+
+/// Carry one tier sidecar pointer across an in-place tip update, or decline.
+///
+/// NOT the same rule as [`carried_tier_pointer`]: there the tier-filtered set
+/// S gains a NEW row C on top of old tip B; here "C" and "B" are positionally
+/// the same row — the sole tip T is replaced by T' (identical except
+/// state/tier), so S keeps, gains, or loses THE SAME row. The guards in
+/// [`try_in_place_tip_update_entry`] already established: T is the sole
+/// frontier tip (the unfiltered preview equals T exactly), the entry is
+/// never-forked (all sidecar ordinals `None`, so any stored tier preview
+/// equals an actual history row byte-for-byte), and T/T' differ only in
+/// state/tier (per-column merge inputs, winner ordering keys and delete
+/// ranking are untouched). Case analysis against the rebuild
+/// (`preview_override_sidecar` over `build_computed_visible_preview`):
+///
+/// - membership unchanged (`old_sat == new_sat`): the tier frontier keeps the
+///   exact same batch-id structure.
+///   - pointer `None` + T in the tier set: the old tier preview matched the
+///     current preview, i.e. equalled T with an empty winner trail — every
+///     column winner was T itself, so the re-run merge outputs T' exactly
+///     (min-tier over contributors {T'} = T'.tier) and still matches ⇒ stays
+///     `None`.
+///   - pointer `None` + T outside the tier set: matching the current preview
+///     is impossible for a candidate whose metadata row is in S (batch ids
+///     are unique), so S was provably empty and stays empty ⇒ stays `None`.
+///   - pointer `Some(x)`: the old preview was row x with every column winner
+///     on x — T contributed values but won nothing, so flipping its
+///     state/tier leaves the merged output (including its min-tier, computed
+///     over contributors all equal to x) byte-identical ⇒ carried verbatim.
+/// - T' enters the tier (`!old_sat && new_sat` — the tier-confirmation hot
+///   case): provable only when S was provably empty (pointer `None`, per the
+///   argument above): the tier set becomes `{T'}`, whose preview matches the
+///   new current row ⇒ `None`. With a `Some(x)` pointer, x's chain is still
+///   in the tier set and tier holes can resurface concurrent tier tips
+///   beside T' (`x ∈ T.parents` does NOT rule out a hole sibling that is not
+///   a parent of T) ⇒ decline; the rebuild may need a merged preview with
+///   pool/ordinals. Pinned by
+///   `in_place_fastpath_declines_tier_confirmation_over_tier_hole`.
+/// - T' leaves the tier (`old_sat && !new_sat`): a removal event — the new
+///   tier frontier may expose rows the entry never tracked ⇒ decline.
+fn in_place_tier_pointer(
+    existing_row: &StoredRowBatch,
+    row: &StoredRowBatch,
+    tier: DurabilityTier,
+    previous_pointer: Option<BatchId>,
+) -> Option<Option<BatchId>> {
+    let old_sat = tier_satisfies(existing_row.confirmed_tier, tier);
+    let new_sat = tier_satisfies(row.confirmed_tier, tier);
+    match (old_sat, new_sat) {
+        (true, false) => None,
+        (false, true) => previous_pointer.is_none().then_some(None),
+        _ => Some(previous_pointer),
     }
 }

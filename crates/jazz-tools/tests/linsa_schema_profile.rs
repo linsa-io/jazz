@@ -419,6 +419,11 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
         jazz_tools::row_histories::HISTORY_FASTPATH_HITS.load(Ordering::Relaxed),
         jazz_tools::row_histories::HISTORY_FASTPATH_FALLBACKS.load(Ordering::Relaxed),
     );
+    eprintln!(
+        "phase B patch fastpath counters: hits {} fallbacks {}",
+        jazz_tools::row_histories::PATCH_FASTPATH_HITS.load(Ordering::Relaxed),
+        jazz_tools::row_histories::PATCH_FASTPATH_FALLBACKS.load(Ordering::Relaxed),
+    );
 
     // ── device 1: alice's app graph ────────────────────────────────────────
     let alice_client =
