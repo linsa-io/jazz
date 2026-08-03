@@ -482,8 +482,12 @@ fn skip_column_descriptor_with_version(
     if version.has_column_merge_strategies() {
         let has_merge_strategy = read_u8(data, offset)? != 0;
         if has_merge_strategy {
+            // Must accept every tag the encoder writes (1 = Counter,
+            // 2 = GSet), mirroring decode_column_descriptor_with_version;
+            // rejecting a valid tag here breaks single-table descriptor
+            // extraction for any schema whose earlier tables use it.
             let tag = read_u8(data, offset)?;
-            if tag != 1 {
+            if !(1..=2).contains(&tag) {
                 return Err(CatalogueEncodingError::InvalidTypeTag {
                     tag,
                     context: "column_merge_strategy",
@@ -2163,6 +2167,43 @@ mod tests {
         let column = table.columns.column("value").expect("counter column");
 
         assert_eq!(column.merge_strategy, Some(ColumnMergeStrategy::Counter));
+    }
+
+    #[test]
+    fn decode_table_descriptor_skips_gset_merge_strategy_columns() {
+        // Tables encode sorted by name, so "aa_docs" (GSet, tag 2) is always
+        // skipped on the way past it. The skip path used to accept only the
+        // Counter tag and errored with "invalid type tag 2".
+        let mut schema = Schema::new();
+        schema.insert(
+            TableName::new("aa_docs"),
+            TableSchema::new(RowDescriptor::new(vec![
+                ColumnDescriptor::new(
+                    "tags",
+                    ColumnType::Array {
+                        element: Box::new(ColumnType::Text),
+                    },
+                )
+                .merge_strategy(ColumnMergeStrategy::GSet),
+            ])),
+        );
+        schema.insert(
+            TableName::new("zz_tasks"),
+            TableSchema::new(RowDescriptor::new(vec![ColumnDescriptor::new(
+                "title",
+                ColumnType::Text,
+            )])),
+        );
+        let encoded = encode_schema(&schema);
+
+        let descriptor = decode_table_descriptor_from_schema(&encoded, "zz_tasks")
+            .expect("skipping a GSet table should succeed")
+            .expect("target table should decode");
+        assert_eq!(descriptor.columns.len(), 1);
+
+        let absent = decode_table_descriptor_from_schema(&encoded, "absent")
+            .expect("skipping every table should succeed");
+        assert!(absent.is_none());
     }
 
     #[test]
