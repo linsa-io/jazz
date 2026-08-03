@@ -1,0 +1,469 @@
+//! Memory profile of app-like subscriptions on the REAL linsa schema.
+//!
+//! Fixture `fixtures/linsa-schema.json` is the production wire schema (with
+//! the merged policy bundle) dumped via `serializeRuntimeSchema` — the exact
+//! bytes the linsa backend feeds the engine. The scenario mirrors the
+//! measured production census (19 live subscriptions: 9×messages, 4×chats,
+//! 2×users, 2×media_assets, singles) and, per the field lead, a HOT users
+//! row carrying 6000 presence-heartbeat batches of history — the suspected
+//! per-batch (not per-row) cost amplifier behind the ~1 GB device step.
+//!
+//! This is a measurement probe: it prints per-phase live bytes; the only
+//! hard assertions are survival and release-on-reap.
+
+#![cfg(feature = "test")]
+
+mod support;
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use jazz_tools::object::ObjectId;
+use jazz_tools::query_manager::types::ColumnType;
+use jazz_tools::row_input;
+use jazz_tools::server::JazzServer;
+use jazz_tools::sync_manager::DurabilityTier;
+use jazz_tools::{JazzClient, QueryBuilder, Schema, Value};
+use support::{connect_ready_client, connect_ready_user};
+
+struct TrackingAllocator;
+
+static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+static PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            let live = LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed)
+                + layout.size() as u64;
+            PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new_ptr.is_null() {
+            LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+            let live = LIVE_BYTES.fetch_add(new_size as u64, Ordering::Relaxed) + new_size as u64;
+            PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+        }
+        new_ptr
+    }
+}
+
+#[global_allocator]
+static GLOBAL: TrackingAllocator = TrackingAllocator;
+
+fn live_mb() -> f64 {
+    LIVE_BYTES.load(Ordering::Relaxed) as f64 / 1048576.0
+}
+
+fn peak_mb() -> f64 {
+    PEAK_BYTES.load(Ordering::Relaxed) as f64 / 1048576.0
+}
+
+fn heartbeats() -> usize {
+    std::env::var("HEARTBEATS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6000)
+}
+const CHATS: usize = 5;
+const MESSAGES_PER_CHAT: usize = 15;
+
+fn linsa_schema() -> Schema {
+    // The dump is the runtime-schema envelope; the engine table map lives at
+    // schema.<any table>._schema (the TS layer stores the full map on every
+    // table handle). NOTE: this dump carries columns only — no policy bundle —
+    // so this profile measures schema width + history + subscription shape
+    // with row policies OFF (PermissiveLocal visibility).
+    let envelope: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/linsa-schema.json"))
+            .expect("envelope must parse");
+    serde_json::from_value(envelope["schema"]["users"]["_schema"].clone())
+        .expect("production wire schema must parse")
+}
+
+/// Fill every required (non-nullable) column that `provided` does not cover
+/// with a type-appropriate placeholder, so inserts satisfy the real schema.
+fn fill_required(
+    schema: &Schema,
+    table: &str,
+    provided: Vec<(String, Value)>,
+) -> std::collections::HashMap<String, Value> {
+    let table_schema = schema
+        .get(&jazz_tools::query_manager::types::TableName::new(table))
+        .unwrap_or_else(|| panic!("table {table} in schema"));
+    let mut map: std::collections::HashMap<String, Value> = provided.into_iter().collect();
+    for column in &table_schema.columns.columns {
+        let name = column.name.as_str();
+        if name == "id" || map.contains_key(name) || column.nullable || column.default.is_some() {
+            continue;
+        }
+        let value = match &column.column_type {
+            ColumnType::Text => Value::Text("mock".into()),
+            ColumnType::Enum { variants } => {
+                Value::Text(variants.first().cloned().unwrap_or_default())
+            }
+            ColumnType::Integer => Value::Integer(1),
+            ColumnType::BigInt => Value::BigInt(1),
+            ColumnType::Double => Value::Double(1.0),
+            ColumnType::Boolean => Value::Boolean(false),
+            ColumnType::Timestamp => Value::Timestamp(1),
+            ColumnType::Uuid => Value::Uuid(ObjectId::new()),
+            ColumnType::Bytea => Value::Bytea(vec![0u8; 4]),
+            ColumnType::Array { .. } => Value::Array(Vec::new()),
+            other => panic!("unhandled required column {table}.{name}: {other:?}"),
+        };
+        map.insert(name.to_string(), value);
+    }
+    map
+}
+
+fn insert_filled(
+    client: &JazzClient,
+    schema: &Schema,
+    table: &str,
+    provided: Vec<(String, Value)>,
+) -> ObjectId {
+    let (id, _, _) = client
+        .insert(table, fill_required(schema, table, provided))
+        .unwrap_or_else(|e| panic!("insert into {table}: {e:?}"));
+    id
+}
+
+/// The 19-subscription graph the production census measured, per client.
+async fn open_app_graph(
+    client: &JazzClient,
+    user_id: ObjectId,
+    chat_ids: &[ObjectId],
+) -> Vec<jazz_tools::SubscriptionStream> {
+    let mut subs = Vec::new();
+
+    // users ×2: own row + directory
+    subs.push(
+        client
+            .subscribe(
+                QueryBuilder::new("users")
+                    .filter_eq("id", Value::Uuid(user_id))
+                    .limit(1)
+                    .build(),
+            )
+            .await
+            .expect("sub users self"),
+    );
+    subs.push(
+        client
+            .subscribe(QueryBuilder::new("users").build())
+            .await
+            .expect("sub users all"),
+    );
+
+    // chats ×4: three by-id + the visible list
+    for chat_id in chat_ids.iter().take(3) {
+        subs.push(
+            client
+                .subscribe(
+                    QueryBuilder::new("chats")
+                        .filter_eq("id", Value::Uuid(*chat_id))
+                        .limit(1)
+                        .build(),
+                )
+                .await
+                .expect("sub chat by id"),
+        );
+    }
+    subs.push(
+        client
+            .subscribe(QueryBuilder::new("chats").build())
+            .await
+            .expect("sub chats list"),
+    );
+
+    // messages ×9: five threads (limit 50) + four previews (limit 1)
+    for chat_id in chat_ids.iter().take(5) {
+        subs.push(
+            client
+                .subscribe(
+                    QueryBuilder::new("messages")
+                        .filter_eq("chatId", Value::Uuid(*chat_id))
+                        .filter_eq("isDeleted", Value::Boolean(false))
+                        .order_by_desc("createdAtMs")
+                        .limit(50)
+                        .build(),
+                )
+                .await
+                .expect("sub thread"),
+        );
+    }
+    for chat_id in chat_ids.iter().take(4) {
+        subs.push(
+            client
+                .subscribe(
+                    QueryBuilder::new("messages")
+                        .filter_eq("chatId", Value::Uuid(*chat_id))
+                        .filter_eq("isDeleted", Value::Boolean(false))
+                        .order_by_desc("createdAtMs")
+                        .limit(1)
+                        .build(),
+                )
+                .await
+                .expect("sub preview"),
+        );
+    }
+
+    // media_assets ×2, singles ×4
+    subs.push(
+        client
+            .subscribe(QueryBuilder::new("media_assets").build())
+            .await
+            .expect("sub media"),
+    );
+    subs.push(
+        client
+            .subscribe(
+                QueryBuilder::new("media_assets")
+                    .filter_eq("ownerUserId", Value::Uuid(user_id))
+                    .build(),
+            )
+            .await
+            .expect("sub media own"),
+    );
+    subs.push(
+        client
+            .subscribe(
+                QueryBuilder::new("tasks")
+                    .filter_eq("ownerUserId", Value::Uuid(user_id))
+                    .build(),
+            )
+            .await
+            .expect("sub tasks"),
+    );
+    subs.push(
+        client
+            .subscribe(
+                QueryBuilder::new("chat_members")
+                    .filter_eq("userId", Value::Uuid(user_id))
+                    .build(),
+            )
+            .await
+            .expect("sub memberships"),
+    );
+    subs.push(
+        client
+            .subscribe(
+                QueryBuilder::new("chat_drafts")
+                    .filter_eq("userId", Value::Uuid(user_id))
+                    .build(),
+            )
+            .await
+            .expect("sub drafts"),
+    );
+    subs.push(
+        client
+            .subscribe(
+                QueryBuilder::new("auth_pending_state")
+                    .filter_eq("claimedBySessionUserId", Value::Text(user_id.to_string()))
+                    .build(),
+            )
+            .await
+            .expect("sub auth pending"),
+    );
+
+    subs
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_graph_on_real_schema_with_hot_history_row() {
+    let schema = linsa_schema();
+    eprintln!(
+        "schema loaded: {} tables; live {:.1} MiB",
+        schema.keys().count(),
+        live_mb()
+    );
+
+    let server = JazzServer::builder()
+        .with_schema(schema.clone())
+        .with_rocksdb_storage()
+        .start()
+        .await;
+    let ready = Duration::from_secs(60);
+    let writer = connect_ready_client(&server, &schema, "writer", "users", ready).await;
+
+    // ── seed ────────────────────────────────────────────────────────────────
+    let alice = insert_filled(
+        &writer,
+        &schema,
+        "users",
+        vec![
+            ("firstName".into(), Value::Text("Alice".into())),
+            ("isActive".into(), Value::Boolean(true)),
+            ("onlineTimeMs".into(), Value::Integer(0)),
+        ],
+    );
+    let bob = insert_filled(
+        &writer,
+        &schema,
+        "users",
+        vec![
+            ("firstName".into(), Value::Text("Bob".into())),
+            ("isActive".into(), Value::Boolean(true)),
+        ],
+    );
+
+    let mut chat_ids = Vec::new();
+    for _ in 0..CHATS {
+        let chat = insert_filled(
+            &writer,
+            &schema,
+            "chats",
+            vec![
+                ("kind".into(), Value::Text("direct".into())),
+                ("createdByUserId".into(), Value::Uuid(alice)),
+            ],
+        );
+        for user in [alice, bob] {
+            insert_filled(
+                &writer,
+                &schema,
+                "chat_members",
+                vec![
+                    ("chatId".into(), Value::Uuid(chat)),
+                    ("userId".into(), Value::Uuid(user)),
+                    ("role".into(), Value::Text("member".into())),
+                    ("isBanned".into(), Value::Boolean(false)),
+                ],
+            );
+        }
+        for i in 0..MESSAGES_PER_CHAT {
+            insert_filled(
+                &writer,
+                &schema,
+                "messages",
+                vec![
+                    ("chatId".into(), Value::Uuid(chat)),
+                    ("senderKind".into(), Value::Text("user".into())),
+                    ("senderUserId".into(), Value::Uuid(alice)),
+                    ("createdAtMs".into(), Value::Timestamp(1000 + i as u64)),
+                    ("isDeleted".into(), Value::Boolean(false)),
+                ],
+            );
+        }
+        chat_ids.push(chat);
+    }
+    for _ in 0..3 {
+        insert_filled(
+            &writer,
+            &schema,
+            "media_assets",
+            vec![("ownerUserId".into(), Value::Uuid(alice))],
+        );
+    }
+    let (_, _, seed_batch) = writer
+        .insert(
+            "tasks",
+            fill_required(
+                &schema,
+                "tasks",
+                vec![
+                    ("ownerUserId".into(), Value::Uuid(alice)),
+                    ("status".into(), Value::Text("open".into())),
+                    ("isDeleted".into(), Value::Boolean(false)),
+                ],
+            ),
+        )
+        .expect("insert task");
+    writer
+        .wait_for_batch(seed_batch, DurabilityTier::EdgeServer)
+        .await
+        .expect("seed durable");
+    eprintln!("phase A (seeded, no history): live {:.1} MiB", live_mb());
+
+    // ── 6000 presence heartbeats on the hot users row ──────────────────────
+    let mut last_hb = None;
+    let heartbeat_count = heartbeats();
+    for i in 0..heartbeat_count {
+        let batch = writer
+            .update(
+                alice,
+                vec![
+                    ("onlineTimeMs".to_string(), Value::Integer(i as i32)),
+                    (
+                        "onlineTimeUpdatedAtMs".to_string(),
+                        Value::Timestamp(2000 + i as u64),
+                    ),
+                ],
+            )
+            .expect("heartbeat update");
+        last_hb = Some(batch);
+    }
+    writer
+        .wait_for_batch(last_hb.expect("heartbeats"), DurabilityTier::EdgeServer)
+        .await
+        .expect("heartbeats durable");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    eprintln!(
+        "phase B (+{heartbeat_count} heartbeat batches on users row): live {:.1} MiB",
+        live_mb()
+    );
+
+    // ── device 1: alice's app graph ────────────────────────────────────────
+    let alice_client =
+        connect_ready_user(&server, &schema, &alice.to_string(), "users", ready).await;
+    let before_alice = live_mb();
+    let alice_subs = open_app_graph(&alice_client, alice, &chat_ids).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    eprintln!(
+        "phase C (alice: {} subs): live {:.1} MiB (+{:.1}), peak {:.1} MiB",
+        alice_subs.len(),
+        live_mb(),
+        live_mb() - before_alice,
+        peak_mb()
+    );
+
+    // Visibility check so an empty-result graph cannot masquerade as cheap.
+    let visible = alice_client
+        .query(QueryBuilder::new("chats").build(), None)
+        .await
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+    eprintln!("alice sees {visible} chats (0 would mean policy-denied graph)");
+
+    // ── device 2: bob's identical graph — the per-device marginal ──────────
+    let bob_client = connect_ready_user(&server, &schema, &bob.to_string(), "users", ready).await;
+    let before_bob = live_mb();
+    let bob_subs = open_app_graph(&bob_client, bob, &chat_ids).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    eprintln!(
+        "phase D (bob: {} subs): live {:.1} MiB (+{:.1} per extra device)",
+        bob_subs.len(),
+        live_mb(),
+        live_mb() - before_bob
+    );
+
+    // ── teardown: drop both devices, sweep, must release ───────────────────
+    drop(alice_subs);
+    drop(bob_subs);
+    drop(alice_client);
+    drop(bob_client);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    server.set_client_ttl(Duration::ZERO).await;
+    let reaped = server.run_sweep_once().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    eprintln!(
+        "phase E (dropped + reaped {}): live {:.1} MiB",
+        reaped.len(),
+        live_mb()
+    );
+
+    writer.shutdown().await.expect("shutdown writer");
+    server.shutdown().await;
+}
