@@ -71,6 +71,11 @@ impl<'a> PolicyContextEvaluator<'a> {
             return false;
         }
 
+        // Settle-cost accounting: every row a policy is evaluated against,
+        // recursive descent included — the descent is the cost.
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::POLICY_ROW_EVALS,
+        );
         crate::query_manager::policy_counters::increment(
             "row_access_eval",
             format!("table={} op={:?} depth={}", table_name, operation, depth),

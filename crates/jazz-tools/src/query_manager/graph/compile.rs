@@ -555,6 +555,9 @@ impl QueryGraph {
         schema_context: &Arc<SchemaContext>,
         row_policy_mode: RowPolicyMode,
     ) -> Option<Self> {
+        // Settle-cost accounting: the innermost compile, so nested include
+        // plans are counted individually.
+        crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::PLAN_COMPILES);
         // Build branch -> schema hash map for column translation.
         // Use full hashes from SchemaContext (do not re-parse branch strings, which only encode
         // a shortened hash prefix).

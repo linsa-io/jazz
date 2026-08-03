@@ -518,6 +518,12 @@ impl QueryGraph {
         if !order.is_empty() {
             tracing::trace!(dirty_nodes = order.len(), table = %self.table, "settling query graph");
         }
+        // Settle-cost accounting: one relaxed add per graph settle rather than
+        // one per node, since the node count is known up front.
+        crate::query_manager::settle_cost::add(
+            &crate::query_manager::settle_cost::GRAPH_NODES_EVALUATED,
+            order.len() as u64,
+        );
         let mut tuple_deltas: AHashMap<NodeId, TupleDelta> = AHashMap::new();
 
         let ctx = SourceContext {

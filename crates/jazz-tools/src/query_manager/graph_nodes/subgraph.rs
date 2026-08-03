@@ -74,6 +74,11 @@ impl SubgraphTemplate {
         correlation_value: Value,
         schema: &Arc<Schema>,
     ) -> Option<SubgraphInstance> {
+        // Settle-cost accounting: counted on entry, because the query rebuild
+        // below runs whether or not the compile ultimately succeeds.
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::SUBQUERY_INSTANTIATIONS,
+        );
         // Build query with correlation filter
         let mut query_builder = QueryBuilder::new(self.base_query.table);
         if self.base_query.branches.is_empty() {

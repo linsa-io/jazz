@@ -391,6 +391,14 @@ impl PolicyFilterNode {
 
     /// Evaluate the policy expression against a row.
     pub fn evaluate(&self, row: &Row) -> bool {
+        // Settle-cost accounting: the non-INHERITS per-row policy decision.
+        // A policy without INHERITS clauses never reaches
+        // `PolicyContextEvaluator::evaluate_row_access` (see the dispatch in
+        // `graph::execute`), so counting only there would report zero policy
+        // work for the most common policy shape there is.
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::POLICY_ROW_EVALS,
+        );
         self.evaluate_expr(&self.policy, row, self.initial_depth)
     }
 

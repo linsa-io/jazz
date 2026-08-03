@@ -162,6 +162,8 @@ impl IndexScanNode {
     /// reads, via a point read. Only called for conditions where
     /// [`Self::supports_incremental_membership`] holds.
     fn index_row_membership(&self, ctx: &SourceContext, row_id: ObjectId) -> bool {
+        // Settle-cost accounting: one index point read.
+        crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::INDEX_READS);
         match &self.condition {
             ScanCondition::Empty => false,
             ScanCondition::Eq(value) => ctx
@@ -384,6 +386,11 @@ impl SourceNode for IndexScanNode {
             };
         }
 
+        // Settle-cost accounting: one full index scan. Counted here rather than
+        // inside `full_scan_ids` so the debug-only parity harness above, which
+        // calls the same function purely to check the incremental path, does
+        // not make debug builds report reads a release build never does.
+        crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::INDEX_READS);
         let new_ids = self.full_scan_ids(ctx);
 
         // Diff against last scan

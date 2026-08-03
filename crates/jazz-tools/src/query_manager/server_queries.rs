@@ -551,6 +551,13 @@ impl QueryManager {
         auth_context: &crate::schema_manager::SchemaContext,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
     ) -> bool {
+        // Settle-cost accounting: every per-row authorization decision the sync
+        // scope needs, cached or not. The miss counter below is bumped only
+        // where the verdict is actually computed, so the two together say
+        // whether authorization is amortised or paid per tick.
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::SCOPE_AUTHZ_CHECKS,
+        );
         // Cross-tick verdict cache: without it every write-tick re-authorized every
         // row of every affected subscription's result set — a storage load plus a
         // policy evaluation per row, making write cost proportional to subscribed
@@ -589,6 +596,9 @@ impl QueryManager {
             return cached;
         }
 
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::SCOPE_AUTHZ_EVALS,
+        );
         let (verdict, table) = self.evaluate_provenance_row_select_policy(
             storage,
             settlement_eval_cache,
@@ -1126,6 +1136,15 @@ impl QueryManager {
             let table = sub.query.table.as_str().to_string();
             let mut schema_warnings = SchemaWarningAccumulator::default();
             let include_deleted = sub.query.include_deleted;
+            // Settle-cost accounting: a subscription's FIRST settle happens
+            // here, not in `settle_server_subscriptions`. It is the most
+            // expensive settle a subscription ever has (cold graph, cold
+            // authz verdict cache), so leaving it unattributed would hide the
+            // subscription-storm shape entirely.
+            let settle_started = web_time::Instant::now();
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::SUBSCRIPTIONS_SETTLED,
+            );
             {
                 let row_bytes_dedup = &self.row_bytes_dedup;
                 let row_loader =
@@ -1149,7 +1168,11 @@ impl QueryManager {
                         )
                     };
 
-                let _delta = graph.settle(storage_ref, row_loader);
+                let delta = graph.settle(storage_ref, row_loader);
+                crate::query_manager::settle_cost::add(
+                    &crate::query_manager::settle_cost::ROWS_EMITTED,
+                    (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
+                );
             }
             let mut reported_schema_warnings = HashSet::new();
             let new_schema_warnings = Self::finalize_schema_warnings(
@@ -1242,6 +1265,14 @@ impl QueryManager {
                     );
                 }
             }
+
+            // Covers the initial graph settle AND the authorization scope
+            // computation that follows it.
+            crate::query_manager::settle_cost::note_subscription_settle(
+                Some(sub.client_id),
+                sub.query_id.0,
+                settle_started.elapsed(),
+            );
 
             // Forward QuerySubscription to upstream servers (multi-tier forwarding)
             // This allows hub servers to know about the query and push matching data
@@ -1387,6 +1418,13 @@ impl QueryManager {
                 continue;
             }
 
+            // Settle-cost accounting: past the clean-cached-scope short-circuit
+            // above, so this subscription is about to do real settle work.
+            let settle_started = web_time::Instant::now();
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::SUBSCRIPTIONS_SETTLED,
+            );
+
             // Row loader for this subscription
             let new_scope: Option<Cow<'_, HashSet<(ObjectId, BranchName)>>> = {
                 {
@@ -1412,7 +1450,11 @@ impl QueryManager {
                             )
                         };
 
-                    let _delta = sub.graph.settle(storage, row_loader);
+                    let delta = sub.graph.settle(storage, row_loader);
+                    crate::query_manager::settle_cost::add(
+                        &crate::query_manager::settle_cost::ROWS_EMITTED,
+                        (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
+                    );
                 }
                 let new_schema_warnings = Self::finalize_schema_warnings(
                     &mut sub.reported_schema_warnings,
@@ -1527,6 +1569,15 @@ impl QueryManager {
                     }
                 }
             }
+
+            // Covers the graph settle AND the authorization scope computation
+            // that follows it — the per-row policy work is the whole point of
+            // attributing cost to a subscription.
+            crate::query_manager::settle_cost::note_subscription_settle(
+                Some(client_id),
+                query_id.0,
+                settle_started.elapsed(),
+            );
 
             self.server_subscriptions.insert((client_id, query_id), sub);
         }

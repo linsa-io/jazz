@@ -776,6 +776,12 @@ impl ArraySubqueryNode {
         io: &dyn Storage,
         row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
     ) -> (Value, TupleProvenance, TupleBatchProvenance) {
+        // Settle-cost accounting: this is the per-instance unit of include
+        // work. `SUBQUERY_INSTANTIATIONS` (counted inside
+        // `SubgraphTemplate::instantiate`) is the subset that also compiled.
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::SUBQUERY_INSTANCE_EVALS,
+        );
         let output_desc = self.subgraph_template.output_descriptor().clone();
 
         // Reuse the settled instance when the correlation binding is unchanged; only

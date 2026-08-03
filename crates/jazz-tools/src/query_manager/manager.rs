@@ -1379,6 +1379,10 @@ impl QueryManager {
     /// - Settles all subscription graphs (row data loaded on-demand from storage)
     pub fn process<H: Storage>(&mut self, storage: &mut H) {
         let _span = tracing::trace_span!("QueryManager::process").entered();
+        // Settle-cost accounting: this call IS the settle pass. The guard
+        // snapshots the counters here and emits one line on drop if the pass
+        // ran longer than `JAZZ_SETTLE_LOG_MS`.
+        let _settle_cost = super::settle_cost::SettlePass::begin();
 
         if let Err(error) = self.ensure_known_schemas_catalogued(storage) {
             tracing::warn!(%error, "failed to persist known schemas to catalogue storage");
@@ -1524,6 +1528,10 @@ impl QueryManager {
                         .has_remote_query_scope_snapshot_at_least(QueryId(sub_id.0), tier)
                 });
 
+            // Settle-cost accounting: this subscription is past every
+            // short-circuit above, so it is about to do real settle work — the
+            // clock read sits next to a graph settle, never next to a skip.
+            let settle_started = web_time::Instant::now();
             let delta = {
                 let schema_context = &self.schema_context;
                 let branch_schema_map = &self.branch_schema_map;
@@ -1587,6 +1595,14 @@ impl QueryManager {
                     row_loader,
                 )
             };
+            super::settle_cost::bump(&super::settle_cost::SUBSCRIPTIONS_SETTLED);
+            super::settle_cost::add(
+                &super::settle_cost::ROWS_EMITTED,
+                (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
+            );
+            // Local subscriptions have no downstream client; the query id alone
+            // identifies them.
+            super::settle_cost::note_subscription_settle(None, sub_id.0, settle_started.elapsed());
             subscription.needs_visibility_recompute = false;
             let new_schema_warnings = Self::finalize_schema_warnings(
                 &mut subscription.reported_schema_warnings,
@@ -2801,6 +2817,9 @@ impl QueryManager {
         schema_warnings: &mut SchemaWarningAccumulator,
         row_bytes_dedup: &std::cell::RefCell<super::row_bytes_dedup::RowBytesDedup>,
     ) -> Option<LoadedRow> {
+        // Settle-cost accounting: the query row loader is the dominant storage
+        // read driver of a settle.
+        super::settle_cost::bump(&super::settle_cost::ROW_LOADS);
         let exact_pending_visible_row = || {
             let pending_version = local_pending_version?;
             let resolved = Self::load_best_visible_row_batch_with_hint_or_locator(

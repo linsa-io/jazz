@@ -20,6 +20,7 @@ mod relation_ir_query_plan;
 mod row_bytes_dedup;
 pub mod server_queries;
 pub mod session;
+pub mod settle_cost;
 pub mod settlement_eval_cache;
 pub mod subscriptions;
 pub mod types;
