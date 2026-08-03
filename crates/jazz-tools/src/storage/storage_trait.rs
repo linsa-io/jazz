@@ -2130,6 +2130,19 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         (**self).load_visible_region_row(table, branch, row_id)
     }
 
+    fn load_visible_region_entry(
+        &self,
+        table: &str,
+        branch: &str,
+        row_id: ObjectId,
+    ) -> Result<Option<VisibleRowEntry>, StorageError> {
+        // Without this forwarding, Box<dyn Storage> callers silently fall back
+        // to the byte-decoding default and miss backend overrides (memory
+        // keeps visible entries as structs, not raw bytes), which turns every
+        // visible-entry hit into a miss + full-history rebuild upstream.
+        (**self).load_visible_region_entry(table, branch, row_id)
+    }
+
     fn load_visible_query_row(
         &self,
         table: &str,
