@@ -164,13 +164,56 @@ pub enum ClientRole {
 /// The set of batch ids already sent to a peer for one `(row, branch)`.
 ///
 /// A newtype around the underlying set purely so its `Clone` can be observed.
-/// The set grows with a row's history, and an earlier regression cloned the
-/// whole set on every queued batch just to test membership, making each forward
-/// O(n) in the history length. Membership is now checked by borrow; the custom
-/// `Clone` is instrumented under `cfg(test)` so a guard test can assert the
-/// forwarding hot path never clones the set again.
+/// An earlier regression cloned the whole set on every queued batch just to
+/// test membership, making each forward O(n) in the history length. Membership
+/// is now checked by borrow; the custom `Clone` is instrumented under
+/// `cfg(test)` so a guard test can assert the forwarding hot path never clones
+/// the set again.
+///
+/// Since fix D1 the set is a *delivered-frontier cursor*, not the full
+/// delivered history: [`Self::record_delivery`] prunes ids dominated by each
+/// newly delivered batch, so for serial histories the set stays O(1) instead
+/// of growing with every batch ever sent. See `record_delivery` for the
+/// invariant.
 #[derive(Debug, Default)]
 pub struct SentBatchIds(HashSet<BatchId>);
+
+impl SentBatchIds {
+    /// Record `batch_id` as delivered to this peer and prune the ids this
+    /// delivery dominates: the batch's direct parents.
+    ///
+    /// This is the frontier-cursor pruning rule (fix D1). A parent id may be
+    /// dropped because the just-delivered batch proves the peer's delivered
+    /// set covers it: any future ancestor walk from a newer batch reaches
+    /// `batch_id` before (or instead of) the parent, and a dedup miss on a
+    /// pruned id merely re-sends a batch the peer already applied — an
+    /// idempotent no-op on the receiver (`apply_row_batch` early-returns on an
+    /// identical stored batch).
+    ///
+    /// Invariant (hard): pruning must only ever *under*-claim. Ids are only
+    /// removed, never invented, and only ids listed as parents of a batch
+    /// being recorded as delivered are removed — provably ancestors of a
+    /// delivered batch. Over-claim (skipping a batch the receiver actually
+    /// lacks) would make the receiver drop rows on `ParentNotFound` with no
+    /// repair protocol, so no recency/LRU eviction is allowed here in any
+    /// form.
+    ///
+    /// Termination property preserved: for a serial history the direct parent
+    /// of the next write is exactly the last recorded batch, which this rule
+    /// never removes (only *its* parents), so the ancestor DFS in
+    /// `queue_row_to_server_with_missing_parents` still terminates on its
+    /// first membership probe.
+    pub fn record_delivery(&mut self, batch_id: BatchId, parents: &[BatchId]) {
+        self.0.insert(batch_id);
+        for parent in parents {
+            // A self-parent would be malformed input; never let it evict the
+            // id we just recorded.
+            if *parent != batch_id {
+                self.0.remove(parent);
+            }
+        }
+    }
+}
 
 impl Clone for SentBatchIds {
     fn clone(&self) -> Self {

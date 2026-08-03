@@ -418,6 +418,7 @@ fn push_query_subscription(
 mod basic;
 mod client_lifecycle;
 mod forwarding_recursion;
+mod frontier_pruning;
 mod permissions;
 mod query_scope;
 mod server_sync;

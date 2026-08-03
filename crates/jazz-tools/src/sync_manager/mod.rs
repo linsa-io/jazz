@@ -864,6 +864,11 @@ impl SyncManager {
             return;
         };
 
+        // The sent set is the delivered frontier (fix D1), so this cleanup
+        // only reaches interest entries for frontier ids. Entries for pruned
+        // ancestor ids outlive a scope drop and are reclaimed on client
+        // removal (`remove_client`), same as before D1 for clients that never
+        // shrink their scope.
         for &(object_id, branch_name) in removed_scope {
             if let Some(batch_ids) = client.sent_batch_ids.remove(&(object_id, branch_name)) {
                 removed_row_batches.extend(

@@ -268,7 +268,7 @@ impl SyncManager {
             .sent_batch_ids
             .entry((object_id, branch_name))
             .or_default()
-            .insert(batch_id);
+            .record_delivery(batch_id, &row.parents);
 
         self.outbox.push(OutboxEntry {
             destination: Destination::Server(server_id),
@@ -311,6 +311,9 @@ impl SyncManager {
         row: StoredRowBatch,
         force_resend: bool,
     ) {
+        // Capture parent ids before scope stripping: the delivery copy drops
+        // them for visible rows, but the frontier cursor prunes by them.
+        let parent_ids = row.parents.clone();
         let row = Self::scope_delivery_row(row);
         if metadata
             .get(crate::metadata::MetadataKey::NoSync.as_str())
@@ -354,7 +357,7 @@ impl SyncManager {
             .sent_batch_ids
             .entry((object_id, branch_name))
             .or_default()
-            .insert(batch_id);
+            .record_delivery(batch_id, &parent_ids);
         self.row_batch_interest
             .entry(RowBatchKey::new(object_id, branch_name, batch_id))
             .or_default()

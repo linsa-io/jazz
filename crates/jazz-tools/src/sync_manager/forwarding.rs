@@ -233,7 +233,17 @@ impl SyncManager {
                 while *parent_index < current.parents.len() {
                     let parent_batch_id = current.parents[*parent_index];
                     *parent_index += 1;
-                    // Borrow rather than clone the sent set: it grows with the row's history.
+                    // Borrow rather than clone the sent set. Since fix D1 the
+                    // set is the delivered frontier, not the full delivered
+                    // history (`SentBatchIds::record_delivery`): for a serial
+                    // history the direct parent is always retained, so this
+                    // probe terminates the walk in O(1) without touching
+                    // storage. A pruned *inner* ancestor (possible when a new
+                    // fork branch joins the delivered set below the frontier)
+                    // misses here and the walk descends and re-queues batches
+                    // the peer already has — the safe, idempotent direction —
+                    // once per new branch tip, after which that tip is in the
+                    // frontier and the branch is O(1) again.
                     if self
                         .servers
                         .get(&server_id)
