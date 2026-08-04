@@ -855,6 +855,37 @@ impl ArraySubqueryNode {
         crate::query_manager::settle_cost::bump(
             &crate::query_manager::settle_cost::SUBQUERY_INSTANCE_EVALS,
         );
+
+        // A NULL correlation value can never match: the include's answer is the
+        // empty array, and there is no query to run. Short-circuiting here is
+        // not an optimization of an otherwise-correct path — the bound query is
+        // `filter_eq(inner_column, NULL)`, and every stage below mishandles it:
+        //
+        // - `Condition::is_index_scannable` (query.rs) is false for a null
+        //   literal, so `index_scan_plan` (graph/compile.rs) falls back to
+        //   `{ column: "_id", condition: ScanCondition::All }` — a FULL SCAN of
+        //   the inner table;
+        // - the residual becomes `Predicate::IsNull` (`null_literal_predicate`),
+        //   which is `IS NULL`, not SQL's `= NULL`: on a NULLABLE inner column
+        //   that returns every null-keyed row instead of nothing;
+        // - `graph/compile.rs` places that filter ABOVE the nested array
+        //   subqueries, so the whole nested include subtree is instantiated for
+        //   EVERY row of the inner table before the filter discards it.
+        //
+        // Measured on `tests/include_self_join_instance_blowup.rs` (100 outer
+        // rows, 8 with a real FK, a 6-node subtree): 28 024 live subgraph
+        // instances and 967 MB of settle churn become 56 instances and 4.4 MB.
+        // `drop_cached_subgraph` mirrors the failed-instantiate branch below, so
+        // a binding that just went null releases its routing-index entries.
+        if correlation_value.is_null() {
+            self.drop_cached_subgraph(&cache_key);
+            return (
+                Value::Array(vec![]),
+                TupleProvenance::default(),
+                TupleBatchProvenance::default(),
+            );
+        }
+
         let output_desc = self.subgraph_template.output_descriptor().clone();
 
         // Reuse the settled instance when the correlation binding is unchanged; only
