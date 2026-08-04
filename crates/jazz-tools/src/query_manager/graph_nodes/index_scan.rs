@@ -145,6 +145,31 @@ impl IndexScanNode {
         values.get(column_index).cloned()
     }
 
+    /// Row ids this scan currently considers members.
+    ///
+    /// This is PRE-filter membership: everything the correlate predicate
+    /// matches, including rows a downstream filter, policy or window later
+    /// drops. Include routing needs exactly that set — a row an instance
+    /// scans but does not output still has to be re-checked when it changes,
+    /// or the scan's incremental baseline drifts from a full rescan (the
+    /// parity harness in [`Self::scan`] is what catches the drift).
+    pub(crate) fn scanned_row_ids(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.last_scanned_ids.iter().copied()
+    }
+
+    /// Whether this node holds an exact baseline that nothing has invalidated:
+    /// it has scanned at least once, no table-level mark demanded a rescan, no
+    /// row was reported changed, and it is not itself dirty.
+    ///
+    /// A node in this state can only rescan to the membership it already has,
+    /// so the settle may skip it — see the call site in `graph/execute.rs`,
+    /// which is the only place allowed to make that judgement because it is
+    /// the only one that can also see the graph-level dirty bit
+    /// (`mark_all_dirty` sets the bitmap without touching this node).
+    pub(crate) fn holds_exact_baseline(&self) -> bool {
+        self.has_scanned && !self.needs_full && !self.dirty && self.pending_changed_rows.is_empty()
+    }
+
     /// Whether this node's condition admits per-row membership checks against the
     /// index itself. Only shapes answerable by an exact index-key point read qualify —
     /// reading the same raw table the full scan traverses is what makes the

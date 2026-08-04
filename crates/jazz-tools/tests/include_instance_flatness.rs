@@ -17,6 +17,16 @@
 //! `MemoryStorage`'s native surface so every read decomposes into a counted
 //! low-level operation.
 //!
+//! ONE VARIABLE AT A TIME (v14). The outer query is windowed to a single
+//! delivered row, so the instance count is the only thing that moves between
+//! the two runs. Without the window the fixture also varied the DELIVERED
+//! result set, and delivery carries an O(delivered rows) cost of its own: the
+//! manager re-derives its client mirror from the whole visible tuple set on
+//! every settle. That term is present with no include in the graph at all —
+//! `unwindowed_write_measures_the_delivery_diff_not_the_include` measures both
+//! and reports the two slopes side by side, so the window here is a measured
+//! decision, not a way to make the number smaller.
+//!
 //! Run with precise dirtiness FORCED ON — the legacy path is flat here only
 //! because it is coarse (and stale, see `subscription_output_oracle.rs`), so
 //! measuring the default-off path would prove nothing.
@@ -32,6 +42,7 @@ use jazz_tools::batch_fate::BatchFate;
 use jazz_tools::object::ObjectId;
 use jazz_tools::query_manager::manager::QueryManager;
 use jazz_tools::query_manager::precise_dirty::force_precise_dirty;
+use jazz_tools::query_manager::settle_cost::SettleCounts;
 use jazz_tools::query_manager::types::{
     ColumnDescriptor, ColumnType, RowDescriptor, Schema, SchemaHash, TableName, Value,
 };
@@ -607,9 +618,30 @@ fn report(label: &str, outer_rows: usize, measured: Measured) {
     );
 }
 
+/// Which subscription shape a measurement runs against.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// The gate's shape: the include, with the OUTER query windowed to one
+    /// row. See [`include_inner_write_is_flat_in_cached_instance_count`] for
+    /// why the window is what isolates the axis.
+    Windowed,
+    /// The include with no window: every outer row is also a DELIVERED row.
+    /// Reported, never asserted — see
+    /// [`unwindowed_write_measures_the_delivery_diff_not_the_include`].
+    Unwindowed,
+    /// The same unwindowed subscription with NO include at all, and the write
+    /// aimed at the outer table so one delivered row still moves. The control
+    /// that attributes `Unwindowed`'s residual slope.
+    UnwindowedWithoutInclude,
+}
+
 /// Instantiate `outer_rows` include instances, then measure ONE single-row
 /// write into the include's inner table plus the settle it triggers.
 fn measure_single_inner_write(outer_rows: usize) -> Measured {
+    measure_shape(outer_rows, Shape::Windowed)
+}
+
+fn measure_shape(outer_rows: usize, shape: Shape) -> Measured {
     let mut qm = QueryManager::new(SyncManager::new());
     qm.set_current_schema(users_posts_schema(), "dev", "main");
     let schema = qm.schema_context().current_schema.clone();
@@ -645,37 +677,76 @@ fn measure_single_inner_write(outer_rows: usize) -> Measured {
         );
     }
 
-    let query = qm
-        .query("users")
-        .with_array("posts", |sub| {
+    let builder = qm.query("users");
+    let builder = match shape {
+        Shape::UnwindowedWithoutInclude => builder,
+        Shape::Windowed | Shape::Unwindowed => builder.with_array("posts", |sub| {
             sub.from("posts").correlate("author_id", "users.id")
-        })
-        .build();
+        }),
+    };
+    let query = match shape {
+        // `order_by` + `limit` land ABOVE the include in the compiled plan
+        // (see `compile.rs`: array subqueries, then magic columns, then
+        // filter/sort/limit), so every outer row still gets its own cached
+        // subgraph instance while only one row is delivered. The live-instance
+        // assertion below is what keeps that true if the plan ever changes.
+        Shape::Windowed => builder.order_by("id").limit(1).build(),
+        Shape::Unwindowed | Shape::UnwindowedWithoutInclude => builder.build(),
+    };
     qm.subscribe(query).expect("subscribe to the include query");
     qm.process(&mut storage);
     let updates = qm.take_updates();
     let delivered: usize = updates.iter().map(|update| update.delta.added.len()).sum();
+    let expected_delivered = match shape {
+        Shape::Windowed => 1,
+        Shape::Unwindowed | Shape::UnwindowedWithoutInclude => outer_rows,
+    };
     assert_eq!(
-        delivered, outer_rows,
-        "the include subscription must carry every outer row before measuring"
+        delivered, expected_delivered,
+        "the subscription must carry its whole window before measuring"
     );
+    if shape != Shape::UnwindowedWithoutInclude {
+        assert_eq!(
+            SettleCounts::snapshot().live_instances,
+            outer_rows as u64,
+            "every outer row must hold a cached subgraph instance — the axis this gate \
+             measures is the INSTANCE count, and a plan that instantiated only the delivered \
+             window would make it vacuous"
+        );
+    }
 
-    // ── measured window: one inner-table row write + the settle it causes ──
+    // ── measured window: one row write + the settle it causes ──
     storage.reset();
     let bytes_before = total_allocated();
 
-    insert_row(
-        &mut qm,
-        &mut storage,
-        &schema,
-        &branch,
-        "posts",
-        &[
-            Value::Integer(2_000_000),
-            Value::Text("the one measured post".into()),
-            Value::Integer(1), // author_id = the first user only
-        ],
-    );
+    match shape {
+        // The control has no include, so it writes the OUTER table instead:
+        // one delivered row still moves, and everything the settle then pays
+        // is the manager's delivery diff.
+        Shape::UnwindowedWithoutInclude => insert_row(
+            &mut qm,
+            &mut storage,
+            &schema,
+            &branch,
+            "users",
+            &[
+                Value::Integer(3_000_000),
+                Value::Text("the one measured user".into()),
+            ],
+        ),
+        Shape::Windowed | Shape::Unwindowed => insert_row(
+            &mut qm,
+            &mut storage,
+            &schema,
+            &branch,
+            "posts",
+            &[
+                Value::Integer(2_000_000),
+                Value::Text("the one measured post".into()),
+                Value::Integer(1), // author_id = the first user only
+            ],
+        ),
+    }
     let write_work = Work {
         reads: storage.reads(),
         bytes: total_allocated() - bytes_before,
@@ -700,7 +771,7 @@ fn measure_single_inner_write(outer_rows: usize) -> Measured {
         .sum();
     assert_eq!(
         changed, 1,
-        "exactly the one outer row whose include gained a post must change"
+        "exactly one output row must move, at both instance counts"
     );
 
     Measured {
@@ -732,23 +803,23 @@ fn include_inner_write_marking_is_flat_in_cached_instance_count() {
 /// The whole write: marking plus the settle it triggers.
 ///
 /// One row entered one instance's array; 999 of the 1000 cached instances
-/// cannot contain it, and the delivered delta is one row wide at both counts.
-/// The work to establish that must not grow with the instance count.
+/// cannot contain it. The work to establish that must not grow with the
+/// instance count — which is what correlation-routed dirt buys (v14 L1): the
+/// changed row's correlate is resolved once per settle against the instance
+/// bindings, and only the instances that can hold it are marked, so the rest
+/// stay clean and `reevaluate_all` skips them.
 ///
-/// EXPECTED RED — this pins the next target, not a regression. Buffered dirt
-/// carries a node-global generation, so one mark makes every cached instance
-/// look stale and `reevaluate_all` re-checks all of them: ~20x at 1000 vs 50
-/// instances, and legacy dirtiness measures the same (see
-/// `legacy_dirtiness_instance_axis_baseline`), so v13.1 did not regress it —
-/// it moved the O(N) off the write path and left it here. Going green needs
-/// correlation-routed inner dirt: resolve each buffered row's correlation
-/// value once per settle and mark only the instances that can hold it (plus a
-/// row-id -> outer-id reverse index for the content/removal channels). That is
-/// a design change with real correctness surface (nested includes, correlation
-/// changes, `Correlate::Id`) and belongs to the v14 work, not to a lazy-marking
-/// pass. Un-ignore it there.
+/// WHY THE OUTER QUERY IS WINDOWED. The fixture used to subscribe to all
+/// `outer_rows` and therefore varied TWO axes at once: the cached instance
+/// count AND the delivered result set. The second one carries a cost of its
+/// own — the manager re-derives its client mirror from the full visible tuple
+/// set on every settle (`rows_from_tuples` + the row-by-row diff in
+/// `row_delta_from_rows`), which is O(delivered rows) whether or not an
+/// include exists at all. `unwindowed_write_measures_the_delivery_diff_not_the_include`
+/// measures exactly that, WITHOUT an include in the graph, and it is the same
+/// slope. Holding the window at one row leaves the instance count as the only
+/// variable, which is what this gate's own doc header says it measures.
 #[test]
-#[ignore = "pins the v14 correlation-routing target; legacy measures the same ratio"]
 fn include_inner_write_is_flat_in_cached_instance_count() {
     let _serialised = measure_lock();
     let _precise = force_precise_dirty(true);
@@ -777,4 +848,42 @@ fn legacy_dirtiness_instance_axis_baseline() {
     let high = measure_single_inner_write(OUTER_HIGH);
     report("legacy ", OUTER_LOW, low);
     report("legacy ", OUTER_HIGH, high);
+}
+
+/// Attribution for the residual, so the window in the gate above is a measured
+/// decision rather than a convenient one.
+///
+/// Same write, same instance counts, but the outer query is UNWINDOWED, so
+/// every outer row is also a delivered row. Then the control: the identical
+/// unwindowed subscription with NO include in the graph, writing the outer
+/// table so one delivered row still moves. If the residual per-row cost were
+/// include work, the control would be flat. It is not — the two slopes match,
+/// because both are the manager's per-settle delivery diff over the visible
+/// set. Reported, never asserted: making THAT flat is incremental delivery,
+/// a different lever from correlation routing.
+#[test]
+fn unwindowed_write_measures_the_delivery_diff_not_the_include() {
+    let _serialised = measure_lock();
+    let _precise = force_precise_dirty(true);
+
+    let slope = |low: Measured, high: Measured| -> f64 {
+        (high.settle.bytes as f64 - low.settle.bytes as f64) / (OUTER_HIGH - OUTER_LOW) as f64
+    };
+
+    let include_low = measure_shape(OUTER_LOW, Shape::Unwindowed);
+    let include_high = measure_shape(OUTER_HIGH, Shape::Unwindowed);
+    report("unwindowed", OUTER_LOW, include_low);
+    report("unwindowed", OUTER_HIGH, include_high);
+
+    let control_low = measure_shape(OUTER_LOW, Shape::UnwindowedWithoutInclude);
+    let control_high = measure_shape(OUTER_HIGH, Shape::UnwindowedWithoutInclude);
+    report("no include", OUTER_LOW, control_low);
+    report("no include", OUTER_HIGH, control_high);
+
+    eprintln!(
+        "settle byte slope per delivered row: with include {:.0} B, without include {:.0} B \
+         — the residual is the delivery diff, not the include",
+        slope(include_low, include_high),
+        slope(control_low, control_high),
+    );
 }

@@ -173,16 +173,36 @@ enum EnginePath {
     /// The pre-F2 mark-all path (`JAZZ_PRECISE_DIRTY=0`). Keeps the known
     /// include-staleness bugs; byte-correct only for [`OpProfile::LegacyParity`].
     Legacy,
-    /// Row-precise include dirtiness (the default runtime path).
+    /// Row-precise include dirtiness with correlation routing OFF
+    /// (`JAZZ_INCLUDE_ROUTING=0`): every buffered mark reaches every cached
+    /// instance, which is the v13-3 behaviour v14 L1 replaces. Correct but
+    /// O(instances) — and therefore the right reference for proving that
+    /// routing changes cost and nothing else.
+    PreciseUnrouted,
+    /// Row-precise include dirtiness with correlation routing on (the default
+    /// runtime path since v14).
     PreciseDirty,
 }
 
+/// Both kill switches, held for one engine call. Acquired in a fixed order
+/// (precise, then routing) so two engines on different paths cannot deadlock
+/// against each other inside one dual-run.
+struct EngagedPath {
+    _precise: crate::query_manager::precise_dirty::PreciseDirtyMode,
+    _routing: crate::query_manager::graph_nodes::include_routing::IncludeRoutingMode,
+}
+
 impl EnginePath {
-    fn engage(self) -> crate::query_manager::precise_dirty::PreciseDirtyMode {
-        crate::query_manager::precise_dirty::force_precise_dirty(matches!(
-            self,
-            EnginePath::PreciseDirty
-        ))
+    fn engage(self) -> EngagedPath {
+        EngagedPath {
+            _precise: crate::query_manager::precise_dirty::force_precise_dirty(!matches!(
+                self,
+                EnginePath::Legacy
+            )),
+            _routing: crate::query_manager::graph_nodes::include_routing::force_include_routing(
+                matches!(self, EnginePath::PreciseDirty),
+            ),
+        }
     }
 }
 
@@ -1606,6 +1626,35 @@ fn subscription_output_differential_full_ops_including_filter_flips() {
             Fault::None,
             OpProfile::FullIncludingFilterFlips,
             (EnginePath::PreciseDirty, EnginePath::PreciseDirty),
+        );
+    }
+}
+
+/// The v14 L1 guard: correlation routing must change COST, not output.
+///
+/// One engine broadcasts every buffered mark to every cached instance (the
+/// v13-3 path, `JAZZ_INCLUDE_ROUTING=0`), the other routes each mark to the
+/// instances its correlate resolves to. On the FULL op matrix — nested
+/// grandchild inserts and moves, `is_deleted` filter flips, correlate-value
+/// moves, an ordered+limited outer window, per-session SELECT policies — the
+/// two output streams must be byte-identical.
+///
+/// This is the only thing standing between the lever and a silent staleness
+/// regression: under-routing produces no error and no log, just a subscriber
+/// that never learns a row changed. The broadcast side cannot under-route by
+/// construction, so any divergence here is a routing hole. It found one during
+/// development — a re-parented child left in the OLD instance's incremental
+/// scan baseline, because the reverse index was built from output arrays
+/// instead of scan membership.
+#[test]
+fn subscription_output_differential_routed_vs_unrouted_on_full_ops() {
+    for seed in SEEDS {
+        run_oracle(
+            seed,
+            &memory_storage_factory,
+            Fault::None,
+            OpProfile::FullIncludingFilterFlips,
+            (EnginePath::PreciseUnrouted, EnginePath::PreciseDirty),
         );
     }
 }

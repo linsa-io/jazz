@@ -1,5 +1,6 @@
 use ahash::AHashSet;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 
 use crate::object::ObjectId;
@@ -174,9 +175,19 @@ impl RowNode for SortNode {
             for (old, _) in &input.updated {
                 self.current_tuples.remove(old);
             }
-            // Tuple PartialEq is ID-based, so retain uses the same identity semantics.
-            self.sorted_tuples
-                .retain(|t| !removed_id_set.contains(&t.ids()));
+            // Tuple PartialEq is ID-based, so retain uses the same identity
+            // semantics. The lookup key is built into a REUSED buffer rather
+            // than a fresh `Vec` per tuple: this pass is O(current tuples), so
+            // one 8-byte allocation per tuple made every settle that removes
+            // or updates a SINGLE row allocate across the whole result set.
+            // `Vec<ObjectId>: Borrow<[ObjectId]>`, so a slice finds the same
+            // entry.
+            let mut key: SmallVec<[ObjectId; 2]> = SmallVec::new();
+            self.sorted_tuples.retain(|t| {
+                key.clear();
+                key.extend(t.id_iter());
+                !removed_id_set.contains(key.as_slice())
+            });
         }
 
         // --- Phase 2: Additions ---
@@ -218,11 +229,15 @@ impl RowNode for SortNode {
         // Added tuples in sorted order (scan sorted_tuples, match against full IDs).
         if !added_id_set.is_empty() {
             let mut remaining = added_id_set;
+            // Same reused key as the retain above, for the same reason.
+            let mut key: SmallVec<[ObjectId; 2]> = SmallVec::new();
             for tuple in &self.sorted_tuples {
                 if remaining.is_empty() {
                     break;
                 }
-                if remaining.remove(&tuple.ids()) {
+                key.clear();
+                key.extend(tuple.id_iter());
+                if remaining.remove(key.as_slice()) {
                     result.added.push(tuple.clone());
                 }
             }

@@ -13,6 +13,10 @@ use crate::query_manager::precise_dirty::precise_dirty_enabled;
 use crate::query_manager::query::ArraySubqueryRequirement;
 use std::sync::Arc;
 
+use super::include_routing::{
+    CacheKey, Channel, DirtRouting, IncludeDirt, PendingInnerDirt, Route,
+};
+
 use crate::query_manager::types::{
     ColumnDescriptor, ColumnType, LoadedRow, RowDescriptor, Schema, TableName, Tuple,
     TupleBatchProvenance, TupleDelta, TupleDescriptor, TupleElement, TupleProvenance, Value,
@@ -59,95 +63,19 @@ const MAX_CACHED_SUBGRAPHS: usize = 2048;
 /// Sized like `MAX_PENDING_CHANGED_ROWS` in `index_scan.rs`, and for the same
 /// reason: past it the bookkeeping costs more than the work it defers. It is
 /// also what stops a node whose instances are never re-evaluated from pinning
-/// changed-id sets without bound — see [`Self::flush_pending_inner_dirt`] for
-/// the overflow policy.
+/// changed-id sets without bound — see [`Self::broadcast_pending_inner_dirt`]
+/// for the overflow policy.
 const MAX_PENDING_INNER_ROWS: usize = 4096;
 
-/// Inner-table dirt recorded at WRITE time and threaded into a cached subgraph
-/// instance when that instance is next evaluated (v13-3).
+/// Cached-instance count below which a node broadcasts instead of routing.
 ///
-/// WHY: v13-2 threaded every mark into every cached instance eagerly, inside
-/// `mark_table_dependents_dirty` and the `forward_rows_*` siblings. That made
-/// one write cost O(live outer rows) on the write path — for every table the
-/// subscription touches, not just the include's own, because the content and
-/// removal channels were table-blind. Measured on the live server it doubled
-/// idle CPU and turned a ten-second presence heartbeat into a burst that
-/// scaled with the subscribed result set (`tests/include_instance_flatness.rs`
-/// pins both axes). Buffering here makes the write path O(1) in the instance
-/// count; the marks are applied per instance in `evaluate_subgraph_for_single`,
-/// which the settle already visits, so no instance sees a different bitmap
-/// than it would have under eager marking — only later.
-///
-/// The buffer is a SNAPSHOT, not a log: an instance behind `generation` gets
-/// the whole current payload applied. That is a superset of the marks it
-/// missed, and every mark is a "re-check this" instruction, so over-applying
-/// costs work, never correctness. `generation` plus the per-instance
-/// `applied_generation` is what makes application exactly-once: an instance
-/// compiled after a push starts all-dirty AND up to date, so it neither misses
-/// the change nor re-applies it.
-#[derive(Debug, Default)]
-struct PendingInnerDirt {
-    /// Bumped on every payload change. An instance is up to date exactly when
-    /// its `applied_generation` equals this.
-    generation: u64,
-    /// Cached instances still behind `generation`. The payload is non-empty
-    /// only while this is non-zero — reaching zero drops it.
-    stale_instances: usize,
-    /// Row-precise membership marks, per inner table.
-    rows: AHashMap<TableName, AHashSet<ObjectId>>,
-    /// Inner tables marked with no row information: a full rescan on apply.
-    /// Dominates `rows` for the same table, exactly as `IndexScanNode`'s
-    /// `needs_full` dominates its pending set.
-    full_tables: AHashSet<TableName>,
-    /// Content re-load marks, per inner table.
-    updated: AHashMap<TableName, AHashSet<ObjectId>>,
-    /// Removal marks, per inner table.
-    deleted: AHashMap<TableName, AHashSet<ObjectId>>,
-}
-
-/// Which table-keyed content buffer a graph-level row mark lands in.
-#[derive(Debug, Clone, Copy)]
-enum ContentMark {
-    Updated,
-    Deleted,
-}
-
-impl PendingInnerDirt {
-    /// Ids currently buffered, across every channel and inner table.
-    fn buffered_ids(&self) -> usize {
-        fn total(per_table: &AHashMap<TableName, AHashSet<ObjectId>>) -> usize {
-            per_table.values().map(|ids| ids.len()).sum()
-        }
-        total(&self.rows) + total(&self.updated) + total(&self.deleted)
-    }
-
-    /// Thread the whole payload into one instance's graph, in the order the
-    /// eager path delivered it: table-level marks (which force a full rescan)
-    /// before row-precise ones, membership before content before removals —
-    /// the order `apply_batched_subscription_visibility_effects` marks in.
-    fn apply_to(&self, graph: &mut crate::query_manager::graph::QueryGraph) {
-        for table in &self.full_tables {
-            graph.mark_dirty_for_table(table.as_str());
-        }
-        for (table, ids) in &self.rows {
-            graph.mark_rows_changed_for_table(table.as_str(), ids);
-        }
-        for (table, ids) in &self.updated {
-            graph.mark_rows_updated(table.as_str(), ids);
-        }
-        for (table, ids) in &self.deleted {
-            graph.mark_rows_deleted(table.as_str(), ids);
-        }
-    }
-
-    fn clear_payload(&mut self) {
-        self.rows.clear();
-        self.full_tables.clear();
-        self.updated.clear();
-        self.deleted.clear();
-        self.stale_instances = 0;
-    }
-}
+/// Routing resolves each changed row with one row load per node; what it buys
+/// is the instances it can then skip. At or below this many instances there is
+/// nothing worth skipping, and the load is the more expensive half — measured
+/// on the production-schema profile, whose include nodes average ~1.3
+/// instances each. Broadcasting there is exactly the v13-3 behaviour, so the
+/// floor can only cost work, never correctness.
+const MIN_ROUTABLE_INSTANCES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Correlate {
@@ -196,17 +124,18 @@ pub struct ArraySubqueryNode {
     /// the correlation binding differs — so keeping the settled instance and
     /// re-settling it removes the compile entirely. Results are read from
     /// `current_output_tuples()` (full state, not a delta), so reuse is sound.
-    subgraph_cache: AHashMap<(ObjectId, usize), CachedSubgraph>,
+    subgraph_cache: AHashMap<CacheKey, CachedSubgraph>,
     /// Monotonic tick used to order cache entries by last use.
     subgraph_cache_clock: u64,
-    /// Inner-table dirt buffered at write time, applied per instance on use.
+    /// Inner-table dirt buffered at write time plus the indices that route it
+    /// to the instances that can hold it (v14 L1, `include_routing`).
     ///
-    /// Boxed: the buffer's four collections are ~200 bytes of mostly-empty
-    /// headers, and `ArraySubqueryNode` is the largest `GraphNode` variant, so
-    /// inline they would widen every node slot in every compiled graph
-    /// (`clippy::large_enum_variant`). One pointer here, one allocation per
-    /// compiled node.
-    pending_inner_dirt: Box<PendingInnerDirt>,
+    /// Boxed: the buffer's collections plus the two routing maps are ~400
+    /// bytes of mostly-empty headers, and `ArraySubqueryNode` is the largest
+    /// `GraphNode` variant, so inline they would widen every node slot in every
+    /// compiled graph (`clippy::large_enum_variant`). One pointer here, one
+    /// allocation per compiled node.
+    dirt: Box<IncludeDirt>,
 }
 
 #[derive(Debug)]
@@ -214,9 +143,10 @@ struct CachedSubgraph {
     correlation_value: Value,
     instance: SubgraphInstance,
     last_used: u64,
-    /// [`PendingInnerDirt::generation`] this instance's graph has already been
-    /// marked with. Behind it means the buffer still owes this instance.
-    applied_generation: u64,
+    /// Row ids this instance's subtree scanned at its last evaluation, sorted
+    /// and deduplicated — the per-entry half of `DirtRouting`'s reverse index,
+    /// kept here so dropping the entry can un-index it without a search.
+    held_rows: Vec<ObjectId>,
     /// Membership in the process-wide live-instance gauge, held for exactly as
     /// long as this entry exists. Tied to the entry's lifetime rather than to
     /// the removal call sites because entries also leave by plain drop (of the
@@ -286,6 +216,14 @@ impl ArraySubqueryNode {
             &crate::query_manager::settle_cost::LIVE_SUBQUERY_NODES,
         );
 
+        let routing = DirtRouting::new(
+            &schema,
+            TableName::new(subgraph_template.table()),
+            subgraph_template.inner_column(),
+            subgraph_template.inner_offset(),
+            subgraph_template.nested_specs(),
+        );
+
         Self {
             outer_descriptor,
             output_descriptor,
@@ -300,7 +238,11 @@ impl ArraySubqueryNode {
             inner_dirty: false,
             subgraph_cache: AHashMap::new(),
             subgraph_cache_clock: 0,
-            pending_inner_dirt: Box::default(),
+            dirt: Box::new(IncludeDirt {
+                pending: PendingInnerDirt::default(),
+                routing,
+                scratch: Vec::new(),
+            }),
         }
     }
 
@@ -310,20 +252,19 @@ impl ArraySubqueryNode {
     /// than every row ever seen. Without this the cache is what grows without bound —
     /// the capacity ceiling is only a backstop.
     fn forget_cached_subgraphs(&mut self, outer_id: ObjectId) {
-        let generation = self.pending_inner_dirt.generation;
-        let mut dropped_stale = 0usize;
-        self.subgraph_cache.retain(|(id, _), cached| {
-            let keep = *id != outer_id;
-            if !keep && cached.applied_generation != generation {
-                dropped_stale += 1;
-            }
-            keep
-        });
-        self.release_stale_instances(dropped_stale);
+        let victims: Vec<CacheKey> = self
+            .subgraph_cache
+            .keys()
+            .filter(|(id, _)| *id == outer_id)
+            .copied()
+            .collect();
+        for key in victims {
+            self.drop_cached_subgraph(&key);
+        }
     }
 
     /// Make room for one new entry, evicting the least recently used one if needed.
-    fn evict_subgraphs_over_capacity(&mut self, incoming: &(ObjectId, usize)) {
+    fn evict_subgraphs_over_capacity(&mut self, incoming: &CacheKey) {
         if self.subgraph_cache.len() < MAX_CACHED_SUBGRAPHS
             || self.subgraph_cache.contains_key(incoming)
         {
@@ -340,43 +281,36 @@ impl ArraySubqueryNode {
         }
     }
 
-    /// Drop one cache entry, keeping the pending-dirt debt count in step.
-    fn drop_cached_subgraph(&mut self, key: &(ObjectId, usize)) {
-        if let Some(cached) = self.subgraph_cache.remove(key)
-            && cached.applied_generation != self.pending_inner_dirt.generation
-        {
-            self.release_stale_instances(1);
+    /// Drop one cache entry, taking it out of both routing indices.
+    ///
+    /// Un-indexing here (rather than at the call sites) is what makes eviction
+    /// and rebuild safe: an evicted instance leaves no binding and no held
+    /// rows, so nothing routes to it, and the outer row it served is then
+    /// never `subgraph_state_clean` — `reevaluate_all` re-instantiates it from
+    /// a fresh, all-dirty compile.
+    fn drop_cached_subgraph(&mut self, key: &CacheKey) {
+        if let Some(cached) = self.subgraph_cache.remove(key) {
+            self.dirt
+                .routing
+                .unbind(*key, &cached.correlation_value, &cached.held_rows);
         }
     }
 
-    /// Record that `count` instances no longer owe the buffer an application.
-    /// The payload is dropped the moment nobody is behind it any more — that is
-    /// what keeps a settled node from carrying changed-id sets between ticks.
-    fn release_stale_instances(&mut self, count: usize) {
-        let pending = &mut self.pending_inner_dirt;
-        pending.stale_instances = pending.stale_instances.saturating_sub(count);
-        if pending.stale_instances == 0 {
-            pending.clear_payload();
+    /// Called after any payload change, to keep the buffer bounded.
+    fn note_pending_changed(&mut self) {
+        if self.subgraph_cache.is_empty() {
+            // Nothing to route it to. An instance compiled later starts
+            // all-dirty, so it cannot miss the change, and an idle include
+            // costs nothing to keep marked.
+            self.dirt.pending.clear();
+        } else if self.dirt.pending.buffered_ids() > MAX_PENDING_INNER_ROWS {
+            self.broadcast_pending_inner_dirt();
         }
     }
 
-    /// Open a new buffer generation: every cached instance now owes it an
-    /// application. Called after any payload change.
-    fn bump_pending_generation(&mut self) {
-        self.pending_inner_dirt.generation += 1;
-        self.pending_inner_dirt.stale_instances = self.subgraph_cache.len();
-        if self.pending_inner_dirt.stale_instances == 0 {
-            // Nothing to owe it to — a node with no live instances buffers
-            // nothing, so an idle include costs nothing to keep marked.
-            self.pending_inner_dirt.clear_payload();
-        } else if self.pending_inner_dirt.buffered_ids() > MAX_PENDING_INNER_ROWS {
-            self.flush_pending_inner_dirt();
-        }
-    }
-
-    /// Bounded degradation past [`MAX_PENDING_INNER_ROWS`]: thread the payload
-    /// into every cached instance NOW — the v13-2 eager walk — and reset the
-    /// buffer.
+    /// Bounded degradation past [`MAX_PENDING_INNER_ROWS`], and the resolution
+    /// of everything routing cannot place: thread the payload into every
+    /// cached instance NOW — the v13-2 eager walk — and reset the buffer.
     ///
     /// Deliberately not "mark everything on next use": `mark_all_dirty` is the
     /// legacy coarse mark, and the legacy mark is exactly what fails to re-load
@@ -385,13 +319,11 @@ impl ArraySubqueryNode {
     /// the marks row-precise, so the overflow path costs one O(instances) walk
     /// per `MAX_PENDING_INNER_ROWS` buffered ids — amortised O(instances/4096)
     /// per id — and never trades correctness for the bound.
-    fn flush_pending_inner_dirt(&mut self) {
-        let generation = self.pending_inner_dirt.generation;
+    fn broadcast_pending_inner_dirt(&mut self) {
         for cached in self.subgraph_cache.values_mut() {
-            self.pending_inner_dirt.apply_to(&mut cached.instance.graph);
-            cached.applied_generation = generation;
+            self.dirt.pending.apply_to(&mut cached.instance.graph);
         }
-        self.pending_inner_dirt.clear_payload();
+        self.dirt.pending.clear();
     }
 
     /// Table-level sibling of [`Self::note_inner_rows_changed`] for dirt with
@@ -411,9 +343,9 @@ impl ArraySubqueryNode {
         let table = TableName::new(table);
         // The full-rescan mark dominates everything row-precise for this table,
         // so drop what it subsumes rather than applying both.
-        self.pending_inner_dirt.rows.remove(&table);
-        self.pending_inner_dirt.full_tables.insert(table);
-        self.bump_pending_generation();
+        self.dirt.pending.rows.remove(&table);
+        self.dirt.pending.full_tables.insert(table);
+        self.note_pending_changed();
     }
 
     /// Row-precise sibling of [`Self::note_inner_table_dirty`] (F2): `ids`
@@ -440,16 +372,17 @@ impl ArraySubqueryNode {
             return;
         }
         let table = TableName::new(table);
-        if self.pending_inner_dirt.full_tables.contains(&table) {
+        if self.dirt.pending.full_tables.contains(&table) {
             // Already scheduled for a full rescan; row detail adds nothing.
             return;
         }
-        self.pending_inner_dirt
+        self.dirt
+            .pending
             .rows
             .entry(table)
             .or_default()
             .extend(ids.iter().copied());
-        self.bump_pending_generation();
+        self.note_pending_changed();
     }
 
     /// Buffer a content-update mark so include-inner materializers re-load rows
@@ -471,32 +404,133 @@ impl ArraySubqueryNode {
     /// the dependency on that ordering. Legacy mode buffers nothing,
     /// preserving the old behavior byte for byte.
     pub fn forward_rows_updated(&mut self, table: &str, ids: &AHashSet<ObjectId>) -> bool {
-        self.buffer_content_marks(table, ids, ContentMark::Updated)
+        self.buffer_content_marks(table, ids, Channel::Updated)
     }
 
     /// Removal-delta counterpart of [`Self::forward_rows_updated`].
     pub fn forward_rows_deleted(&mut self, table: &str, ids: &AHashSet<ObjectId>) -> bool {
-        self.buffer_content_marks(table, ids, ContentMark::Deleted)
+        self.buffer_content_marks(table, ids, Channel::Deleted)
     }
 
     fn buffer_content_marks(
         &mut self,
         table: &str,
         ids: &AHashSet<ObjectId>,
-        mark: ContentMark,
+        channel: Channel,
     ) -> bool {
         if !precise_dirty_enabled() || ids.is_empty() {
             return false;
         }
         let table = TableName::new(table);
-        let sink = match mark {
-            ContentMark::Updated => &mut self.pending_inner_dirt.updated,
-            ContentMark::Deleted => &mut self.pending_inner_dirt.deleted,
-        };
-        sink.entry(table).or_default().extend(ids.iter().copied());
+        self.dirt
+            .pending
+            .channel_mut(channel)
+            .entry(table)
+            .or_default()
+            .extend(ids.iter().copied());
         self.inner_dirty = true;
-        self.bump_pending_generation();
+        self.note_pending_changed();
         true
+    }
+
+    /// Resolve every buffered row to the cached instances that can hold it and
+    /// mark only those (v14 L1 — the whole lever).
+    ///
+    /// Runs once per settle, at the head of both consumers of instance
+    /// cleanliness ([`Self::process_with_context`] and
+    /// [`Self::reevaluate_all`]), and drains the buffer. After it, an instance
+    /// carries dirty nodes exactly when a change can reach it, so
+    /// [`Self::subgraph_state_clean`] needs no bookkeeping of its own — which
+    /// is what retired v13-3's node-global `applied_generation` scheme:
+    /// nothing is owed to anybody once the marks are placed.
+    ///
+    /// Cost is O(buffered ids) resolutions plus O(instances actually marked),
+    /// against v13-3's O(cached instances) per settle.
+    fn route_pending_inner_dirt(
+        &mut self,
+        row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
+    ) {
+        if self.dirt.pending.is_empty() {
+            return;
+        }
+        // A table-level mark carries no row id, so nothing about it can be
+        // resolved; it dominates the whole payload rather than routing part of
+        // it and leaving the rest to a second pass.
+        //
+        // The instance floor is the other bail-out, and it is measured, not
+        // assumed: resolving a row costs ONE row load per node per changed id,
+        // and it buys skipping the instances that cannot hold it. A node with
+        // one or two instances has nothing to skip, so the load is pure loss —
+        // on the production-schema profile (`tests/linsa_schema_profile.rs`,
+        // ~1.3 instances per include node) routing every node cost ~25 % more
+        // allocation per write than broadcasting. Above the floor the trade
+        // inverts hard: the gate fixture routes one load against 999 skipped
+        // instances.
+        //
+        // The kill switch lands here too, so `JAZZ_INCLUDE_ROUTING=0` takes
+        // the v13-3 path exactly, without paying for resolutions it discards.
+        if !self.dirt.pending.full_tables.is_empty()
+            || self.subgraph_cache.len() <= MIN_ROUTABLE_INSTANCES
+            || !super::include_routing::routing_enabled()
+        {
+            self.broadcast_pending_inner_dirt();
+            return;
+        }
+
+        let pending = std::mem::take(&mut self.dirt.pending);
+        let mut routed: AHashMap<CacheKey, PendingInnerDirt> = AHashMap::new();
+        let mut broadcast = PendingInnerDirt::default();
+        for (channel, table, id) in pending.marks() {
+            match self.resolve_route(&table, id, row_loader) {
+                Route::Instances(keys) => {
+                    for key in keys {
+                        routed.entry(key).or_default().insert(channel, table, id);
+                    }
+                }
+                Route::Broadcast => broadcast.insert(channel, table, id),
+            }
+        }
+
+        for (key, marks) in routed {
+            if let Some(cached) = self.subgraph_cache.get_mut(&key) {
+                marks.apply_to(&mut cached.instance.graph);
+            }
+        }
+        if !broadcast.is_empty() {
+            for cached in self.subgraph_cache.values_mut() {
+                broadcast.apply_to(&mut cached.instance.graph);
+            }
+        }
+    }
+
+    /// Where one buffered mark must go.
+    ///
+    /// The row load is what turns a row id into a correlation, and it is the
+    /// only storage read routing adds: one point load per changed id, against
+    /// the full re-settle per cached instance it replaces. A row the loader
+    /// cannot see (deleted, or filtered out by the subscription's durability
+    /// tier) resolves to the instances already holding it — no instance can
+    /// materialize a row the same loader will refuse during the same settle.
+    fn resolve_route(
+        &self,
+        table: &TableName,
+        id: ObjectId,
+        row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
+    ) -> Route {
+        let correlate = match self.dirt.routing.correlate_position(table) {
+            // Either not a table this node reads, or one whose rows cannot be
+            // resolved at all — `route` decides which, and broadcasts if so.
+            None => None,
+            // The correlate IS the row id: no load needed.
+            Some(position) if position.is_row_id() => Some(Value::Uuid(id)),
+            Some(position) => row_loader(id, Some(*table))
+                .and_then(|loaded| {
+                    let descriptor = &self.schema.get(table)?.columns;
+                    decode_row(descriptor, &loaded.data).ok()
+                })
+                .and_then(|values| position.read(id, &values)),
+        };
+        self.dirt.routing.route(table, id, correlate.as_ref())
     }
 
     /// How many compiled subgraphs this node is holding.
@@ -505,6 +539,25 @@ impl ArraySubqueryNode {
     /// how much of it is ours, but RSS delta divided by this count can.
     pub fn cached_subgraph_count(&self) -> usize {
         self.subgraph_cache.len()
+    }
+
+    /// Distinct inner rows in the correlation-routing reverse index.
+    ///
+    /// Exposed so the index's size can be measured rather than argued: it must
+    /// stay Σ(rows this node's instances scan) — the same order as the data
+    /// they already hold — and never become an axis of its own.
+    #[cfg(any(test, feature = "test"))]
+    pub fn routed_rows_tracked(&self) -> usize {
+        self.dirt.routing.tracked_rows()
+    }
+
+    /// Every row id this node's cached instances scan, at any nesting depth.
+    ///
+    /// The reverse index already IS that set for this node (its instances put
+    /// their whole subtree in it as they evaluate), so an enclosing include
+    /// reads it here instead of walking the instance graphs a second time.
+    pub(crate) fn extend_routed_row_ids(&self, out: &mut Vec<ObjectId>) {
+        self.dirt.routing.extend_tracked_row_ids(out);
     }
 
     /// Check if the inner table changed (need to reevaluate all instances).
@@ -522,6 +575,12 @@ impl ArraySubqueryNode {
     where
         F: FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
     {
+        // Place the buffered marks before anything reads instance cleanliness:
+        // the freshness check below and `reevaluate_all`'s skip filter both
+        // ask "does this instance carry dirt", and that answer is only correct
+        // once routing has delivered this tick's marks.
+        self.route_pending_inner_dirt(&mut |id, hint| row_loader(id, hint));
+
         let mut result = TupleDelta::new();
 
         // Process removed tuples
@@ -785,7 +844,7 @@ impl ArraySubqueryNode {
 
     fn evaluate_subgraph_for_single(
         &mut self,
-        cache_key: (ObjectId, usize),
+        cache_key: CacheKey,
         correlation_value: &Value,
         io: &dyn Storage,
         row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
@@ -810,30 +869,28 @@ impl ArraySubqueryNode {
                 .instantiate(correlation_value.clone(), &self.schema)
             {
                 Some(fresh) => {
+                    // Retire whatever occupied the slot first, so its binding
+                    // and held rows leave the routing indices with it.
+                    self.drop_cached_subgraph(&cache_key);
                     self.evict_subgraphs_over_capacity(&cache_key);
                     self.subgraph_cache_clock += 1;
                     // A freshly compiled graph starts with every node dirty, so
-                    // it already covers everything the buffer holds: it is born
-                    // UP TO DATE with the current generation. That is what stops
-                    // an instance created after a buffered change from either
-                    // missing it or applying it a second time.
-                    let replaced = self.subgraph_cache.insert(
+                    // it already covers anything that could have been routed to
+                    // it: an instance created after a buffered change neither
+                    // misses it nor needs it applied a second time.
+                    self.subgraph_cache.insert(
                         cache_key,
                         CachedSubgraph {
                             correlation_value: correlation_value.clone(),
                             instance: fresh,
                             last_used: self.subgraph_cache_clock,
-                            applied_generation: self.pending_inner_dirt.generation,
+                            held_rows: Vec::new(),
                             _live: crate::query_manager::settle_cost::LiveGauge::enter(
                                 &crate::query_manager::settle_cost::LIVE_SUBQUERY_INSTANCES,
                             ),
                         },
                     );
-                    if let Some(replaced) = replaced
-                        && replaced.applied_generation != self.pending_inner_dirt.generation
-                    {
-                        self.release_stale_instances(1);
-                    }
+                    self.dirt.routing.bind(cache_key, correlation_value);
                 }
                 None => {
                     self.drop_cached_subgraph(&cache_key);
@@ -856,18 +913,6 @@ impl ArraySubqueryNode {
             );
         };
         cached.last_used = clock;
-
-        // Apply whatever inner-table dirt was buffered since this instance was
-        // last evaluated. This is the deferred half of the write-path marking:
-        // the instance ends up with the bitmap the eager walk would have given
-        // it (a superset when several ticks coalesced), just paid for here,
-        // where the settle was going to visit it anyway.
-        let generation = self.pending_inner_dirt.generation;
-        let consumed_pending = cached.applied_generation != generation;
-        if consumed_pending {
-            self.pending_inner_dirt.apply_to(&mut cached.instance.graph);
-            cached.applied_generation = generation;
-        }
         let instance = &mut cached.instance;
 
         if reused && !precise_dirty_enabled() {
@@ -925,9 +970,31 @@ impl ArraySubqueryNode {
                 })
             })
             .collect();
-        if consumed_pending {
-            self.release_stale_instances(1);
-        }
+
+        // Refresh the reverse index from everything this instance now scans —
+        // its own inner rows AND, recursively, every nested row its nested
+        // includes hold. That is what lets a grandchild change route through
+        // the child instance holding it.
+        //
+        // SCAN membership, not array membership: a row an instance scans but
+        // filters, de-prioritises out of a window, or hides by policy is still
+        // a row whose change that instance must re-check — leaving it out let
+        // a re-parented child sit in the old instance's incremental scan
+        // baseline forever (caught by the parity harness in `IndexScanNode`,
+        // via `subscription_output_oracle`). Sized by Σ(rows scanned), the
+        // same order as the data the instances already hold.
+        let mut held = std::mem::take(&mut self.dirt.scratch);
+        held.clear();
+        cached.instance.graph.collect_scanned_row_ids(&mut held);
+        held.sort_unstable();
+        held.dedup();
+        let previous = std::mem::replace(&mut cached.held_rows, held);
+        self.dirt
+            .routing
+            .set_held(cache_key, &previous, &cached.held_rows);
+        // Rotate the retired set in as the next rebuild's buffer.
+        self.dirt.scratch = previous;
+
         (Value::Array(array_elements), provenance, batch_provenance)
     }
 
@@ -997,22 +1064,24 @@ impl ArraySubqueryNode {
         }
     }
 
-    /// Whether every cached subgraph serving this correlation value exists,
-    /// is bound to the current correlation, owes the pending-dirt buffer
-    /// nothing, and carries no dirty nodes — in which case re-evaluating it is
-    /// provably a no-op (a settle over a clean bitmap evaluates zero nodes, so
-    /// the output tuples cannot have moved).
+    /// Whether every cached subgraph serving this correlation value exists, is
+    /// bound to the current correlation, and carries no dirty nodes — in which
+    /// case re-evaluating it is provably a no-op (a settle over a clean bitmap
+    /// evaluates zero nodes, so the output tuples cannot have moved).
     ///
-    /// The generation check is what keeps deferral invisible: an instance with
-    /// buffered dirt still owed to it is NOT clean, exactly as it would not
-    /// have been under eager marking, so it is re-evaluated on the same tick.
+    /// Both callers run [`Self::route_pending_inner_dirt`] first, so "no dirty
+    /// nodes" already accounts for this tick's marks: an instance a change can
+    /// reach was marked by the routing pass and is not clean here. That is the
+    /// whole of the bookkeeping v13-3 needed a node-global generation for.
     fn subgraph_state_clean(&self, outer_id: ObjectId, correlation_value: &Value) -> bool {
-        let generation = self.pending_inner_dirt.generation;
+        debug_assert!(
+            self.dirt.pending.is_empty(),
+            "instance cleanliness read before the buffered marks were routed"
+        );
         let element_clean = |index: usize, element: &Value| {
             matches!(
                 self.subgraph_cache.get(&(outer_id, index)),
                 Some(cached) if &cached.correlation_value == element
-                    && cached.applied_generation == generation
                     && !cached.instance.graph.has_dirty_nodes()
             )
         };
@@ -1039,6 +1108,13 @@ impl ArraySubqueryNode {
         F: FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
     {
         let mut result = TupleDelta::new();
+
+        // Normally a no-op: `process_with_context` runs first in the settle and
+        // has already drained the buffer. It is repeated here because this
+        // entry point is also reachable on its own, and skipping instances by
+        // cleanliness before the marks are placed is exactly the silent-
+        // staleness failure this lever must not introduce.
+        self.route_pending_inner_dirt(&mut |id, hint| row_loader(id, hint));
 
         // Clear inner_dirty flag
         self.inner_dirty = false;
@@ -1404,7 +1480,7 @@ mod tests {
         )
     }
 
-    fn seed_cache_entry(node: &mut ArraySubqueryNode, key: (ObjectId, usize), last_used: u64) {
+    fn seed_cache_entry(node: &mut ArraySubqueryNode, key: CacheKey, last_used: u64) {
         let correlation_value = Value::Integer(key.1 as i32);
         let instance = node
             .subgraph_template
@@ -1413,17 +1489,16 @@ mod tests {
         node.subgraph_cache.insert(
             key,
             CachedSubgraph {
-                correlation_value,
+                correlation_value: correlation_value.clone(),
                 instance,
                 last_used,
-                // Freshly instantiated: no buffered dirt has been applied to
-                // it yet, so it starts behind the current pending generation.
-                applied_generation: 0,
+                held_rows: Vec::new(),
                 _live: crate::query_manager::settle_cost::LiveGauge::enter(
                     &crate::query_manager::settle_cost::LIVE_SUBQUERY_INSTANCES,
                 ),
             },
         );
+        node.dirt.routing.bind(key, &correlation_value);
     }
 
     #[test]

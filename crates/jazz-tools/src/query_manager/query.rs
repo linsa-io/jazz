@@ -70,7 +70,12 @@ fn tuple_condition_column_index(tuple_descriptor: &TupleDescriptor, column: &str
     }
 }
 
-fn is_row_id_condition_column(column: &str) -> bool {
+/// Whether a filter column names the row's identity rather than a stored
+/// column: `filter_eq("id", v)` is a row-id condition, not a column read.
+///
+/// Shared with include routing, which must extract a changed row's correlate
+/// value exactly the way the correlated filter matches it.
+pub(crate) fn is_row_id_condition_column(column: &str) -> bool {
     matches!(column, "id" | "_id")
 }
 

@@ -201,6 +201,27 @@ impl SubgraphTemplate {
         &self.inner_column
     }
 
+    /// OFFSET the instantiated inner query carries.
+    ///
+    /// Include specs cannot set one (`ArraySubquerySpec` has no offset field),
+    /// and correlation routing depends on that: with an offset, deleting a row
+    /// BEFORE an instance's window shifts the window even though the instance
+    /// never held the row, so "route a vanished row only to the instances that
+    /// held it" would under-route. `DirtRouting` reads this and disables
+    /// itself rather than trusting the invariant.
+    pub fn inner_offset(&self) -> usize {
+        self.base_query.offset
+    }
+
+    /// Nested include specs carried inside this template's inner query.
+    ///
+    /// Their tables are registered against the OUTER node (`graph/compile.rs`,
+    /// the `nested_stack` walk), so the outer node needs their correlation
+    /// shape to route a grandchild change to the child instance holding it.
+    pub fn nested_specs(&self) -> &[crate::query_manager::query::ArraySubquerySpec] {
+        &self.base_query.array_subqueries
+    }
+
     /// Get the output descriptor for result rows.
     pub fn output_descriptor(&self) -> &RowDescriptor {
         &self.output_descriptor

@@ -241,10 +241,14 @@ fn report(label: &str, cost: &SettleCounts) {
 /// implies:
 ///
 /// * ONE subscription is live, so exactly one settles.
-/// * Buffered inner dirt carries a node-global generation, so all `OUTER_ROWS`
-///   cached instances look stale and every one is re-evaluated. That is the
-///   documented v14 target pinned by `include_instance_flatness.rs`; the point
-///   here is that the instrument REPORTS it, exactly, instead of under-counting.
+/// * The written row correlates to exactly ONE outer row, so correlation
+///   routing (v14 L1) marks exactly one cached instance and exactly one is
+///   re-evaluated; the other `OUTER_ROWS - 1` cannot hold it and stay clean.
+///   Before routing this read `OUTER_ROWS` — buffered dirt carried a
+///   node-global generation, so one mark made every cached instance look stale
+///   (the target `include_instance_flatness.rs` pinned). The point here is
+///   that the instrument REPORTS the difference exactly, instead of
+///   under-counting either state.
 /// * Every instance's correlation binding is unchanged, so not one of them may
 ///   compile. Zero instantiations, zero plan compiles — the split between "(a)
 ///   re-evaluating instances" and "(b) compiling plans" is the whole question
@@ -264,8 +268,8 @@ fn inner_row_write_reports_instance_evals_without_compiles() {
 
     assert_eq!(cost.subscriptions, 1, "one live subscription settles once");
     assert_eq!(
-        cost.instance_evals, OUTER_ROWS as u64,
-        "every cached include instance is re-evaluated by the generation bump"
+        cost.instance_evals, 1,
+        "correlation routing marks only the instance whose binding matches the written row"
     );
     assert_eq!(
         cost.subquery_instantiations, 0,

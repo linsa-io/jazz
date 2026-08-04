@@ -42,6 +42,25 @@ impl QueryGraph {
         self.dirty_bitmap.fill(true);
     }
 
+    /// Every row id this graph's scans currently hold, recursing into the
+    /// cached instances of any include it contains.
+    ///
+    /// This is the source of include routing's reverse index (v14 L1). It is
+    /// deliberately PRE-filter and PRE-window: an instance whose scan holds a
+    /// row must be re-checked when that row changes even if the row never
+    /// reaches its array — otherwise a row moving to a different parent leaves
+    /// the old instance's incremental scan baseline permanently ahead of a
+    /// full rescan.
+    pub(crate) fn collect_scanned_row_ids(&self, out: &mut Vec<ObjectId>) {
+        for compact in &self.nodes {
+            match &compact.node {
+                GraphNode::IndexScan(scan) => out.extend(scan.scanned_row_ids()),
+                GraphNode::ArraySubquery(node) => node.extend_routed_row_ids(out),
+                _ => {}
+            }
+        }
+    }
+
     /// Mark index scan nodes dirty for a given table/column.
     /// Also propagates dirty marks to downstream nodes.
     pub fn mark_dirty_for_column(&mut self, table: &str, column: &str) {
@@ -554,7 +573,27 @@ impl QueryGraph {
 
             match self.get_node(node_id) {
                 Some(GraphNode::IndexScan(_)) => {
-                    if let Some(GraphNode::IndexScan(scan_node)) = self.get_node_mut(node_id) {
+                    // `topo_sort_dirty` pulls a dirty node's whole INPUT chain
+                    // into the order, so a source node is visited even when
+                    // nothing about it changed — which is how one write into
+                    // an include's inner table made the settle re-scan the
+                    // whole OUTER result set: O(rows) storage reads to
+                    // reproduce the membership it already held. A node holding
+                    // an exact baseline, with no overlay in play, can only
+                    // rescan to that same membership, so the empty delta below
+                    // is the one the rescan would have produced (v14 L1's
+                    // residual term; `include_instance_flatness` measures it).
+                    let holds_baseline = local_overlay_rows.is_none_or(|rows| rows.is_empty())
+                        && !self.is_dirty(node_id)
+                        && matches!(
+                            self.get_node(node_id),
+                            Some(GraphNode::IndexScan(scan_node))
+                                if scan_node.holds_exact_baseline()
+                        );
+                    if holds_baseline {
+                        tuple_deltas.insert(node_id, TupleDelta::new());
+                    } else if let Some(GraphNode::IndexScan(scan_node)) = self.get_node_mut(node_id)
+                    {
                         let delta = SourceNode::scan(scan_node, &ctx);
                         tracing::debug!(
                             node_id = node_id.0,

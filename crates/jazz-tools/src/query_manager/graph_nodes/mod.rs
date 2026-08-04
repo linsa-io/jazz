@@ -2,6 +2,7 @@ pub mod alias;
 pub mod array_subquery;
 pub mod exists_output;
 pub mod filter;
+pub mod include_routing;
 pub mod index_scan;
 pub mod join;
 pub mod limit_offset;
