@@ -139,6 +139,37 @@ export function mintLocalFirstToken(
     )
   );
 }
+/**
+ * Set the level of the engine's native `tracing` logs, effective immediately.
+ *
+ * Engine logs are off until this is called and go to Apple unified logging
+ * (subsystem `io.linsa.jazz`, one category per tracing target) — never through
+ * the RN bridge, because these are hot-path lines. They are therefore invisible
+ * in the Metro/Expo terminal; read them with, on the simulator,
+ * `xcrun simctl spawn booted log stream --predicate 'subsystem ==
+ * "io.linsa.jazz"' --style compact` (add `--level debug` for tracing
+ * debug/trace lines), and on a device `xcrun devicectl device console` or
+ * Console.app filtered on the subsystem.
+ *
+ * `spec` is a `tracing` `EnvFilter` directive string, so it accepts both a bare
+ * level — `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"` — and
+ * per-target filtering, e.g. `"off,jazz::settle_cost=info"` to raise the settle
+ * cost counters alone. An empty string means `"off"`.
+ */
+export function setEngineLogLevel(spec: string): void /*throws*/ {
+  uniffiCaller.rustCallWithError(
+    /*liftError:*/ FfiConverterTypeJazzRnError.lift.bind(
+      FfiConverterTypeJazzRnError
+    ),
+    /*caller:*/ (callStatus) => {
+      nativeModule().ubrn_uniffi_jazz_rn_fn_func_set_engine_log_level(
+        FfiConverterString.lower(spec),
+        callStatus
+      );
+    },
+    /*liftString:*/ FfiConverterString.lift
+  );
+}
 
 export interface AuthFailureCallback {
   /**
@@ -1699,6 +1730,14 @@ function uniffiEnsureInitialized() {
   ) {
     throw new UniffiInternalError.ApiChecksumMismatch(
       'uniffi_jazz_rn_checksum_func_mint_local_first_token'
+    );
+  }
+  if (
+    nativeModule().ubrn_uniffi_jazz_rn_checksum_func_set_engine_log_level() !==
+    43911
+  ) {
+    throw new UniffiInternalError.ApiChecksumMismatch(
+      'uniffi_jazz_rn_checksum_func_set_engine_log_level'
     );
   }
   if (

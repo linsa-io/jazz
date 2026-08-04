@@ -227,6 +227,10 @@ interface NativeModuleInterface {
     ttlSeconds: bigint,
     uniffi_out_err: UniffiRustCallStatus
   ): Uint8Array;
+  ubrn_uniffi_jazz_rn_fn_func_set_engine_log_level(
+    spec: Uint8Array,
+    uniffi_out_err: UniffiRustCallStatus
+  ): void;
   ubrn_ffi_jazz_rn_rust_future_poll_u8(
     handle: bigint,
     callback: UniffiRustFutureContinuationCallback,
@@ -361,6 +365,7 @@ interface NativeModuleInterface {
   ): void;
   ubrn_uniffi_jazz_rn_checksum_func_mint_anonymous_token(): number;
   ubrn_uniffi_jazz_rn_checksum_func_mint_local_first_token(): number;
+  ubrn_uniffi_jazz_rn_checksum_func_set_engine_log_level(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_batched_tick(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_begin_batch(): number;
   ubrn_uniffi_jazz_rn_checksum_method_rnruntime_close(): number;

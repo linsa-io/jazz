@@ -32,6 +32,8 @@ use jazz_tools::schema_manager::{rehydrate_schema_manager_from_catalogue, AppId,
 use jazz_tools::storage::{SqliteStorage, Storage};
 use jazz_tools::sync_manager::{DurabilityTier, QueryPropagation, SyncManager};
 
+mod engine_log;
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -576,6 +578,10 @@ impl RnRuntime {
         data_path: Option<String>,
     ) -> Result<Arc<Self>, JazzRnError> {
         with_panic_boundary("new", || {
+            // Put the engine-log subscriber in place with everything filtered
+            // out, so `setEngineLogLevel` has a filter to reload later.
+            engine_log::install();
+
             let schema: Schema = serde_json::from_str(&schema_json).map_err(json_err)?;
 
             let persistence_tier = tier.as_deref().map(parse_tier).transpose()?;
@@ -1492,6 +1498,28 @@ mod tests {
 // ============================================================================
 // Module-level utilities
 // ============================================================================
+
+/// Set the level of the engine's native `tracing` logs, effective immediately.
+///
+/// Engine logs are off until this is called and go to Apple unified logging
+/// (subsystem `io.linsa.jazz`, one category per tracing target) — never through
+/// the RN bridge, because these are hot-path lines. They are therefore invisible
+/// in the Metro/Expo terminal; read them with, on the simulator,
+/// `xcrun simctl spawn booted log stream --predicate 'subsystem ==
+/// "io.linsa.jazz"' --style compact` (add `--level debug` for tracing
+/// debug/trace lines), and on a device `xcrun devicectl device console` or
+/// Console.app filtered on the subsystem.
+///
+/// `spec` is a `tracing` `EnvFilter` directive string, so it accepts both a bare
+/// level — `"off"`, `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"` — and
+/// per-target filtering, e.g. `"off,jazz::settle_cost=info"` to raise the settle
+/// cost counters alone. An empty string means `"off"`.
+#[uniffi::export]
+pub fn set_engine_log_level(spec: String) -> Result<(), JazzRnError> {
+    with_panic_boundary("set_engine_log_level", || {
+        engine_log::set_level(&spec).map_err(|message| JazzRnError::Internal { message })
+    })
+}
 
 /// Mint a local-first JWT from a base64url-encoded 32-byte seed.
 ///

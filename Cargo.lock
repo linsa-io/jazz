@@ -1788,6 +1788,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake3",
+ "cc",
  "futures",
  "hex",
  "indexmap",
@@ -1796,6 +1797,8 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uniffi",
  "uuid",
 ]
