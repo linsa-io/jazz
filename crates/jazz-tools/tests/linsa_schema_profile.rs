@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use jazz_tools::object::ObjectId;
+use jazz_tools::query_manager::settle_cost::{LIVE_SUBQUERY_INSTANCES, LIVE_SUBQUERY_NODES};
 use jazz_tools::query_manager::types::ColumnType;
 use jazz_tools::row_input;
 use jazz_tools::server::JazzServer;
@@ -150,6 +151,32 @@ fn insert_filled(
         .insert(table, fill_required(schema, table, provided))
         .unwrap_or_else(|e| panic!("insert into {table}: {e:?}"));
     id
+}
+
+/// The live-instance gauge next to the residency a phase added.
+///
+/// The production `jazz::settle_cost` line reports ~23 800 include-instance
+/// EVALUATIONS per settle and the server holds ~1.5 GB; dividing one by the
+/// other only yields bytes per instance if evaluations and live instances are
+/// the same population. `live_instances` is the gauge that removes the
+/// assumption, and printing it beside the phase's own MiB delta is the local
+/// analogue of that division — with the caveat that the delta covers the whole
+/// subscription graph (flat scans, sync scopes, row caches), not only the
+/// includes, so the per-instance figure it implies is an UPPER bound. The
+/// isolated per-instance measurement is `tests/include_instance_bytes.rs`.
+fn report_include_census(phase: &str, phase_mb: f64) {
+    let instances = LIVE_SUBQUERY_INSTANCES.load(Ordering::Relaxed);
+    let nodes = LIVE_SUBQUERY_NODES.load(Ordering::Relaxed);
+    let per_instance_kib = if instances == 0 {
+        0.0
+    } else {
+        phase_mb * 1024.0 / instances as f64
+    };
+    eprintln!(
+        "{phase} include census: {instances} live subgraph instances across {nodes} include \
+         nodes; phase delta {phase_mb:.1} MiB => {per_instance_kib:.1} KiB per instance \
+         (upper bound: the delta is the whole graph, not only includes)"
+    );
 }
 
 /// The 19-subscription graph the production census measured, per client.
@@ -549,6 +576,7 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
         live_mb() - before_alice,
         peak_mb()
     );
+    report_include_census("phase C", live_mb() - before_alice);
 
     // Visibility check so an empty-result graph cannot masquerade as cheap.
     let visible = alice_client
@@ -609,6 +637,7 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
         live_mb(),
         live_mb() - before_bob
     );
+    report_include_census("phase D", live_mb() - before_bob);
 
     let tier_scans_after_subs =
         jazz_tools::row_histories::QUERY_TIER_READ_HISTORY_SCANS.load(Ordering::Relaxed);
@@ -657,6 +686,7 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
     );
 
     let heartbeat_before = total_allocated();
+    let settle_before = jazz_tools::query_manager::settle_cost::SettleCounts::snapshot();
     let mut last_probe = None;
     for i in 0..probe_writes {
         last_probe = Some(
@@ -715,6 +745,28 @@ async fn app_graph_on_real_schema_with_hot_history_row() {
             - tier_scans_after_subs,
         jazz_tools::row_histories::QUERY_PROVENANCE_HISTORY_SCANS.load(Ordering::Relaxed)
             - provenance_scans_after_subs,
+    );
+
+    // Evaluations against the instance population that produced them — the
+    // ratio the production `settle_cost` line could not report before the
+    // `live_instances` gauge existed. Neither number bounds the other in
+    // general: a clean instance is skipped (evals < instances) and an instance
+    // touched by both `process_with_context` and `reevaluate_all` in one pass
+    // is counted twice (evals > instances). Reported, never asserted: this
+    // process runs a server and three clients on shared counters.
+    let settle =
+        jazz_tools::query_manager::settle_cost::SettleCounts::snapshot().since(settle_before);
+    let probe_total = 2 * probe_writes as u64;
+    eprintln!(
+        "phase D2 include accounting: {} instance evals over {probe_total} writes ({:.0} per \
+         write) against a standing population of {} live instances in {} include nodes; \
+         {} instantiations, {} plan compiles",
+        settle.instance_evals,
+        settle.instance_evals as f64 / probe_total as f64,
+        settle.live_instances,
+        settle.live_instance_nodes,
+        settle.subquery_instantiations,
+        settle.plan_compiles,
     );
 
     // ── teardown: drop both devices, sweep, must release ───────────────────

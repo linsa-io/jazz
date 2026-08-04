@@ -217,6 +217,11 @@ struct CachedSubgraph {
     /// [`PendingInnerDirt::generation`] this instance's graph has already been
     /// marked with. Behind it means the buffer still owes this instance.
     applied_generation: u64,
+    /// Membership in the process-wide live-instance gauge, held for exactly as
+    /// long as this entry exists. Tied to the entry's lifetime rather than to
+    /// the removal call sites because entries also leave by plain drop (of the
+    /// map, the node, or the whole compiled graph), which no call site sees.
+    _live: crate::query_manager::settle_cost::LiveGauge,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +276,15 @@ impl ArraySubqueryNode {
         let output_descriptor = RowDescriptor::new(output_columns);
         let output_tuple_descriptor =
             TupleDescriptor::single_with_materialization("", output_descriptor.clone(), true);
+
+        // Node-level half of the live-instance gauge, released in `Drop`. A
+        // `LiveGauge` FIELD would be the obvious shape, but this is the largest
+        // `GraphNode` variant, so its eight bytes would widen every node slot
+        // of every compiled graph — the same reason `pending_inner_dirt` is
+        // boxed.
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::LIVE_SUBQUERY_NODES,
+        );
 
         Self {
             outer_descriptor,
@@ -810,6 +824,9 @@ impl ArraySubqueryNode {
                             instance: fresh,
                             last_used: self.subgraph_cache_clock,
                             applied_generation: self.pending_inner_dirt.generation,
+                            _live: crate::query_manager::settle_cost::LiveGauge::enter(
+                                &crate::query_manager::settle_cost::LIVE_SUBQUERY_INSTANCES,
+                            ),
                         },
                     );
                     if let Some(replaced) = replaced
@@ -1124,6 +1141,14 @@ impl ArraySubqueryNode {
     }
 }
 
+impl Drop for ArraySubqueryNode {
+    fn drop(&mut self) {
+        crate::query_manager::settle_cost::unbump(
+            &crate::query_manager::settle_cost::LIVE_SUBQUERY_NODES,
+        );
+    }
+}
+
 impl RowNode for ArraySubqueryNode {
     fn output_descriptor(&self) -> &RowDescriptor {
         &self.output_descriptor
@@ -1394,6 +1419,9 @@ mod tests {
                 // Freshly instantiated: no buffered dirt has been applied to
                 // it yet, so it starts behind the current pending generation.
                 applied_generation: 0,
+                _live: crate::query_manager::settle_cost::LiveGauge::enter(
+                    &crate::query_manager::settle_cost::LIVE_SUBQUERY_INSTANCES,
+                ),
             },
         );
     }

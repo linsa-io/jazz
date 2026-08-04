@@ -291,6 +291,19 @@ fn inner_row_write_reports_instance_evals_without_compiles() {
         cost.row_loads > 0 && cost.graph_nodes > 0 && cost.index_reads > 0,
         "the pass did real graph and storage work: {cost:?}"
     );
+    // The gauge is what separates "N instances evaluated once" from "one
+    // instance evaluated N times" — two readings that are equal here only
+    // because this scenario re-evaluates every instance exactly once. An
+    // instance gauge that merely tracked the evaluation counter would report
+    // the same number and answer nothing.
+    assert_eq!(
+        cost.live_instances, OUTER_ROWS as u64,
+        "one cached subgraph instance per outer row is live"
+    );
+    assert_eq!(
+        cost.live_instance_nodes, 1,
+        "the subscription graph carries exactly one include node"
+    );
 }
 
 /// A new outer row, which is the shape that MUST compile.
@@ -531,6 +544,7 @@ fn threshold_decides_whether_the_pass_is_logged() {
         1,
         "exactly one cost line per settle pass, got: {line}"
     );
+    let live_instances_field = format!("live_instances={OUTER_ROWS}");
     for field in [
         "micros=",
         "subscriptions=1",
@@ -544,6 +558,8 @@ fn threshold_decides_whether_the_pass_is_logged() {
         "row_loads=",
         "index_reads=",
         "rows_emitted=1",
+        live_instances_field.as_str(),
+        "live_instance_nodes=1",
         "hot_micros=",
         "hot_client=\"local\"",
         "hot_query=",

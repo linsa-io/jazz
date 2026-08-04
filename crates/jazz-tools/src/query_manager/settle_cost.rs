@@ -112,10 +112,64 @@ pub static INDEX_READS: AtomicU64 = AtomicU64::new(0);
 /// denominator for everything above: the useful output the pass produced.
 pub static ROWS_EMITTED: AtomicU64 = AtomicU64::new(0);
 
+/// Cached subgraph instances currently held by every `ArraySubqueryNode` in the
+/// process — a GAUGE, not a counter: it goes down as well as up, and a settle
+/// pass reports its VALUE, never a delta (see [`SettleCounts::since`]).
+///
+/// It exists because [`SUBQUERY_INSTANCE_EVALS`] alone cannot say whether a
+/// pass's evaluations came from many instances visited once or few instances
+/// visited many times, and the two imply completely different fixes (routing
+/// versus plan sharing). Divided into RSS it is also the only way to turn
+/// "the server holds 1.6 GB" into a per-instance number without assuming that
+/// evaluations and instances are the same population.
+pub static LIVE_SUBQUERY_INSTANCES: AtomicU64 = AtomicU64::new(0);
+
+/// Live `ArraySubqueryNode`s — the include nodes those instances are spread
+/// over, one per include in each compiled (sub)graph. Also a gauge.
+///
+/// `LIVE_SUBQUERY_INSTANCES / LIVE_SUBQUERY_NODES` is the mean fan-out of an
+/// include, which is what says whether the instance population comes from a
+/// few wide includes or from many nested ones.
+pub static LIVE_SUBQUERY_NODES: AtomicU64 = AtomicU64::new(0);
+
 /// Count one event.
 #[inline]
 pub(crate) fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Give back one gauge membership counted with [`bump`].
+#[inline]
+pub(crate) fn unbump(gauge: &AtomicU64) {
+    gauge.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// RAII membership token for a gauge: one relaxed increment on construction,
+/// one relaxed decrement on drop, nothing else.
+///
+/// Cached subgraph instances leave through four different paths — the LRU
+/// eviction, the per-outer-row `retain`, replacement by a re-instantiation, and
+/// plain drop of the map when the node or the whole graph goes away. A
+/// hand-written decrement at each site would miss the last one, and a gauge
+/// that only leaks upward is worse than no gauge, so membership is tied to the
+/// entry's lifetime instead of to the call sites.
+#[derive(Debug)]
+pub(crate) struct LiveGauge(&'static AtomicU64);
+
+impl LiveGauge {
+    /// Join `gauge` until the returned token is dropped.
+    #[inline]
+    pub(crate) fn enter(gauge: &'static AtomicU64) -> Self {
+        bump(gauge);
+        Self(gauge)
+    }
+}
+
+impl Drop for LiveGauge {
+    #[inline]
+    fn drop(&mut self) {
+        unbump(self.0);
+    }
 }
 
 /// Count `amount` events at once, for sites that already know the batch size.
@@ -179,6 +233,12 @@ pub struct SettleCounts {
     pub row_loads: u64,
     pub index_reads: u64,
     pub rows_emitted: u64,
+    /// Gauge, not a counter: live cached subgraph instances at the moment of
+    /// the reading.
+    pub live_instances: u64,
+    /// Gauge, not a counter: live `ArraySubqueryNode`s at the moment of the
+    /// reading.
+    pub live_instance_nodes: u64,
 }
 
 impl SettleCounts {
@@ -198,10 +258,16 @@ impl SettleCounts {
             row_loads: ROW_LOADS.load(Ordering::Relaxed),
             index_reads: INDEX_READS.load(Ordering::Relaxed),
             rows_emitted: ROWS_EMITTED.load(Ordering::Relaxed),
+            live_instances: LIVE_SUBQUERY_INSTANCES.load(Ordering::Relaxed),
+            live_instance_nodes: LIVE_SUBQUERY_NODES.load(Ordering::Relaxed),
         }
     }
 
-    /// Work done since `base`, field by field.
+    /// Work done since `base`, field by field — except for the gauges, which
+    /// carry the LATER reading through unchanged. Subtracting them would report
+    /// "instances created minus destroyed during the pass", which is a number
+    /// nobody wants; what the pass needs to publish is how many instances
+    /// existed while it ran.
     pub fn since(self, base: Self) -> Self {
         Self {
             subscriptions: self.subscriptions.saturating_sub(base.subscriptions),
@@ -221,6 +287,8 @@ impl SettleCounts {
             row_loads: self.row_loads.saturating_sub(base.row_loads),
             index_reads: self.index_reads.saturating_sub(base.index_reads),
             rows_emitted: self.rows_emitted.saturating_sub(base.rows_emitted),
+            live_instances: self.live_instances,
+            live_instance_nodes: self.live_instance_nodes,
         }
     }
 }
@@ -295,6 +363,8 @@ impl Drop for SettlePass {
             row_loads = cost.row_loads,
             index_reads = cost.index_reads,
             rows_emitted = cost.rows_emitted,
+            live_instances = cost.live_instances,
+            live_instance_nodes = cost.live_instance_nodes,
             hot_micros,
             hot_client,
             hot_query = HOT_QUERY.load(Ordering::Relaxed),
