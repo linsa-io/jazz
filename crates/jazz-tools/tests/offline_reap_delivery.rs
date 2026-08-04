@@ -199,3 +199,127 @@ async fn a_reaped_peer_receives_what_was_written_while_it_was_away() {
     alice.shutdown().await.ok();
     server.shutdown().await;
 }
+
+/// The same window WITHOUT a reap — the shape the field actually reports.
+///
+/// Reaping is what SAVES the peer: `remove_client` drops its `ClientState` and its
+/// `server_subscriptions`, so the next subscribe takes the full settle path and re-derives
+/// everything. Leave the peer un-reaped and the server keeps two pieces of in-memory state
+/// that say the row is already handled:
+///
+/// * `sent_batch_ids` is marked at ENQUEUE time — `queue_row_to_client`
+///   (sync_manager/sync_logic.rs:356) records the delivery before pushing to the outbox,
+///   and the outbox entry is dropped without a trace when the client has no live stream
+///   (`prepare_payload`, server/mod.rs:249; the send result is discarded in
+///   runtime_core/ticks.rs:851).
+/// * on reconnect, `process_pending_query_subscriptions` finds an equivalent, already
+///   settled subscription, re-emits `QuerySettled` from the CACHED `last_scope` and
+///   `continue`s (query_manager/server_queries.rs:1049-1084) — no re-diff, no resend.
+///
+/// The identity has to be pinned for any of this to apply: a client that arrives with a
+/// fresh id is a new peer and always gets everything. That is exactly why seven earlier
+/// probe-based models passed — the server log showed a new `client_id` on every reconnect.
+#[tokio::test]
+#[ignore = "RED: reproduces the field defect — remove the ignore with the fix"]
+async fn an_unreaped_peer_receives_what_was_written_while_it_was_away() {
+    let schema = test_schema();
+    let server = JazzServer::start_with_schema(schema.clone()).await;
+
+    let alice = TestingClient::builder()
+        .with_server(&server)
+        .with_schema(schema.clone())
+        .with_user_id("alice-unreaped")
+        .ready_on("todos", READY_TIMEOUT)
+        .connect()
+        .await;
+
+    let (bob_ctx, bob) = TestingClient::builder()
+        .with_server(&server)
+        .with_schema(schema.clone())
+        .with_user_id("bob-unreaped")
+        .with_persistent_storage()
+        .ready_on("todos", READY_TIMEOUT)
+        .connect_with_context()
+        .await;
+    // Pin the wire identity: `connect_with_context` hands back the context the peer used,
+    // and reconnecting through it is what makes the server treat this as the SAME client.
+    let pinned_client_id = bob.client_id();
+    assert!(
+        pinned_client_id.is_some(),
+        "the peer must have a wire client id, or this test is about a different scenario",
+    );
+
+    let (first_id, _, _) = alice
+        .insert("todos", todo("before-offline"))
+        .expect("insert");
+    let query = QueryBuilder::new("todos").build();
+    let mut before = bob.subscribe(query.clone()).await.expect("bob subscribes");
+    expect_delivered(
+        &mut before,
+        &[first_id].into_iter().collect(),
+        "bob while online",
+    )
+    .await;
+
+    bob.shutdown().await.expect("bob goes offline");
+    // NO reap: the disconnect candidate is left to sit, exactly as it does under a TTL of
+    // hours. Assert that, so a future TTL change cannot quietly turn this into the other
+    // test.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.disconnect_candidate_count().await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the disconnect candidate",
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    alice
+        .update(
+            first_id,
+            vec![(
+                "title".to_string(),
+                Value::Text("edited-while-away".to_string()),
+            )],
+        )
+        .expect("alice edits while bob is away");
+    let (second_id, _, _) = alice
+        .insert("todos", todo("added-while-away"))
+        .expect("alice adds while bob is away");
+
+    wait_for_query(
+        &alice,
+        query.clone(),
+        Some(DurabilityTier::EdgeServer),
+        QUERY_TIMEOUT,
+        "alice's writes reached the server",
+        |rows| (rows.len() == 2).then_some(()),
+    )
+    .await;
+
+    let mut reconnect_ctx = bob_ctx.clone();
+    reconnect_ctx.client_id = pinned_client_id;
+    let bob_back = JazzClient::connect(reconnect_ctx)
+        .await
+        .expect("bob reconnects with the same identity");
+    assert_eq!(
+        bob_back.client_id(),
+        pinned_client_id,
+        "the reconnected peer must present the same wire client id",
+    );
+
+    let mut sub = bob_back
+        .subscribe(query.clone())
+        .await
+        .expect("bob resubscribes");
+    expect_delivered(
+        &mut sub,
+        &[first_id, second_id].into_iter().collect(),
+        "bob after reconnecting without a reap",
+    )
+    .await;
+
+    bob_back.shutdown().await.ok();
+    alice.shutdown().await.ok();
+    server.shutdown().await;
+}
