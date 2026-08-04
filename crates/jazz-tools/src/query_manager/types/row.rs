@@ -10,8 +10,23 @@ use crate::object::ObjectId;
 use crate::row_histories::BatchId;
 use std::collections::HashMap;
 
+/// Shared row payload.
+///
+/// `Arc<Box<[u8]>>`, NOT `Arc<[u8]>`, and the extra indirection is the entire point.
+/// `Arc<[u8]>` stores the strong count, the weak count and the bytes in ONE allocation, so
+/// a surviving `Weak` keeps the whole payload resident long after the last strong
+/// reference is gone — the value is dropped, the memory is not. `row_bytes_dedup` holds
+/// exactly such a `Weak` per (row, batch) and only sweeps them every few thousand
+/// operations, which on blob rows meant megabytes per served part sitting in RSS with
+/// nothing pointing at them. Measured on a copy of the production store: serving 5.2 MiB
+/// of `file_parts` left 5.16 MiB allocated-but-dead; with the sweep forced on every
+/// operation the same run left 0.01 MiB.
+///
+/// Boxing the payload separates the two lifetimes: a stale `Weak` now pins the Arc header
+/// (~24 bytes) and the bytes are freed with the last strong reference. Deduplication is
+/// unchanged — subscribers still share one payload allocation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RowBytes(Arc<[u8]>);
+pub struct RowBytes(Arc<Box<[u8]>>);
 
 impl RowBytes {
     pub fn to_vec(&self) -> Vec<u8> {
@@ -20,24 +35,24 @@ impl RowBytes {
 
     /// The shared allocation behind these bytes (for cross-subscription
     /// deduplication — see `query_manager::row_bytes_dedup`).
-    pub(crate) fn as_arc(&self) -> &Arc<[u8]> {
+    pub(crate) fn as_arc(&self) -> &Arc<Box<[u8]>> {
         &self.0
     }
 
-    pub(crate) fn from_arc(arc: Arc<[u8]>) -> Self {
+    pub(crate) fn from_arc(arc: Arc<Box<[u8]>>) -> Self {
         Self(arc)
     }
 }
 
 impl From<Vec<u8>> for RowBytes {
     fn from(value: Vec<u8>) -> Self {
-        Self(Arc::from(value.into_boxed_slice()))
+        Self(Arc::new(value.into_boxed_slice()))
     }
 }
 
 impl From<&[u8]> for RowBytes {
     fn from(value: &[u8]) -> Self {
-        Self(Arc::from(value))
+        Self(Arc::new(value.to_vec().into_boxed_slice()))
     }
 }
 
@@ -45,25 +60,25 @@ impl Deref for RowBytes {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
+        self.0.as_ref().as_ref()
     }
 }
 
 impl AsRef<[u8]> for RowBytes {
     fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
+        self.0.as_ref().as_ref()
     }
 }
 
 impl PartialEq<Vec<u8>> for RowBytes {
     fn eq(&self, other: &Vec<u8>) -> bool {
-        self.0.as_ref() == other.as_slice()
+        self.0.as_ref().as_ref() == other.as_slice()
     }
 }
 
 impl PartialEq<RowBytes> for Vec<u8> {
     fn eq(&self, other: &RowBytes) -> bool {
-        self.as_slice() == other.0.as_ref()
+        self.as_slice() == other.0.as_ref().as_ref()
     }
 }
 

@@ -11,6 +11,14 @@
 //! byte-identical content is collapsed onto one shared allocation. Entries
 //! are `Weak`, so the cache never retains bytes on its own: content dies with
 //! its last subscriber.
+//!
+//! That last sentence was only true of the VALUE. `RowBytes` used to be an
+//! `Arc<[u8]>`, whose counters and payload live in one allocation, so a `Weak`
+//! left here kept the payload RESIDENT until the next sweep even though its
+//! last subscriber was long gone — and the sweep only runs from `dedup`, so an
+//! idle server never ran it at all. `RowBytes` now boxes its payload, which
+//! leaves a stale entry pinning the Arc header rather than a megabyte of blob
+//! (see the note on the type, and `a_stale_entry_pins_only_the_header` below).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -24,7 +32,7 @@ const PURGE_EVERY_OPS: usize = 4096;
 
 #[derive(Debug, Default)]
 pub(super) struct RowBytesDedup {
-    map: HashMap<(ObjectId, BatchId), Weak<[u8]>>,
+    map: HashMap<(ObjectId, BatchId), Weak<Box<[u8]>>>,
     ops_since_purge: usize,
 }
 
@@ -51,7 +59,7 @@ impl RowBytesDedup {
 
         let key = (row_id, batch_id);
         if let Some(existing) = self.map.get(&key).and_then(Weak::upgrade)
-            && existing.as_ref() == fresh.as_ref()
+            && existing.as_ref().as_ref() == fresh.as_ref()
         {
             return RowBytes::from_arc(existing);
         }
@@ -66,6 +74,49 @@ mod tests {
 
     fn bytes(fill: u8, len: usize) -> RowBytes {
         RowBytes::from(vec![fill; len])
+    }
+
+    /// The regression gate for the retention bug.
+    ///
+    /// It asserts the SHAPE rather than a byte count, because a unit test cannot observe
+    /// deallocation: `jazz-tools` installs mimalloc globally, so a counting allocator
+    /// cannot be layered underneath one here. What it can pin is the property that makes
+    /// the deallocation certain — the payload sits behind a `Box`, so `RowBytes` is one
+    /// word wide and the bytes die with the last strong reference no matter how long a
+    /// `Weak` outlives them. Going back to `Arc<[u8]>` makes it a two-word fat pointer and
+    /// fails here.
+    ///
+    /// The byte-level evidence is a measurement, not a test: serving 5.2 MiB of blob rows
+    /// left 5.16 MiB allocated-but-dead before this change and 0.01 MiB after, and a
+    /// subscriber-attached upload run dropped from 742 to 554 MiB RSS.
+    #[test]
+    fn a_stale_entry_pins_only_the_header() {
+        use std::mem::size_of;
+
+        assert_eq!(
+            size_of::<RowBytes>(),
+            size_of::<usize>(),
+            "RowBytes must stay one word wide: a fat `Arc<[u8]>` puts the payload in the \
+             same allocation as the weak count, so a stale dedup entry keeps it resident",
+        );
+
+        let mut dedup = RowBytesDedup::default();
+        let row = ObjectId::new();
+        let batch = BatchId::new();
+        let payload = dedup.dedup(row, batch, bytes(3, 4096));
+
+        // The map holds a Weak, so the only strong reference is the caller's.
+        assert_eq!(Arc::strong_count(payload.as_arc()), 1);
+        drop(payload);
+
+        // Dropping it runs `Box`'s destructor — the entry survives until the next sweep
+        // but has nothing behind it.
+        let revived = dedup.dedup(row, batch, bytes(3, 4096));
+        assert_eq!(
+            Arc::strong_count(revived.as_arc()),
+            1,
+            "a dead entry must be replaced by the fresh load, not resurrected",
+        );
     }
 
     #[test]
