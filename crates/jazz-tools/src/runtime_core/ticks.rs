@@ -788,15 +788,36 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         }
 
         // Flush the storage durability barrier so writes survive a hard kill (tab close, crash).
+        let mut barrier_failed = false;
         if self.storage_write_pending_flush {
             let _span = tracing::debug_span!("flush_wal").entered();
             if let Err(error) = self.flush_wal_barrier() {
+                barrier_failed = true;
                 tracing::error!(%error, "storage WAL flush failed");
                 if self.should_schedule_storage_flush_retry() {
                     self.scheduler.schedule_batched_tick();
                 }
             }
         }
+
+        // Only now may this node report what it applied. Confirming before the barrier
+        // would let the sender clear its claim for a row a crash would take with it — the
+        // same loss the confirmation exists to prevent, from the other side.
+        if !barrier_failed {
+            self.confirm_applied_rows_upstream();
+        }
+    }
+
+    /// Report rows applied this tick to the server that sent them.
+    fn confirm_applied_rows_upstream(&mut self) {
+        let Some(server_id) = self.transport.as_ref().map(|handle| handle.server_id) else {
+            return;
+        };
+        self.schema_manager
+            .query_manager_mut()
+            .sync_manager_mut()
+            .queue_applied_row_confirmations(server_id);
+        self.flush_runtime_outbox("flushing delivery confirmations");
     }
 
     fn flush_runtime_outbox(&mut self, log_message: &str) {
@@ -885,7 +906,13 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                 crate::transport_manager::TransportInbound::Connected {
                     catalogue_state_hash,
                     next_sync_seq,
+                    supports_delivery_acks,
                 } => {
+                    // Learned per connection: a reconnect may land on a different server.
+                    self.schema_manager
+                        .query_manager_mut()
+                        .sync_manager_mut()
+                        .set_upstream_supports_delivery_acks(supports_delivery_acks);
                     if let Some(next_sync_seq) = next_sync_seq {
                         self.set_next_expected_server_sequence(server_id, next_sync_seq);
                     }
@@ -1152,7 +1179,12 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             crate::transport_manager::TransportInbound::Connected {
                 catalogue_state_hash,
                 next_sync_seq,
+                supports_delivery_acks,
             } => {
+                self.schema_manager
+                    .query_manager_mut()
+                    .sync_manager_mut()
+                    .set_upstream_supports_delivery_acks(supports_delivery_acks);
                 self.remove_server(server_id);
                 self.add_server_with_catalogue_state_hash_and_permission(
                     server_id,

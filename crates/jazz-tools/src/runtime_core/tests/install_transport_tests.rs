@@ -180,6 +180,7 @@ mod install_transport_tests {
         core.handle_transport_inbound_for_test(
             server_id,
             crate::transport_manager::TransportInbound::Connected {
+                supports_delivery_acks: true,
                 catalogue_state_hash: Some(current_hash),
                 next_sync_seq: None,
             },
@@ -227,6 +228,7 @@ mod install_transport_tests {
         core.handle_transport_inbound_for_test(
             server_id,
             crate::transport_manager::TransportInbound::Connected {
+                supports_delivery_acks: true,
                 catalogue_state_hash: None,
                 next_sync_seq: None,
             },
@@ -347,6 +349,7 @@ mod install_transport_tests {
         core.handle_transport_inbound_for_test(
             server_id,
             crate::transport_manager::TransportInbound::Connected {
+                supports_delivery_acks: true,
                 catalogue_state_hash: Some(current_hash),
                 next_sync_seq: None,
             },

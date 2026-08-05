@@ -1369,6 +1369,15 @@ impl SyncManager {
                     row.clone(),
                     AuthoritativeFateRecording::AcceptedByLocalAuthority,
                 ) {
+                    // Applied — and only now may the sender record it as delivered. A
+                    // duplicate re-offer lands here too: the apply is an idempotent no-op
+                    // that still reports success, which is what lets a redelivery loop
+                    // converge instead of repeating forever.
+                    self.note_applied_row(
+                        applied.row.row_id,
+                        applied.row.branch.as_str(),
+                        applied.row.batch_id,
+                    );
                     self.apply_authoritative_transaction_fate_for_row(
                         storage,
                         server_id,

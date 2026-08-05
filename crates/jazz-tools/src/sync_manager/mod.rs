@@ -76,6 +76,15 @@ pub struct SyncManager {
     /// accepts writes for as long as TCP takes to notice.
     pub(super) pending_client_deliveries:
         HashMap<ClientId, HashMap<(ObjectId, BranchName), PendingDelivery>>,
+
+    /// Rows this node has applied and not yet reported upstream.
+    ///
+    /// Drained after the write barrier, never before: a confirmation that leaves ahead of
+    /// the fsync lets the sender clear its claim for a row this node would lose on a crash
+    /// — the original defect, reproduced from the other side.
+    pub(super) applied_rows_to_confirm: Vec<ConfirmedRow>,
+    /// Whether the upstream server understands confirmations, from its handshake response.
+    pub(super) upstream_supports_delivery_acks: bool,
     /// Pending permission checks awaiting policy evaluation.
     pub(super) pending_permission_checks: Vec<PendingPermissionCheck>,
     /// Pending query subscriptions awaiting QueryGraph building by QueryManager.
@@ -252,6 +261,8 @@ impl SyncManager {
             inbox: Vec::new(),
             outbox: Vec::new(),
             pending_client_deliveries: HashMap::new(),
+            applied_rows_to_confirm: Vec::new(),
+            upstream_supports_delivery_acks: false,
             pending_permission_checks: Vec::new(),
             pending_query_subscriptions: Vec::new(),
             pending_query_unsubscriptions: Vec::new(),
@@ -703,6 +714,44 @@ impl SyncManager {
     ///
     /// Only clears when the confirmation names the batch still owed: a late confirmation
     /// for a superseded batch leaves the newer one outstanding.
+    /// Note that this node applied a row, so it can be reported upstream.
+    pub fn note_applied_row(&mut self, row_id: ObjectId, branch: &str, batch_id: BatchId) {
+        if !self.upstream_supports_delivery_acks {
+            return;
+        }
+        self.applied_rows_to_confirm.push(ConfirmedRow {
+            row_id,
+            branch: branch.to_string(),
+            batch_id,
+        });
+    }
+
+    /// Record whether the upstream server understands confirmations.
+    pub fn set_upstream_supports_delivery_acks(&mut self, supported: bool) {
+        self.upstream_supports_delivery_acks = supported;
+    }
+
+    /// Queue one confirmation for everything applied since the last drain.
+    ///
+    /// Batched deliberately: one message per tick regardless of how many rows landed, and
+    /// nothing at all on a tick that applied nothing — so an idle client stays silent.
+    pub fn queue_applied_row_confirmations(&mut self, server_id: ServerId) {
+        if self.applied_rows_to_confirm.is_empty() {
+            return;
+        }
+        let rows = std::mem::take(&mut self.applied_rows_to_confirm);
+        tracing::debug!(
+            target: "jazz::delivery",
+            %server_id,
+            rows = rows.len(),
+            "confirming applied rows upstream"
+        );
+        self.outbox.push(OutboxEntry {
+            destination: Destination::Server(server_id),
+            payload: SyncPayload::DeliveryConfirmed { rows },
+        });
+    }
+
     /// Record whether this client confirms the rows it applies. Set from the handshake.
     pub fn set_client_acks_deliveries(&mut self, client_id: ClientId, acks: bool) {
         if let Some(client) = self.clients.get_mut(&client_id) {

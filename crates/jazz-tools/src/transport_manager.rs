@@ -29,6 +29,10 @@ pub enum TransportInbound {
     Connected {
         catalogue_state_hash: Option<String>,
         next_sync_seq: Option<u64>,
+        /// From the server's handshake response: whether it understands delivery
+        /// confirmations. A client that hears nothing is talking to an older server and
+        /// must stay silent, or its confirmations would fail to decode there.
+        supports_delivery_acks: bool,
     },
     Sync {
         entry: Box<InboxEntry>,
@@ -984,6 +988,7 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
                     self.ever_connected
                         .store(true, std::sync::atomic::Ordering::Release);
                     let _ = self.inbound_tx.unbounded_send(TransportInbound::Connected {
+                        supports_delivery_acks: resp.supports_delivery_acks,
                         catalogue_state_hash: resp.catalogue_state_hash,
                         next_sync_seq: resp.next_sync_seq,
                     });
@@ -1174,6 +1179,7 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
                     self.ever_connected
                         .store(true, std::sync::atomic::Ordering::Release);
                     let _ = self.inbound_tx.unbounded_send(TransportInbound::Connected {
+                        supports_delivery_acks: resp.supports_delivery_acks,
                         catalogue_state_hash: resp.catalogue_state_hash,
                         next_sync_seq: resp.next_sync_seq,
                     });
