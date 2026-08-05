@@ -703,6 +703,13 @@ impl SyncManager {
     ///
     /// Only clears when the confirmation names the batch still owed: a late confirmation
     /// for a superseded batch leaves the newer one outstanding.
+    /// Record whether this client confirms the rows it applies. Set from the handshake.
+    pub fn set_client_acks_deliveries(&mut self, client_id: ClientId, acks: bool) {
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.acks_deliveries = acks;
+        }
+    }
+
     pub fn confirm_client_deliveries(
         &mut self,
         confirmed: &[(ClientId, ObjectId, BranchName, BatchId)],

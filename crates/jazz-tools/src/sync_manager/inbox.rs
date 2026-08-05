@@ -1338,6 +1338,11 @@ impl SyncManager {
     ) {
         let _span = tracing::debug_span!("process_from_server", %server_id, payload = payload.variant_name()).entered();
         match payload {
+            // A confirmation only ever travels client -> server. Receiving one here means
+            // the peer is confused about its role; ignoring it is the safe reading.
+            SyncPayload::DeliveryConfirmed { .. } => {
+                tracing::warn!(%server_id, "ignoring a delivery confirmation from a server");
+            }
             SyncPayload::CatalogueEntryUpdated { entry } => {
                 tracing::debug!(
                     object_id = %entry.object_id,
@@ -1511,6 +1516,29 @@ impl SyncManager {
         tracing::trace!(%client_id, role = ?client.role, payload = payload.variant_name(), "client→payload");
 
         match &payload {
+            // The receiver says these rows are applied. This is the only trustworthy
+            // delivery signal: every sender-side one reports success for payloads that a
+            // dying socket still accepts and never transmits.
+            SyncPayload::DeliveryConfirmed { rows } => {
+                let confirmed: Vec<_> = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            client_id,
+                            row.row_id,
+                            BranchName::new(row.branch.as_str()),
+                            row.batch_id,
+                        )
+                    })
+                    .collect();
+                tracing::debug!(
+                    target: "jazz::delivery",
+                    %client_id,
+                    rows = confirmed.len(),
+                    "receiver confirmed rows"
+                );
+                self.confirm_client_deliveries(&confirmed);
+            }
             SyncPayload::CatalogueEntryUpdated { entry } => {
                 let object_id = entry.object_id;
                 let branch_name = BranchName::new("main");

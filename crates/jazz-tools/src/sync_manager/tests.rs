@@ -374,6 +374,9 @@ fn confirm_queued(sm: &mut SyncManager) {
 
 fn add_client(sm: &mut SyncManager, io: &MemoryStorage, client_id: ClientId) {
     sm.add_client_with_storage(io, client_id);
+    // These tests model a current client, which confirms what it applies. An old client
+    // takes the fallback path, where the claim is recorded at queue time.
+    sm.set_client_acks_deliveries(client_id, true);
 }
 
 fn add_server(sm: &mut SyncManager, io: &MemoryStorage, server_id: ServerId) {

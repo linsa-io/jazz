@@ -352,31 +352,52 @@ impl SyncManager {
             return;
         }
 
+        let acks_deliveries = self
+            .clients
+            .get(&client_id)
+            .map(|client| client.acks_deliveries)
+            .unwrap_or(false);
         if !self.clients.contains_key(&client_id) {
             return;
         }
-        // The claim waits for the receiver. Recording it here — as this did — makes a
-        // dropped payload indistinguishable from a delivered one, and the row is then never
-        // offered again. A newer batch for the same row replaces this entry, because a
-        // re-offer can only ever carry the row's current state.
-        tracing::debug!(
-            target: "jazz::delivery",
-            %client_id, %object_id, ?batch_id,
-            "queued, awaiting the receiver's confirmation"
-        );
-        self.pending_client_deliveries
-            .entry(client_id)
-            .or_default()
-            .insert(
-                (object_id, branch_name),
-                crate::sync_manager::types::PendingDelivery {
-                    batch_id,
-                    branch_name,
-                    metadata: metadata.clone(),
-                    parent_ids: parent_ids.to_vec(),
-                    include_metadata,
-                },
+        if !acks_deliveries {
+            // Old client: it will never confirm, so waiting for it would leave every row
+            // outstanding and re-offer the scope on every subscription. Record the claim as
+            // before — this is exactly today's behaviour, defect included, and no worse.
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                if include_metadata {
+                    client.sent_metadata.insert(object_id);
+                }
+                client
+                    .sent_batch_ids
+                    .entry((object_id, branch_name))
+                    .or_default()
+                    .record_delivery(batch_id, &parent_ids);
+            }
+        } else {
+            // The claim waits for the receiver. Recording it here — as this did — makes a
+            // dropped payload indistinguishable from a delivered one, and the row is then never
+            // offered again. A newer batch for the same row replaces this entry, because a
+            // re-offer can only ever carry the row's current state.
+            tracing::debug!(
+                target: "jazz::delivery",
+                %client_id, %object_id, ?batch_id,
+                "queued, awaiting the receiver's confirmation"
             );
+            self.pending_client_deliveries
+                .entry(client_id)
+                .or_default()
+                .insert(
+                    (object_id, branch_name),
+                    crate::sync_manager::types::PendingDelivery {
+                        batch_id,
+                        branch_name,
+                        metadata: metadata.clone(),
+                        parent_ids: parent_ids.to_vec(),
+                        include_metadata,
+                    },
+                );
+        }
         self.row_batch_interest
             .entry(RowBatchKey::new(object_id, branch_name, batch_id))
             .or_default()

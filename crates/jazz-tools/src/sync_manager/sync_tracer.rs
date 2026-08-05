@@ -854,6 +854,9 @@ impl<'a> Normalizer<'a> {
 
     fn format_payload(&mut self, payload: &SyncPayload) -> String {
         match payload {
+            SyncPayload::DeliveryConfirmed { rows } => {
+                format!("DeliveryConfirmed({} rows)", rows.len())
+            }
             SyncPayload::RowBatchCreated { row, .. } => {
                 format!(
                     "created row:{} branch:{} batch:{}",
@@ -1010,6 +1013,9 @@ fn format_message(msg: &SyncMessage, names: &Names<'_>) -> String {
 
 fn format_payload_details(payload: &SyncPayload, names: &Names<'_>) -> String {
     match payload {
+        SyncPayload::DeliveryConfirmed { rows } => {
+            format!("confirmed {} rows", rows.len())
+        }
         SyncPayload::RowBatchCreated { row, .. } => {
             format!(
                 "created row:{} branch:{} batch:{}",

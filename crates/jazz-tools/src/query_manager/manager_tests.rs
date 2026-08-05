@@ -531,6 +531,10 @@ fn connect_client<H: Storage>(
 ) {
     qm.sync_manager_mut()
         .add_client_with_storage(storage, client_id);
+    // These tests model a current client, which confirms what it applies. An old client
+    // takes the fallback path instead, where the claim is recorded at queue time.
+    qm.sync_manager_mut()
+        .set_client_acks_deliveries(client_id, true);
 }
 
 fn connect_query_manager_upstream(

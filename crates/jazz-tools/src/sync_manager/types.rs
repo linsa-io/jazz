@@ -282,6 +282,13 @@ pub struct ServerState {
     pub sent_batch_ids: HashMap<(ObjectId, BranchName), SentBatchIds>,
     /// Row IDs for which we've sent metadata.
     pub sent_metadata: HashSet<ObjectId>,
+    /// Whether this client confirms the rows it applies.
+    ///
+    /// Negotiated in the handshake, so it is known before the client subscribes. A client
+    /// that does not confirm keeps the old behaviour — the claim is recorded when the row is
+    /// queued — because otherwise nothing would ever clear its outstanding rows and every
+    /// subscription would re-offer them.
+    pub acks_deliveries: bool,
 }
 
 /// A query's scope and session for policy filtering.
@@ -307,6 +314,13 @@ pub struct ClientState {
     pub sent_batch_ids: HashMap<(ObjectId, BranchName), SentBatchIds>,
     /// Row IDs for which we've sent metadata.
     pub sent_metadata: HashSet<ObjectId>,
+    /// Whether this client confirms the rows it applies.
+    ///
+    /// Negotiated in the handshake, so it is known before the client subscribes. A client
+    /// that does not confirm keeps the old behaviour — the claim is recorded when the row is
+    /// queued — because otherwise nothing would ever clear its outstanding rows and every
+    /// subscription registration would re-offer them.
+    pub acks_deliveries: bool,
 }
 
 impl ClientState {
@@ -435,6 +449,13 @@ pub enum SyncPayload {
 
     /// Error response.
     Error(SyncError),
+
+    /// Rows the receiver has applied, so the sender may finally record them as delivered.
+    ///
+    /// Appended LAST on purpose: postcard encodes a variant by index, so inserting anywhere
+    /// else would renumber every payload on the wire. Only sent by a client whose handshake
+    /// said it acks and whose server said it understands acks.
+    DeliveryConfirmed { rows: Vec<ConfirmedRow> },
 }
 
 /// Warning emitted when a query encounters rows that cannot be transformed into the
@@ -571,6 +592,9 @@ impl SyncPayload {
                 | SyncPayload::BatchFate { .. }
                 | SyncPayload::SealBatch { .. }
         )
+        // `DeliveryConfirmed` deliberately absent: it mutates only in-memory delivery
+        // bookkeeping, and marking it as a storage write would schedule a WAL flush for
+        // every ack tick.
     }
 
     /// Encode this payload using postcard.
@@ -625,6 +649,7 @@ impl SyncPayload {
             SyncPayload::QuerySubscription { .. } => "QuerySubscription",
             SyncPayload::QueryUnsubscription { .. } => "QueryUnsubscription",
             SyncPayload::QuerySettled { .. } => "QuerySettled",
+            SyncPayload::DeliveryConfirmed { .. } => "DeliveryConfirmed",
             SyncPayload::SchemaWarning(_) => "SchemaWarning",
             SyncPayload::ConnectionSchemaDiagnostics(_) => "ConnectionSchemaDiagnostics",
             SyncPayload::Error(_) => "Error",
@@ -711,6 +736,14 @@ pub struct PendingDelivery {
     /// the delivered copy, but the frontier cursor prunes by them.
     pub parent_ids: Vec<BatchId>,
     pub include_metadata: bool,
+}
+
+/// One row the receiver has applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmedRow {
+    pub row_id: ObjectId,
+    pub branch: String,
+    pub batch_id: BatchId,
 }
 
 /// Outgoing message to be sent.
