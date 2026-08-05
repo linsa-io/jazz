@@ -143,6 +143,118 @@ impl FromNapiValue for FfiRecordArg {
     }
 }
 
+/// Hand any convertible value to JS as an opaque `Unknown`, so the branches of
+/// [`value_to_js`] can return one type without each knowing the next.
+fn into_unknown<'env, T: ToNapiValue>(env: &'env Env, value: T) -> napi::Result<Unknown<'env>> {
+    unsafe {
+        let raw = ToNapiValue::to_napi_value(env.raw(), value)?;
+        Unknown::from_napi_value(env.raw(), raw)
+    }
+}
+
+/// A row value on its way to JS, with blobs handed over as bytes.
+///
+/// The obvious route — `serde_json::json!({"values": values})` — costs one napi
+/// call per BYTE of a `Bytea` column. `ValueHuman::Bytea` is a plain `Vec<u8>`,
+/// so serde renders a megabyte as an array of a million Numbers and napi then
+/// sets each one into a JS array individually; the JS side walks it back per
+/// byte. Measured on this binding with no server and no network in the loop:
+/// ~10 MiB/s, with 97% of the wall time spent as user CPU on the JS thread.
+///
+/// Only `Bytea` is special-cased here. Everything else still goes through
+/// `serde_json`, so the `{type, value}` shape the TS layer parses stays defined
+/// in exactly one place (`ValueHuman`) rather than being restated — the two
+/// composite variants below reproduce their wrapper only, and recurse for what
+/// is inside.
+fn value_to_js<'env>(env: &'env Env, value: &Value) -> napi::Result<Unknown<'env>> {
+    match value {
+        Value::Bytea(bytes) => {
+            let mut tagged = Object::new(env)?;
+            tagged.set("type", "Bytea")?;
+            // Zero-copy hand-off: napi-rs attaches a finalizer that frees the Vec
+            // back through Rust's allocator, which is what this crate's header
+            // asks for, and falls back to a copy on runtimes that refuse
+            // external buffers.
+            tagged.set("value", BufferSlice::from_data(env, bytes.clone())?)?;
+            into_unknown(env, tagged)
+        }
+        Value::Array(items) => {
+            let mut tagged = Object::new(env)?;
+            tagged.set("type", "Array")?;
+            tagged.set("value", values_to_js(env, items)?)?;
+            into_unknown(env, tagged)
+        }
+        Value::Row { id, values } => {
+            let mut inner = Object::new(env)?;
+            // `RowHuman` skips a missing id rather than sending null, so match it.
+            if let Some(id) = id {
+                inner.set("id", id.uuid().to_string())?;
+            }
+            inner.set("values", values_to_js(env, values)?)?;
+            let mut tagged = Object::new(env)?;
+            tagged.set("type", "Row")?;
+            tagged.set("value", inner)?;
+            into_unknown(env, tagged)
+        }
+        scalar => {
+            let json = serde_json::to_value(scalar).map_err(|error| {
+                napi::Error::from_reason(format!("Failed to encode value: {error}"))
+            })?;
+            into_unknown(env, json)
+        }
+    }
+}
+
+fn values_to_js<'env>(env: &'env Env, values: &[Value]) -> napi::Result<Vec<Unknown<'env>>> {
+    values.iter().map(|value| value_to_js(env, value)).collect()
+}
+
+/// One written row on its way back to JS.
+///
+/// `insert`/`restore` echo the row they just stored, blob included, although JS
+/// supplied those bytes microseconds earlier. Until that echo is dropped
+/// entirely (jazz-rn answers with a `BlobRef` instead), at least send the bytes
+/// as bytes: the `serde_json` route costs one napi call per byte.
+pub struct WrittenRow {
+    id: ObjectId,
+    values: Vec<Value>,
+    batch_id: String,
+}
+
+impl ToNapiValue for WrittenRow {
+    unsafe fn to_napi_value(
+        raw_env: napi::sys::napi_env,
+        written: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        let env = Env::from_raw(raw_env);
+        let mut row = Object::new(&env)?;
+        row.set("id", written.id.uuid().to_string())?;
+        row.set("values", values_to_js(&env, &written.values)?)?;
+        row.set("batchId", written.batch_id)?;
+        unsafe { ToNapiValue::to_napi_value(raw_env, row) }
+    }
+}
+
+/// Query results, converted on the JS thread by [`value_to_js`].
+pub struct QueryRows(Vec<(ObjectId, Vec<Value>)>);
+
+impl ToNapiValue for QueryRows {
+    unsafe fn to_napi_value(
+        raw_env: napi::sys::napi_env,
+        rows: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        let env = Env::from_raw(raw_env);
+        let mut js_rows = Vec::with_capacity(rows.0.len());
+        for (id, values) in rows.0.iter() {
+            let mut row = Object::new(&env)?;
+            row.set("id", id.uuid().to_string())?;
+            row.set("values", values_to_js(&env, values)?)?;
+            js_rows.push(into_unknown(&env, row)?);
+        }
+        unsafe { ToNapiValue::to_napi_value(raw_env, js_rows) }
+    }
+}
+
 fn parse_node_durability_tiers(tier: Option<&str>) -> napi::Result<Vec<DurabilityTier>> {
     let Some(raw) = tier else {
         return Ok(Vec::new());
@@ -480,7 +592,7 @@ impl NapiRuntime {
         #[napi(ts_arg_type = "Record<string, unknown>")] values: FfiRecordArg,
         write_context_json: Option<String>,
         object_id: Option<String>,
-    ) -> napi::Result<serde_json::Value> {
+    ) -> napi::Result<WrittenRow> {
         let write_context = parse_write_context_json(write_context_json)?;
         let object_id =
             parse_external_object_id(object_id.as_deref()).map_err(napi::Error::from_reason)?;
@@ -492,11 +604,11 @@ impl NapiRuntime {
             .insert_with_id(&table, values.0, object_id, write_context.as_ref())
             .map_err(|e| napi::Error::from_reason(format!("Insert failed: {:?}", e)))?;
 
-        Ok(serde_json::json!({
-            "id": object_id.uuid().to_string(),
-            "values": row_values,
-            "batchId": batch_id.to_string(),
-        }))
+        Ok(WrittenRow {
+            id: object_id,
+            values: row_values,
+            batch_id: batch_id.to_string(),
+        })
     }
 
     #[napi]
@@ -583,7 +695,7 @@ impl NapiRuntime {
         object_id: String,
         #[napi(ts_arg_type = "Record<string, unknown>")] values: FfiRecordArg,
         write_context_json: Option<String>,
-    ) -> napi::Result<serde_json::Value> {
+    ) -> napi::Result<WrittenRow> {
         let uuid = uuid::Uuid::parse_str(&object_id)
             .map_err(|e| napi::Error::from_reason(format!("Invalid ObjectId: {}", e)))?;
         let oid = ObjectId::from_uuid(uuid);
@@ -597,11 +709,11 @@ impl NapiRuntime {
             .restore(&table, oid, values.0, write_context.as_ref())
             .map_err(|e| napi::Error::from_reason(format!("Restore failed: {:?}", e)))?;
 
-        Ok(serde_json::json!({
-            "id": object_id.uuid().to_string(),
-            "values": row_values,
-            "batchId": batch_id.to_string(),
-        }))
+        Ok(WrittenRow {
+            id: object_id,
+            values: row_values,
+            batch_id: batch_id.to_string(),
+        })
     }
 
     #[napi(
@@ -688,7 +800,7 @@ impl NapiRuntime {
         session_json: Option<String>,
         tier: Option<String>,
         options_json: Option<String>,
-    ) -> napi::Result<serde_json::Value> {
+    ) -> napi::Result<QueryRows> {
         let query = parse_query(&query_json)?;
         let session = parse_session_json(session_json)?;
 
@@ -715,17 +827,7 @@ impl NapiRuntime {
             .await
             .map_err(|e| napi::Error::from_reason(format!("Query failed: {:?}", e)))?;
 
-        let json_rows: Vec<serde_json::Value> = rows
-            .into_iter()
-            .map(|(id, values)| {
-                serde_json::json!({
-                    "id": id.uuid().to_string(),
-                    "values": values
-                })
-            })
-            .collect();
-
-        Ok(serde_json::Value::Array(json_rows))
+        Ok(QueryRows(rows))
     }
 
     // =========================================================================
