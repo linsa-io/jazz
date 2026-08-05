@@ -810,8 +810,23 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
 
     /// Report rows applied this tick to the server that sent them.
     fn confirm_applied_rows_upstream(&mut self) {
-        let Some(server_id) = self.transport.as_ref().map(|handle| handle.server_id) else {
-            return;
+        // Prefer the transport's server, but fall back to a registered upstream: tying the
+        // confirmation to a transport handle would make it silent in every setup that syncs
+        // without one, and untestable below the transport layer.
+        let server_id = match self.transport.as_ref().map(|handle| handle.server_id) {
+            Some(server_id) => server_id,
+            None => {
+                let servers: Vec<_> = self
+                    .schema_manager
+                    .query_manager()
+                    .sync_manager()
+                    .server_ids()
+                    .collect();
+                match servers.as_slice() {
+                    [server_id] => *server_id,
+                    _ => return,
+                }
+            }
         };
         self.schema_manager
             .query_manager_mut()

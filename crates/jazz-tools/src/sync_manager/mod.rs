@@ -830,6 +830,11 @@ impl SyncManager {
         );
     }
 
+    #[cfg(any(test, feature = "test"))]
+    pub fn outbox_len_for_test(&self) -> usize {
+        self.outbox.len()
+    }
+
     pub fn take_outbox(&mut self) -> Vec<OutboxEntry> {
         std::mem::take(&mut self.outbox)
     }

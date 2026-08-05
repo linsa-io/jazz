@@ -1302,6 +1302,7 @@ mod client_lifecycle;
 mod contributing_ids;
 mod crud_queries;
 mod deletes;
+mod delivery_confirmation_differential;
 mod e2e_sync;
 mod include_routing_liveness;
 mod joins;
