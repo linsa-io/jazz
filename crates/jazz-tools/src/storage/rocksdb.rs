@@ -87,6 +87,23 @@ impl RocksDBStorage {
         // LZ4 for L0-L2 (fast), Zstd for deeper levels (compact)
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        // Memtables, not the block cache, are what a blob workload leaves
+        // resident. RocksDB's default is 64 MiB per buffer with two of them, so
+        // writing 1 MiB rows parks up to 128 MiB that never comes back down.
+        //
+        // Measured on a 105 MiB store, ten 18 MiB uploads back to back, reading
+        // physical footprint (not `ps rss`, which does not count compressed
+        // pages): the plateau is 219 MB at the default, 73 MB at 16 MiB, and
+        // 50 MB at 4 MiB. Shrinking the block cache 64 -> 4 MiB instead moved
+        // nothing (248 MB), so this is the term that matters.
+        //
+        // 16 MiB rather than 4: smaller buffers flush more often, which costs
+        // L0 files and compaction on the read path. At 16 MiB neither the
+        // subscription plateau (170 vs 165 MB) nor the initial settle over 187
+        // rows (146 vs 162 ms) moved, so this keeps four times the buffer of
+        // the aggressive setting for the same practical saving.
+        opts.set_write_buffer_size(16 * 1024 * 1024);
+        opts.set_max_write_buffer_number(2);
 
         let txdb_opts = TransactionDBOptions::default();
         let db = TransactionDB::open(&opts, &txdb_opts, path.as_ref())
