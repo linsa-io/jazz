@@ -211,10 +211,15 @@ fn values_to_js<'env>(env: &'env Env, values: &[Value]) -> napi::Result<Vec<Unkn
 
 /// One written row on its way back to JS.
 ///
-/// `insert`/`restore` echo the row they just stored, blob included, although JS
-/// supplied those bytes microseconds earlier. Until that echo is dropped
-/// entirely (jazz-rn answers with a `BlobRef` instead), at least send the bytes
-/// as bytes: the `serde_json` route costs one napi call per byte.
+/// `insert`/`restore` echo the row they just stored, blob included. The bytes
+/// were supplied by JS microseconds earlier, so the echo looks redundant — but
+/// `restore` can resurrect columns the caller never sent, so it carries real
+/// information and is not simply removable. What it should not do is cost one
+/// napi call per byte, which the `serde_json` route did.
+///
+/// (jazz-rn answers with a `BlobRef` instead. That is not a better design so
+/// much as a necessary one there: its bridge ships a JSON *string*, so it has
+/// no way to hand over bytes at all.)
 pub struct WrittenRow {
     id: ObjectId,
     values: Vec<Value>,
@@ -585,7 +590,7 @@ impl NapiRuntime {
     // CRUD Operations
     // =========================================================================
 
-    #[napi]
+    #[napi(ts_return_type = "{ id: string; values: unknown[]; batchId: string }")]
     pub fn insert(
         &self,
         table: String,
@@ -688,7 +693,7 @@ impl NapiRuntime {
         }))
     }
 
-    #[napi]
+    #[napi(ts_return_type = "{ id: string; values: unknown[]; batchId: string }")]
     pub fn restore(
         &self,
         table: String,

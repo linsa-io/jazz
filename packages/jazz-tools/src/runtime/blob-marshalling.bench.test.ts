@@ -33,6 +33,16 @@ function blobSchema(): WasmSchema {
       columns: [
         { name: "data", column_type: { type: "Bytea" as const }, nullable: false },
         { name: "label", column_type: { type: "Text" as const }, nullable: false },
+        // A blob nested one level down. `value_to_js` restates the `{type, value}`
+        // wrapper for `Array` by hand so it can recurse into it, and that
+        // restatement is the part of this change that can silently drift from
+        // `ValueHuman`. Nothing else in the napi tests covers it.
+        {
+          name: "parts",
+          column_type: { type: "Array" as const, element: { type: "Bytea" as const } },
+          nullable: true,
+        },
+        { name: "note", column_type: { type: "Text" as const }, nullable: true },
       ],
     },
   } as unknown as WasmSchema;
@@ -56,6 +66,14 @@ function blobRow(seed: number, label: string) {
     data: { type: "Bytea" as const, value: payload(seed) },
     label: { type: "Text" as const, value: label },
   };
+}
+
+function cell(row: unknown, index: number): { type?: string; value?: unknown } {
+  const values = (row as { values?: unknown[] })?.values;
+  if (!Array.isArray(values)) {
+    throw new Error(`unexpected wire row shape: ${JSON.stringify(row)?.slice(0, 200)}`);
+  }
+  return values[index] as { type?: string; value?: unknown };
 }
 
 /** What the binding handed back for the `data` column, before any JS normalisation. */
@@ -94,6 +112,58 @@ describe.skipIf(!hasJazzNapiBuild())("Bytea across the napi boundary", () => {
       "query() returned the blob as a JS array — this is the per-byte read path",
     ).toBe(false);
     expect(ArrayBuffer.isView(read)).toBe(true);
+  });
+});
+
+describe.skipIf(!hasJazzNapiBuild())("Bytea nested inside other values", () => {
+  it("keeps the wrapper shape while handing nested blobs over as bytes", async () => {
+    const schema = blobSchema();
+    const runtime = await createNapiRuntime(schema, { appId: "blob-marshalling-nested" });
+
+    // An empty blob alongside a populated one: zero-length is its own case for an
+    // external buffer, and nothing else exercises it.
+    const inserted = runtime.insert("blobs", {
+      data: { type: "Bytea" as const, value: new Uint8Array(0) },
+      label: { type: "Text" as const, value: "nested" },
+      parts: {
+        type: "Array" as const,
+        value: [
+          { type: "Bytea" as const, value: new Uint8Array([1, 2, 3]) },
+          { type: "Bytea" as const, value: new Uint8Array(0) },
+        ],
+      },
+      note: { type: "Null" as const, value: null },
+    } as never);
+
+    const top = cell(inserted, 0);
+    expect(top.type).toBe("Bytea");
+    expect(ArrayBuffer.isView(top.value)).toBe(true);
+    expect((top.value as Uint8Array).length).toBe(0);
+
+    const parts = cell(inserted, 2);
+    expect(parts.type).toBe("Array");
+    const elements = parts.value as { type?: string; value?: unknown }[];
+    expect(elements).toHaveLength(2);
+    for (const element of elements) {
+      expect(element.type).toBe("Bytea");
+      expect(
+        ArrayBuffer.isView(element.value),
+        "a blob nested in an Array still crossed as numbers",
+      ).toBe(true);
+    }
+    expect(Array.from(elements[0]!.value as Uint8Array)).toEqual([1, 2, 3]);
+
+    // The wrapper for a null column must keep whatever serde produced for it: this
+    // branch is delegated, and the assertion is here so a future rewrite that stops
+    // delegating has to keep it.
+    expect(cell(inserted, 3).type).toBe("Null");
+
+    const rows = (await runtime.query(blobQuery(schema), null, null, null)) as unknown[];
+    const readParts = cell(rows[0], 2);
+    expect(readParts.type).toBe("Array");
+    for (const element of readParts.value as { value?: unknown }[]) {
+      expect(ArrayBuffer.isView(element.value)).toBe(true);
+    }
   });
 });
 
