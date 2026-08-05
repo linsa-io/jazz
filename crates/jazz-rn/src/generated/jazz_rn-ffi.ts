@@ -533,7 +533,8 @@ type UniffiCallbackInterfaceMutationErrorCallbackMethod0 = (
 ) => UniffiResult<void>;
 type UniffiCallbackInterfaceSubscriptionCallbackMethod0 = (
   uniffiHandle: bigint,
-  deltaJson: Uint8Array
+  deltaJson: Uint8Array,
+  blobs: Uint8Array
 ) => UniffiResult<void>;
 export type UniffiVTableCallbackInterfaceAuthFailureCallback = {
   uniffiFree: UniffiCallbackInterfaceFree;

@@ -334,8 +334,14 @@ const FfiConverterTypeMutationErrorCallback =
 export interface SubscriptionCallback {
   /**
    * Called when a subscription produces an update.
+   *
+   * `delta_json` refers to entries of `blobs` via
+   * `{"type":"BlobRef","value":<idx>}`, the same convention the `*_with_blobs`
+   * write methods use in the other direction. Bytes never enter the JSON: a
+   * megabyte inlined as an array of Numbers is ~3.7 MB of text to serialize,
+   * hand across, parse, and then walk byte by byte on the JS side.
    */
-  onUpdate(deltaJson: string): void;
+  onUpdate(deltaJson: string, blobs: Array<ArrayBuffer>): void;
 }
 
 // Put the implementation in a struct so we don't pollute the top-level namespace
@@ -346,11 +352,18 @@ const uniffiCallbackInterfaceSubscriptionCallback: {
   // Create the VTable using a series of closures.
   // ts automatically converts these into C callback functions.
   vtable: {
-    onUpdate: (uniffiHandle: bigint, deltaJson: Uint8Array) => {
+    onUpdate: (
+      uniffiHandle: bigint,
+      deltaJson: Uint8Array,
+      blobs: Uint8Array
+    ) => {
       const uniffiMakeCall = (): void => {
         const jsCallback =
           FfiConverterTypeSubscriptionCallback.lift(uniffiHandle);
-        return jsCallback.onUpdate(FfiConverterString.lift(deltaJson));
+        return jsCallback.onUpdate(
+          FfiConverterString.lift(deltaJson),
+          FfiConverterArrayArrayBuffer.lift(blobs)
+        );
       };
       const uniffiResult = UniffiResult.ready<void>();
       const uniffiHandleSuccess = (obj: any) => {};
@@ -1982,7 +1995,7 @@ function uniffiEnsureInitialized() {
   }
   if (
     nativeModule().ubrn_uniffi_jazz_rn_checksum_method_subscriptioncallback_on_update() !==
-    5131
+    9237
   ) {
     throw new UniffiInternalError.ApiChecksumMismatch(
       'uniffi_jazz_rn_checksum_method_subscriptioncallback_on_update'
