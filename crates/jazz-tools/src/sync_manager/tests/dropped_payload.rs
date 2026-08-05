@@ -119,3 +119,52 @@ fn a_delivered_payload_is_not_offered_twice() {
         "a row already delivered to this client was queued again"
     );
 }
+
+/// A row that is never confirmed must stop being re-offered.
+///
+/// Some rows can never be applied by the peer — a rejected fate, a decode failure, a bug on
+/// its side. Nothing confirms them, so nothing clears them, and the peer stays marked as
+/// owed rows forever: every subscription registration re-derives its scope and re-sends.
+/// That is a retransmission livelock, and it is worse than losing the row, because it never
+/// stops. After a bounded number of attempts the sender gives up loudly and records the
+/// claim, which is the same outcome as the old behaviour for that one row.
+#[test]
+fn a_row_that_is_never_confirmed_stops_being_re_offered() {
+    let io = MemoryStorage::new();
+    let mut sm = SyncManager::new();
+    let client_id = ClientId::new();
+    add_client(&mut sm, &io, client_id);
+    let row_id = ObjectId::new();
+    set_client_query_scope(
+        &mut sm,
+        &io,
+        client_id,
+        QueryId(1),
+        HashSet::from([(row_id, BranchName::new("main"))]),
+        None,
+    );
+
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"never-applies");
+
+    // Offer it up to the cap, never confirming. Each attempt is what a re-offer does when
+    // the peer is owed the row.
+    for attempt in 1..=MAX_REDELIVERY_ATTEMPTS {
+        sm.queue_row_to_client(client_id, row_id, row_metadata("users"), row.clone(), true);
+        let _discarded = sm.take_outbox();
+        assert!(
+            sm.client_has_undelivered_payloads(client_id),
+            "the sender stopped waiting after only {attempt} attempts"
+        );
+    }
+
+    // One more, and it must give up rather than keep the peer marked forever.
+    sm.queue_row_to_client(client_id, row_id, row_metadata("users"), row, true);
+    let _discarded = sm.take_outbox();
+
+    assert!(
+        !sm.client_has_undelivered_payloads(client_id),
+        "a row nothing can confirm is still recorded as owed past {MAX_REDELIVERY_ATTEMPTS} \
+         attempts, so every later subscription re-derives and re-sends it — a livelock that \
+         never ends and is worse than the loss it replaced"
+    );
+}

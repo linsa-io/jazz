@@ -47,6 +47,17 @@ pub(crate) struct OutgoingQuerySubscription {
 // SyncManager
 // ============================================================================
 
+/// How many times a row is offered to a peer that never confirms it before the sender
+/// gives up on hearing back.
+///
+/// Some rows can never be applied by a given peer — a rejected fate, a decode failure, a
+/// bug on its side — and nothing will ever confirm them. Without a bound the peer stays
+/// marked as owed rows for as long as it is connected, and every subscription registration
+/// re-derives its scope and re-sends: a livelock that is worse than the loss it replaced,
+/// because it never ends. On giving up the claim is recorded, which is exactly the old
+/// behaviour for that one row, and a warning names it.
+pub const MAX_REDELIVERY_ATTEMPTS: u32 = 5;
+
 /// Manages synchronization state atop storage-backed row and catalogue state.
 ///
 /// Coordinates:

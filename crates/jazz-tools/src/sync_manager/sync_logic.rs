@@ -384,12 +384,40 @@ impl SyncManager {
                 %client_id, %object_id, ?batch_id,
                 "queued, awaiting the receiver's confirmation"
             );
-            self.pending_client_deliveries
-                .entry(client_id)
-                .or_default()
-                .insert(
+            let owed = self.pending_client_deliveries.entry(client_id).or_default();
+            let attempts = owed
+                .get(&(object_id, branch_name))
+                .filter(|pending| pending.batch_id == batch_id)
+                .map(|pending| pending.attempts + 1)
+                .unwrap_or(1);
+            if attempts > crate::sync_manager::MAX_REDELIVERY_ATTEMPTS {
+                // Give up on hearing back about this row. Recording the claim stops the
+                // re-offer: the row is as lost as it was under the old behaviour, but the
+                // peer is no longer pinned as owed rows forever, re-deriving its scope on
+                // every registration.
+                owed.remove(&(object_id, branch_name));
+                if owed.is_empty() {
+                    self.pending_client_deliveries.remove(&client_id);
+                }
+                tracing::warn!(
+                    %client_id, %object_id, ?batch_id, attempts,
+                    "giving up on a delivery confirmation; the peer never reported this row"
+                );
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    if include_metadata {
+                        client.sent_metadata.insert(object_id);
+                    }
+                    client
+                        .sent_batch_ids
+                        .entry((object_id, branch_name))
+                        .or_default()
+                        .record_delivery(batch_id, &parent_ids);
+                }
+            } else {
+                owed.insert(
                     (object_id, branch_name),
                     crate::sync_manager::types::PendingDelivery {
+                        attempts,
                         batch_id,
                         branch_name,
                         metadata: metadata.clone(),
@@ -397,6 +425,7 @@ impl SyncManager {
                         include_metadata,
                     },
                 );
+            }
         }
         self.row_batch_interest
             .entry(RowBatchKey::new(object_id, branch_name, batch_id))

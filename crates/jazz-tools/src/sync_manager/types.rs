@@ -722,6 +722,8 @@ impl Source {
 /// every later attempt to offer the row.
 #[derive(Debug, Clone)]
 pub struct PendingDelivery {
+    /// How many times this row has been offered without a confirmation coming back.
+    pub attempts: u32,
     /// The batch this entry is about. Kept in the value, not the key: a later batch for the
     /// same row REPLACES this entry, because a re-offer can only ever ship the row's
     /// current state. Keying by batch would strand every superseded entry — nothing would
