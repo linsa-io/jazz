@@ -331,7 +331,12 @@ impl SyncManager {
                 return;
             };
             let in_scope = client.is_in_scope(object_id, &branch_name);
-            let include_metadata = !client.sent_metadata.contains(&object_id);
+            // A forced resend must carry metadata: `sent_metadata` can claim
+            // delivery for payloads that were dropped at the stream layer while
+            // the client had no live connection, and a row without metadata is
+            // unresolvable (and silently discarded) on a client that never got
+            // the locator.
+            let include_metadata = force_resend || !client.sent_metadata.contains(&object_id);
             let batch_already_sent = client
                 .sent_batch_ids
                 .get(&(object_id, branch_name))

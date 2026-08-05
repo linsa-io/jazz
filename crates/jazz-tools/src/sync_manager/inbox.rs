@@ -255,11 +255,26 @@ impl SyncManager {
             return Some(metadata.metadata.clone());
         }
 
-        storage
+        let locator = storage
             .load_row_locator(row.row_id)
             .ok()
             .flatten()
-            .map(|locator| metadata_from_row_locator(&locator))
+            .map(|locator| metadata_from_row_locator(&locator));
+        if locator.is_none() {
+            // The caller drops the row on `None`, so without this the peer
+            // discards a row it was just sent and says nothing. That silence is
+            // what made the offline-delivery defect take a night to find: the
+            // row was delivered, applied nowhere, and no log line existed
+            // between "sent" and "missing".
+            tracing::warn!(
+                row_id = %row.row_id,
+                branch = %row.branch,
+                batch_id = ?row.batch_id,
+                "discarding a row batch that carries no metadata and has no local locator: \
+                 the table cannot be resolved, so the row is unusable",
+            );
+        }
+        locator
     }
 
     fn row_context_from_metadata<H: Storage>(

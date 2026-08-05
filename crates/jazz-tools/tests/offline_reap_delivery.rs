@@ -220,7 +220,6 @@ async fn a_reaped_peer_receives_what_was_written_while_it_was_away() {
 /// fresh id is a new peer and always gets everything. That is exactly why seven earlier
 /// probe-based models passed — the server log showed a new `client_id` on every reconnect.
 #[tokio::test]
-#[ignore = "RED: reproduces the field defect — remove the ignore with the fix"]
 async fn an_unreaped_peer_receives_what_was_written_while_it_was_away() {
     let schema = test_schema();
     let server = JazzServer::start_with_schema(schema.clone()).await;

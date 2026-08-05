@@ -228,7 +228,6 @@ async fn an_edit_made_during_the_gap_reaches_a_returning_peer() {
 /// gap would deliver nothing here. A fix that advances the cursor to the newest batch and
 /// prunes its ancestors too eagerly would deliver the last row and swallow the other 24.
 #[tokio::test]
-#[ignore = "RED until #210 lands"]
 async fn every_row_written_during_a_long_gap_arrives() {
     let schema = test_schema();
     let server = JazzServer::start_with_schema(schema.clone()).await;
@@ -305,7 +304,6 @@ async fn every_row_written_during_a_long_gap_arrives() {
 /// subscription it happens to process leaves the second one serving a cached scope. The
 /// second table is the whole point: one subscription cannot show this.
 #[tokio::test]
-#[ignore = "RED until #210 lands"]
 async fn each_subscription_of_a_returning_peer_re_derives() {
     let schema = test_schema();
     let server = JazzServer::start_with_schema(schema.clone()).await;
@@ -407,7 +405,6 @@ async fn each_subscription_of_a_returning_peer_re_derives() {
 /// before the first one is confirmed. This is the test that would catch that: it counts
 /// how many times the id shows up after it first arrives.
 #[tokio::test]
-#[ignore = "RED until #210 lands"]
 async fn a_returning_peer_receives_a_gap_row_exactly_once() {
     let schema = test_schema();
     let server = JazzServer::start_with_schema(schema.clone()).await;
