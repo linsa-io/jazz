@@ -106,7 +106,10 @@ export interface JazzRnRuntimeBinding {
     sessionJson: string | undefined,
     tier: string | undefined,
   ): bigint;
-  executeSubscription(handle: bigint, callback: { onUpdate(deltaJson: string): void }): void;
+  executeSubscription(
+    handle: bigint,
+    callback: { onUpdate(deltaJson: string, blobs: ArrayBuffer[]): void },
+  ): void;
   unsubscribe(handle: bigint): void;
   update(objectId: string, valuesJson: string, writeContextJson: string | undefined): string;
   commitBatch(batchId: string): void;
@@ -393,9 +396,23 @@ export class JazzRnRuntimeAdapter implements Runtime {
   executeSubscription(handle: number, on_update: Function): void {
     const nativeHandle = this.handleMap.get(handle) ?? BigInt(handle);
     this.binding.executeSubscription(nativeHandle, {
-      onUpdate: (deltaJson: string) => {
+      // Blobs arrive beside the JSON rather than inside it — the same BlobRef
+      // convention the `*_with_blobs` write methods use in the other direction.
+      // Inlining a megabyte as an array of Numbers costs ~3.7 MB of text to
+      // serialize, hand over, and parse, and then a walk of the parsed array once
+      // per byte.
+      onUpdate: (deltaJson: string, blobs: ArrayBuffer[]) => {
         try {
           const parsed = JSON.parse(deltaJson) as unknown;
+          if (Array.isArray(parsed) && blobs.length > 0) {
+            const views = blobs.map((blob) => new Uint8Array(blob));
+            for (const change of parsed as { row?: { values?: unknown[] } }[]) {
+              const values = change?.row?.values;
+              if (Array.isArray(values)) {
+                resolveReturnedFFIValuesWithBlobs(values, views);
+              }
+            }
+          }
           on_update(parsed);
         } catch (error) {
           swallowCallbackError("subscription", error);

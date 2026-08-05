@@ -671,7 +671,7 @@ impl NapiRuntime {
     // CRUD Operations
     // =========================================================================
 
-    #[napi(ts_return_type = "{ id: string; values: unknown[]; batchId: string }")]
+    #[napi(ts_return_type = "{ id: string; values: any[]; batchId: string }")]
     pub fn insert(
         &self,
         table: String,
@@ -774,7 +774,7 @@ impl NapiRuntime {
         }))
     }
 
-    #[napi(ts_return_type = "{ id: string; values: unknown[]; batchId: string }")]
+    #[napi(ts_return_type = "{ id: string; values: any[]; batchId: string }")]
     pub fn restore(
         &self,
         table: String,

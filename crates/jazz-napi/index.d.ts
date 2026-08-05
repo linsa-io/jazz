@@ -16,11 +16,11 @@ export declare class NapiRuntime {
   constructor(schemaJson: string, appId: string, jazzEnv: string, userBranch: string, dataPath: string, tier?: string | undefined | null)
   /** Create a new NapiRuntime with in-memory storage (no local persistence). */
   static inMemory(schemaJson: string, appId: string, jazzEnv: string, userBranch: string, tier?: string | undefined | null): NapiRuntime
-insert(table: string, values: Record<string, unknown>, writeContextJson?: string | undefined | null, objectId?: string | undefined | null): { id: string; values: unknown[]; batchId: string }
+insert(table: string, values: Record<string, unknown>, writeContextJson?: string | undefined | null, objectId?: string | undefined | null): { id: string; values: any[]; batchId: string }
 update(objectId: string, values: any, writeContextJson?: string | undefined | null): any
 upsert(table: string, objectId: string, values: Record<string, unknown>, writeContextJson?: string | undefined | null): any
 delete(objectId: string, writeContextJson?: string | undefined | null): any
-restore(table: string, objectId: string, values: Record<string, unknown>, writeContextJson?: string | undefined | null): { id: string; values: unknown[]; batchId: string }
+restore(table: string, objectId: string, values: Record<string, unknown>, writeContextJson?: string | undefined | null): { id: string; values: any[]; batchId: string }
 onMutationError(callback: (event: any) => void): void
 rollbackBatch(batchId: string): boolean
 beginBatch(batchMode: string): string

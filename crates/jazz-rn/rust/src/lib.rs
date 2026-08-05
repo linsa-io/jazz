@@ -18,7 +18,6 @@ use jazz_tools::binding_support::{
     parse_batch_id_input, parse_batch_mode_input, parse_durability_tier as parse_binding_tier,
     parse_external_object_id, parse_query_input, parse_read_durability_options,
     parse_session_input, parse_write_context_input, serialize_mutation_error_event,
-    subscription_delta_to_json,
 };
 use jazz_tools::object::ObjectId;
 use jazz_tools::query_manager::query::Query;
@@ -297,14 +296,114 @@ fn parse_subscription_inputs(
     Ok((query, session, default_read_durability_options(tier)))
 }
 
+/// Encode a value for delivery to JS, moving every blob into `sidecar` and
+/// leaving a `BlobRef` in its place.
+///
+/// The read-direction twin of [`encode_return_value_with_blob_refs`]. That one
+/// answers a `*_with_blobs` call, so it can only reference blobs the caller
+/// already holds and falls back to hex for anything else. Deliveries have no
+/// such caller, so they collect their own sidecar as they go and never encode a
+/// payload as text at all.
+fn encode_value_into_sidecar(value: &Value, sidecar: &mut Vec<Vec<u8>>) -> serde_json::Value {
+    match value {
+        Value::Bytea(bytes) => {
+            let index = sidecar.len();
+            sidecar.push(bytes.clone());
+            serde_json::json!({ "type": "BlobRef", "value": index })
+        }
+        Value::Array(values) => serde_json::json!({
+            "type": "Array",
+            "value": values
+                .iter()
+                .map(|value| encode_value_into_sidecar(value, sidecar))
+                .collect::<Vec<_>>(),
+        }),
+        Value::Row { id, values } => {
+            let mut row = serde_json::Map::new();
+            if let Some(id) = id {
+                row.insert("id".into(), serde_json::json!(id));
+            }
+            row.insert(
+                "values".into(),
+                serde_json::Value::Array(
+                    values
+                        .iter()
+                        .map(|value| encode_value_into_sidecar(value, sidecar))
+                        .collect(),
+                ),
+            );
+            serde_json::json!({ "type": "Row", "value": row })
+        }
+        other => {
+            serde_json::to_value(other).expect("scalar Value serialization to JSON cannot fail")
+        }
+    }
+}
+
+/// Re-encode a delta so its blobs travel beside the JSON rather than inside it.
+///
+/// Mirrors `subscription_delta_to_json` key for key — same `kind` numbering,
+/// `updated` still carrying an optional row — and differs only in what a `Bytea`
+/// becomes. A megabyte inlined as an array of Numbers is ~3.7 MB of text that
+/// the receiver parses and then walks byte by byte; as a reference it is about
+/// thirty characters.
+fn subscription_delta_with_blob_sidecar(
+    delta: &SubscriptionDelta,
+) -> (serde_json::Value, Vec<Vec<u8>>) {
+    let mut sidecar: Vec<Vec<u8>> = Vec::new();
+    let descriptor = &delta.descriptor;
+    let row_to_json = |row: &jazz_tools::query_manager::types::Row, sidecar: &mut Vec<Vec<u8>>| {
+        let values = jazz_tools::row_format::decode_row(descriptor, &row.data).unwrap_or_default();
+        serde_json::json!({
+            "id": row.id.uuid().to_string(),
+            "values": values
+                .iter()
+                .map(|value| encode_value_into_sidecar(value, sidecar))
+                .collect::<Vec<_>>(),
+        })
+    };
+
+    let mut changes: Vec<serde_json::Value> = Vec::new();
+    for change in &delta.ordered_delta.removed {
+        changes.push(serde_json::json!({
+            "kind": 1,
+            "id": change.id.uuid().to_string(),
+            "index": change.index,
+        }));
+    }
+    for change in &delta.ordered_delta.updated {
+        let row = change
+            .row
+            .as_ref()
+            .map(|row| row_to_json(row, &mut sidecar));
+        changes.push(serde_json::json!({
+            "kind": 2,
+            "id": change.id.uuid().to_string(),
+            "index": change.new_index,
+            "row": row,
+        }));
+    }
+    for change in &delta.ordered_delta.added {
+        let row = row_to_json(&change.row, &mut sidecar);
+        changes.push(serde_json::json!({
+            "kind": 0,
+            "id": change.id.uuid().to_string(),
+            "index": change.index,
+            "row": row,
+        }));
+    }
+
+    (serde_json::Value::Array(changes), sidecar)
+}
+
 fn make_subscription_callback(
     callback: Box<dyn SubscriptionCallback>,
 ) -> impl Fn(SubscriptionDelta) + Send + 'static {
     move |delta: SubscriptionDelta| {
-        let payload = subscription_delta_to_json(&delta);
+        let (payload, blobs) = subscription_delta_with_blob_sidecar(&delta);
         if let Ok(json) = serde_json::to_string(&payload) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                callback.on_update(json);
+                callback.on_update(json, blobs);
             }));
         }
     }
@@ -323,7 +422,13 @@ pub trait BatchedTickCallback: Send + Sync {
 #[uniffi::export(callback_interface)]
 pub trait SubscriptionCallback: Send + Sync {
     /// Called when a subscription produces an update.
-    fn on_update(&self, delta_json: String);
+    ///
+    /// `delta_json` refers to entries of `blobs` via
+    /// `{"type":"BlobRef","value":<idx>}`, the same convention the `*_with_blobs`
+    /// write methods use in the other direction. Bytes never enter the JSON: a
+    /// megabyte inlined as an array of Numbers is ~3.7 MB of text to serialize,
+    /// hand across, parse, and then walk byte by byte on the JS side.
+    fn on_update(&self, delta_json: String, blobs: Vec<Vec<u8>>);
 }
 
 #[uniffi::export(callback_interface)]
@@ -1293,6 +1398,66 @@ struct RnTickNotifier {
 impl jazz_tools::transport_manager::TickNotifier for RnTickNotifier {
     fn notify(&self) {
         self.scheduler.schedule_batched_tick();
+    }
+}
+
+#[cfg(test)]
+mod delta_blob_size_tests {
+    use super::*;
+
+    /// A megabyte of blob, measured on each of the three routes it can take out
+    /// of the bridge.
+    ///
+    /// Size rather than duration on purpose: the JSON text length is
+    /// deterministic, so this cannot flake, and it is a direct proxy for the work
+    /// on both sides — every character is one the Rust side writes and the JS
+    /// side parses, and for the array form `toByteArray` then walks the result
+    /// once per byte.
+    fn json_len(value: &serde_json::Value) -> usize {
+        serde_json::to_string(value).expect("json").len()
+    }
+
+    #[test]
+    fn a_blob_must_not_be_inlined_into_the_delta_text() {
+        // Byte values spread over the whole range, not a fill: a run of single-digit
+        // bytes renders as two characters each and would flatter the number. Real
+        // media averages closer to four.
+        let payload: Vec<u8> = (0..1024 * 1024).map(|index| (index % 256) as u8).collect();
+        let blob = Value::Bytea(payload.clone());
+
+        // What a subscription delta does today: `Value`'s own human-readable
+        // serde, which renders `Vec<u8>` as an array of Numbers.
+        let as_numbers = json_len(&serde_json::to_value(&blob).expect("serde"));
+
+        // What the write direction falls back to when it has no matching input
+        // blob: hex. Half the characters, still linear in the payload.
+        let as_hex = json_len(&encode_return_value_with_blob_refs(&blob, &[]));
+
+        // What a delivery does now: the bytes travel beside the JSON, not inside
+        // it, so the text is a fixed handful of characters whatever the blob weighs.
+        let mut collected: Vec<Vec<u8>> = Vec::new();
+        let as_reference = json_len(&encode_value_into_sidecar(&blob, &mut collected));
+        assert_eq!(
+            collected,
+            vec![payload],
+            "the bytes must reach the sidecar intact"
+        );
+
+        assert!(
+            as_reference < 64,
+            "a referenced blob should leave ~30 characters of JSON, got {as_reference}",
+        );
+        // The two inline forms are what a delivery must never fall back to. Kept
+        // measured rather than deleted so the gap stays visible: 3.7 MB of text for
+        // a megabyte of payload, or 2 MB as hex.
+        assert!(
+            as_numbers > 3_000_000,
+            "expected the inline form to be huge, got {as_numbers}"
+        );
+        assert!(
+            as_hex > 2_000_000,
+            "expected hex to be linear too, got {as_hex}"
+        );
     }
 }
 

@@ -301,6 +301,18 @@ pub fn parse_read_durability_options(
     ))
 }
 
+/// The canonical delta wire shape.
+///
+/// No longer called: both bindings encode deltas themselves now, because a blob
+/// inlined here costs ~3.7 MB of JSON text per MiB and a walk of the parsed
+/// array once per byte on the far side. jazz-napi hands blobs over as Buffers
+/// (`SubscriptionDeltaJs`), jazz-rn moves them into a sidecar and leaves a
+/// `BlobRef` (`subscription_delta_with_blob_sidecar`).
+///
+/// Kept because both of those mirror it key for key — same `kind` numbering,
+/// `updated` carrying an optional row — and deleting it would leave two copies
+/// with no original to drift from. If a third consumer never appears, delete it
+/// and fold the shape into a shared encoder instead.
 pub fn subscription_delta_to_json(delta: &SubscriptionDelta) -> serde_json::Value {
     let row_to_json = |row: &crate::query_manager::types::Row,
                        descriptor: &crate::query_manager::types::RowDescriptor|
