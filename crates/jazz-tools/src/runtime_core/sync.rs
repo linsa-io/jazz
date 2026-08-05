@@ -280,6 +280,14 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     /// Returns `false` if the client has unprocessed messages — either
     /// parked in RuntimeCore (pre-inbox, from `push_sync_inbox`) or
     /// already in SyncManager's inbox. The caller should retry later.
+    /// See `SyncManager::set_upstream_supports_delivery_acks`.
+    pub fn set_upstream_supports_delivery_acks(&mut self, supported: bool) {
+        self.schema_manager
+            .query_manager_mut()
+            .sync_manager_mut()
+            .set_upstream_supports_delivery_acks(supported);
+    }
+
     /// See `SyncManager::set_client_acks_deliveries`.
     pub fn set_client_acks_deliveries(&mut self, client_id: ClientId, acks: bool) {
         self.schema_manager

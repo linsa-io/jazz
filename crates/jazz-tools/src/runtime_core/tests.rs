@@ -2131,6 +2131,7 @@ mod accepted_batch_downgrade;
 mod authz_cache_runtime;
 mod basic;
 mod batched_tick_parked_drain;
+mod delivery_confirmation;
 mod fk_remove_error;
 mod incremental_scan;
 mod install_transport_tests;
