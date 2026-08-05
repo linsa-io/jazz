@@ -130,6 +130,7 @@ fn serial_deliveries_keep_the_client_sent_set_at_frontier_size() {
 
     for (index, tip) in serial_chain(row_id, DELIVERIES).iter().enumerate() {
         sm.queue_row_to_client(client_id, row_id, row_metadata("users"), tip.clone(), false);
+        confirm_queued(&mut sm);
         let sent = client_sent_set(&sm, client_id, row_id);
         assert!(
             sent.len() <= 2,

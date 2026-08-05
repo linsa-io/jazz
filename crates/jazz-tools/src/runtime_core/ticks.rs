@@ -800,6 +800,11 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     }
 
     fn flush_runtime_outbox(&mut self, log_message: &str) {
+        self.schema_manager
+            .query_manager()
+            .sync_manager()
+            .publish_undelivered_gauges();
+
         let outbox = self
             .schema_manager
             .query_manager_mut()

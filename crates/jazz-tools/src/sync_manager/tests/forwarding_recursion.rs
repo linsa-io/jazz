@@ -162,6 +162,7 @@ fn forwarding_hot_row_updates_to_a_client_does_not_clone_the_sent_batch_set() {
     sent_batch_clone_probe::reset();
     for tip in hot_row_tips(row_id, FORWARDS) {
         sm.queue_row_to_client(client_id, row_id, forwarding_metadata(), tip, false);
+        confirm_queued(&mut sm);
     }
 
     let synced = sm

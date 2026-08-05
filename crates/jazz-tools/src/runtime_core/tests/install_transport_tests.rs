@@ -194,6 +194,59 @@ mod install_transport_tests {
         );
     }
 
+    /// A transport that reconnects must replay the client's subscriptions.
+    ///
+    /// The server-side recovery for rows the peer never confirmed hangs entirely off this:
+    /// it re-derives a returning peer's scope when its subscription is registered again. If
+    /// a transport-level reconnect did NOT replay subscriptions, the server would never be
+    /// asked, and the recovery would be dead code in the field while every unit test around
+    /// it stayed green. This test exists because that assumption was taken on trust once
+    /// already, and the fix built on it did nothing.
+    #[test]
+    fn a_transport_reconnect_replays_active_subscriptions() {
+        let mut core = create_test_runtime();
+
+        let mut manager = crate::runtime_core::install_transport::<_, _, NopStreamAdapter, _>(
+            &mut core,
+            "ws://example.test/ws".to_string(),
+            AuthConfig::default(),
+            NopTick,
+        );
+        let server_id = core.transport.as_ref().unwrap().server_id;
+
+        let _handle = core
+            .subscribe(
+                crate::query_manager::query::Query::new("users"),
+                |_| {},
+                None,
+            )
+            .expect("subscribe");
+        core.batched_tick();
+        while manager.try_recv_outbox_for_test().is_some() {}
+
+        core.handle_transport_inbound_for_test(
+            server_id,
+            crate::transport_manager::TransportInbound::Connected {
+                catalogue_state_hash: None,
+                next_sync_seq: None,
+            },
+        );
+        core.batched_tick();
+
+        let mut replayed = false;
+        while let Some(entry) = manager.try_recv_outbox_for_test() {
+            if matches!(entry.payload, SyncPayload::QuerySubscription { .. }) {
+                replayed = true;
+            }
+        }
+        assert!(
+            replayed,
+            "a reconnecting transport did not replay the active subscription, so the server \
+             is never asked to re-derive the peer's scope — the recovery for rows the peer \
+             never confirmed can never run"
+        );
+    }
+
     #[test]
     fn install_transport_holds_initial_remote_query_frontier_while_connecting() {
         let mut core = create_test_runtime();

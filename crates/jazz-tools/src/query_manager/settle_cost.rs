@@ -194,6 +194,16 @@ pub(crate) fn timed<T>(counter: &AtomicU64, f: impl FnOnce() -> T) -> T {
 /// is untouched.
 pub static PENDING_LOCAL_ROW_BATCHES: AtomicU64 = AtomicU64::new(0);
 
+/// Payloads queued to clients that never reached a connection, and how many distinct
+/// clients are owed them. Gauges.
+///
+/// This is the early warning for silent delivery loss: a healthy server sits at zero, and
+/// anything that stays non-zero is a peer that is missing rows right now. It is the number
+/// that would have shown the 3-second-blip defect without a user noticing missing messages
+/// first.
+pub static UNDELIVERED_PAYLOADS: AtomicU64 = AtomicU64::new(0);
+pub static UNDELIVERED_CLIENTS: AtomicU64 = AtomicU64::new(0);
+
 /// Publish a gauge reading.
 #[inline]
 pub(crate) fn set_gauge(gauge: &AtomicU64, value: u64) {
@@ -310,6 +320,8 @@ pub struct SettleCounts {
     pub storage_write_micros: u64,
     pub storage_write_bytes: u64,
     pub pending_local_row_batches: u64,
+    pub undelivered_payloads: u64,
+    pub undelivered_clients: u64,
     /// Gauge, not a counter: live cached subgraph instances at the moment of
     /// the reading.
     pub live_instances: u64,
@@ -344,6 +356,8 @@ impl SettleCounts {
             storage_write_micros: STORAGE_WRITE_MICROS.load(Ordering::Relaxed),
             storage_write_bytes: STORAGE_WRITE_BYTES.load(Ordering::Relaxed),
             pending_local_row_batches: PENDING_LOCAL_ROW_BATCHES.load(Ordering::Relaxed),
+            undelivered_payloads: UNDELIVERED_PAYLOADS.load(Ordering::Relaxed),
+            undelivered_clients: UNDELIVERED_CLIENTS.load(Ordering::Relaxed),
             live_instances: LIVE_SUBQUERY_INSTANCES.load(Ordering::Relaxed),
             live_instance_nodes: LIVE_SUBQUERY_NODES.load(Ordering::Relaxed),
         }
@@ -390,6 +404,8 @@ impl SettleCounts {
                 .storage_write_bytes
                 .saturating_sub(base.storage_write_bytes),
             pending_local_row_batches: self.pending_local_row_batches,
+            undelivered_payloads: self.undelivered_payloads,
+            undelivered_clients: self.undelivered_clients,
             live_instances: self.live_instances,
             live_instance_nodes: self.live_instance_nodes,
         }
@@ -475,6 +491,8 @@ impl Drop for SettlePass {
             storage_write_micros = cost.storage_write_micros,
             storage_write_bytes = cost.storage_write_bytes,
             pending_local_row_batches = cost.pending_local_row_batches,
+            undelivered_payloads = cost.undelivered_payloads,
+            undelivered_clients = cost.undelivered_clients,
             live_instances = cost.live_instances,
             live_instance_nodes = cost.live_instance_nodes,
             hot_micros,

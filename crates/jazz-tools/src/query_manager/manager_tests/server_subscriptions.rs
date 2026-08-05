@@ -15,6 +15,30 @@ fn owned_items_schema() -> Schema {
     schema
 }
 
+/// Confirm the given payloads as the receiver would, so the server's delivery bookkeeping
+/// advances. Claims are applied on the receiver's confirmation, not at queue time, so a
+/// test that drains the outbox has to say the rows arrived — otherwise the peer looks like
+/// one still owed rows and is rightly re-offered them.
+fn confirm_delivered(
+    qm: &mut crate::query_manager::manager::QueryManager,
+    entries: &[crate::sync_manager::OutboxEntry],
+) {
+    use crate::sync_manager::{Destination, SyncPayload};
+    let confirmed: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match (&entry.destination, &entry.payload) {
+            (Destination::Client(client_id), SyncPayload::RowBatchNeeded { row, .. }) => Some((
+                *client_id,
+                row.row_id,
+                crate::object::BranchName::new(row.branch.as_str()),
+                row.batch_id,
+            )),
+            _ => None,
+        })
+        .collect();
+    qm.sync_manager_mut().confirm_client_deliveries(&confirmed);
+}
+
 #[test]
 fn server_builds_query_graph_on_subscription() {
     use crate::sync_manager::{ClientId, Destination, InboxEntry, QueryId, Source, SyncPayload};
@@ -290,6 +314,7 @@ fn duplicate_server_subscription_does_not_replay_same_scope_same_tier_settlement
         .filter_gt("score", Value::Integer(50))
         .build();
 
+    let mut outbox = Vec::new();
     for _ in 0..2 {
         server_qm.sync_manager_mut().push_inbox(InboxEntry {
             source: Source::Client(client_id),
@@ -304,9 +329,14 @@ fn duplicate_server_subscription_does_not_replay_same_scope_same_tier_settlement
         });
 
         server_qm.process(&mut storage);
-    }
 
-    let outbox = server_qm.sync_manager_mut().take_outbox();
+        // Confirm between the registrations. A peer with rows still outstanding is owed a
+        // re-offer, and the second registration would rightly give it one; this test is
+        // about the other case — a peer that has everything and merely re-registers.
+        let delivered = server_qm.sync_manager_mut().take_outbox();
+        confirm_delivered(&mut server_qm, &delivered);
+        outbox.extend(delivered);
+    }
     let settled_count = outbox
         .iter()
         .filter(|entry| {
@@ -768,8 +798,9 @@ fn server_pushes_new_matches() {
 
     server_qm.process(&mut storage);
 
-    // Clear initial outbox
-    let _ = server_qm.sync_manager_mut().take_outbox();
+    // Clear initial outbox, confirming it as the receiver would.
+    let initial = server_qm.sync_manager_mut().take_outbox();
+    confirm_delivered(&mut server_qm, &initial);
 
     // Insert new matching user
     let handle2 = server_qm
@@ -958,5 +989,366 @@ fn server_does_not_push_non_matching() {
         row_updates.len(),
         0,
         "Should NOT send RowBatchNeeded for non-matching user"
+    );
+}
+
+/// A peer whose transport dropped and came back must be re-offered what it missed.
+///
+/// This is the shape a phone produces and the one no other test reaches. A brief network gap
+/// does not tear down the client's subscription — the transport reconnects underneath it and
+/// replays the SAME query id. The server then finds an equivalent, already-settled
+/// subscription and answers from the cached scope without re-deriving anything.
+/// Re-derivation is the only place that sets `force_resend`, so a row the peer never
+/// confirmed is otherwise never offered again.
+///
+/// Every existing offline test reconnects by building a fresh client, which mints a NEW
+/// query id; the server has no prior state for that key, re-derives, and force-resends
+/// everything as a side effect. They are green for a reason that does not apply in the field.
+#[test]
+fn a_transport_reconnect_re_offers_a_row_the_peer_never_confirmed() {
+    use crate::sync_manager::{ClientId, Destination, InboxEntry, QueryId, Source, SyncPayload};
+
+    let sync_manager = SyncManager::new();
+    let schema = test_schema();
+    let (mut server_qm, mut storage) = create_query_manager(sync_manager, schema);
+
+    server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("Alice".into()), Value::Integer(100)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    let query = server_qm
+        .query("users")
+        .filter_gt("score", Value::Integer(50))
+        .build();
+    let subscribe = |qm: &mut crate::query_manager::manager::QueryManager| {
+        qm.sync_manager_mut().push_inbox(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::QuerySubscription {
+                query_id: QueryId(1),
+                query: Box::new(query.clone()),
+                session: None,
+                required_tier: None,
+                propagation: crate::sync_manager::QueryPropagation::Full,
+                policy_context_tables: vec![],
+            },
+        });
+    };
+
+    subscribe(&mut server_qm);
+    server_qm.process(&mut storage);
+    let initial = server_qm.sync_manager_mut().take_outbox();
+    confirm_delivered(&mut server_qm, &initial);
+
+    // The gap: a message arrives while the peer cannot receive it. Draining the outbox
+    // without confirming is what a dead socket does to the payload.
+    let missed = server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("sent while away".into()), Value::Integer(150)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+    let dropped = server_qm.sync_manager_mut().take_outbox();
+    assert!(
+        dropped.iter().any(|entry| matches!(
+            entry,
+            crate::sync_manager::OutboxEntry {
+                destination: Destination::Client(id),
+                payload: SyncPayload::RowBatchNeeded { row, .. },
+            } if *id == client_id && row.row_id == missed.row_id
+        )),
+        "precondition: the row should have been offered to the subscribed peer once"
+    );
+    drop(dropped);
+
+    // The peer is back. Nothing is signalled by hand: the server still believes the old
+    // socket is alive — a three-second drop tells TCP nothing — so no disconnect was ever
+    // recorded. What IS true is that the peer never confirmed the row.
+    subscribe(&mut server_qm);
+    server_qm.process(&mut storage);
+
+    let after = server_qm.sync_manager_mut().take_outbox();
+    assert!(
+        after.iter().any(|entry| matches!(
+            entry,
+            crate::sync_manager::OutboxEntry {
+                destination: Destination::Client(id),
+                payload: SyncPayload::RowBatchNeeded { row, .. },
+            } if *id == client_id && row.row_id == missed.row_id
+        )),
+        "the peer reconnected and the row it missed was never offered again — the server \
+         recognised the replayed subscription as equivalent and already settled, so nothing \
+         re-derived its scope and nothing set force_resend. This is the message that never \
+         arrives after a brief network drop."
+    );
+}
+
+/// The re-offer stops once the peer is caught up.
+///
+/// If the trigger stayed true after confirmation, every resubscribe — and a phone
+/// resubscribes on every foreground — would re-send. This pins the other half.
+#[test]
+fn the_re_offer_stops_once_the_peer_is_caught_up() {
+    use crate::sync_manager::{ClientId, Destination, InboxEntry, QueryId, Source, SyncPayload};
+
+    let sync_manager = SyncManager::new();
+    let schema = test_schema();
+    let (mut server_qm, mut storage) = create_query_manager(sync_manager, schema);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    let query = server_qm
+        .query("users")
+        .filter_gt("score", Value::Integer(50))
+        .build();
+    let subscribe = |qm: &mut crate::query_manager::manager::QueryManager| {
+        qm.sync_manager_mut().push_inbox(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::QuerySubscription {
+                query_id: QueryId(1),
+                query: Box::new(query.clone()),
+                session: None,
+                required_tier: None,
+                propagation: crate::sync_manager::QueryPropagation::Full,
+                policy_context_tables: vec![],
+            },
+        });
+    };
+
+    subscribe(&mut server_qm);
+    server_qm.process(&mut storage);
+
+    server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("delivered".into()), Value::Integer(150)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+    let delivered = server_qm.sync_manager_mut().take_outbox();
+    confirm_delivered(&mut server_qm, &delivered);
+
+    subscribe(&mut server_qm);
+    server_qm.process(&mut storage);
+
+    let after = server_qm.sync_manager_mut().take_outbox();
+    let re_offered = after
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                crate::sync_manager::OutboxEntry {
+                    destination: Destination::Client(id),
+                    payload: SyncPayload::RowBatchNeeded { .. },
+                } if *id == client_id
+            )
+        })
+        .count();
+    assert_eq!(
+        re_offered, 0,
+        "a peer that confirmed everything was re-offered {re_offered} rows on a plain \
+         resubscribe — the trigger never clears, so every foreground re-sends"
+    );
+}
+
+/// The re-offer carries what the peer is missing, not everything it can see.
+#[test]
+fn the_re_offer_carries_only_what_the_peer_is_missing() {
+    use crate::sync_manager::{ClientId, Destination, InboxEntry, QueryId, Source, SyncPayload};
+
+    let sync_manager = SyncManager::new();
+    let schema = test_schema();
+    let (mut server_qm, mut storage) = create_query_manager(sync_manager, schema);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    let query = server_qm
+        .query("users")
+        .filter_gt("score", Value::Integer(50))
+        .build();
+    let subscribe = |qm: &mut crate::query_manager::manager::QueryManager| {
+        qm.sync_manager_mut().push_inbox(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::QuerySubscription {
+                query_id: QueryId(1),
+                query: Box::new(query.clone()),
+                session: None,
+                required_tier: None,
+                propagation: crate::sync_manager::QueryPropagation::Full,
+                policy_context_tables: vec![],
+            },
+        });
+    };
+
+    subscribe(&mut server_qm);
+    server_qm.process(&mut storage);
+
+    let held = server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("already held".into()), Value::Integer(150)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+    let delivered = server_qm.sync_manager_mut().take_outbox();
+    confirm_delivered(&mut server_qm, &delivered);
+
+    let missed = server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("sent while away".into()), Value::Integer(160)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+    let _dropped = server_qm.sync_manager_mut().take_outbox();
+
+    subscribe(&mut server_qm);
+    server_qm.process(&mut storage);
+
+    let after = server_qm.sync_manager_mut().take_outbox();
+    let offered: Vec<_> = after
+        .iter()
+        .filter_map(|entry| match (&entry.destination, &entry.payload) {
+            (Destination::Client(id), SyncPayload::RowBatchNeeded { row, .. })
+                if *id == client_id =>
+            {
+                Some(row.row_id)
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        offered.contains(&missed.row_id),
+        "the unconfirmed row was not re-offered"
+    );
+    assert!(
+        !offered.contains(&held.row_id),
+        "a row the peer already confirmed was re-sent as part of the recovery — the \
+         re-offer ships the whole scope instead of what is missing, so one outstanding row \
+         costs a full retransmission on every resubscribe"
+    );
+}
+
+/// A batch a later batch supersedes must stop being owed.
+///
+/// A re-offer can only ship the CURRENT row, so an unconfirmed batch that a newer one has
+/// replaced can never be confirmed — nothing will send it again. If the entry survives that,
+/// the peer counts as owed rows forever: every registration re-derives, and the entry leaks
+/// until the client is reaped, which never happens while it stays connected.
+#[test]
+fn a_superseded_unconfirmed_batch_stops_being_owed() {
+    use crate::sync_manager::{ClientId, Destination, InboxEntry, QueryId, Source, SyncPayload};
+
+    let sync_manager = SyncManager::new();
+    let schema = test_schema();
+    let (mut server_qm, mut storage) = create_query_manager(sync_manager, schema);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    let query = server_qm
+        .query("users")
+        .filter_gt("score", Value::Integer(50))
+        .build();
+    let subscribe = |qm: &mut crate::query_manager::manager::QueryManager| {
+        qm.sync_manager_mut().push_inbox(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::QuerySubscription {
+                query_id: QueryId(1),
+                query: Box::new(query.clone()),
+                session: None,
+                required_tier: None,
+                propagation: crate::sync_manager::QueryPropagation::Full,
+                policy_context_tables: vec![],
+            },
+        });
+    };
+
+    subscribe(&mut server_qm);
+    server_qm.process(&mut storage);
+
+    let row = server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("first".into()), Value::Integer(150)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+    let _dropped = server_qm.sync_manager_mut().take_outbox();
+
+    // Edited while the peer is still away: the first batch can never be sent again.
+    server_qm
+        .update(
+            &mut storage,
+            row.row_id,
+            &[Value::Text("second".into()), Value::Integer(160)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    // The peer returns, is handed the current row, and confirms it.
+    subscribe(&mut server_qm);
+    server_qm.process(&mut storage);
+    let delivered = server_qm.sync_manager_mut().take_outbox();
+    assert!(
+        delivered.iter().any(|entry| matches!(
+            entry,
+            crate::sync_manager::OutboxEntry {
+                destination: Destination::Client(id),
+                payload: SyncPayload::RowBatchNeeded { .. },
+            } if *id == client_id
+        )),
+        "precondition: the returning peer should have been re-offered the row"
+    );
+    confirm_delivered(&mut server_qm, &delivered);
+
+    subscribe(&mut server_qm);
+    server_qm.process(&mut storage);
+
+    let after = server_qm.sync_manager_mut().take_outbox();
+    let re_offered = after
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                crate::sync_manager::OutboxEntry {
+                    destination: Destination::Client(id),
+                    payload: SyncPayload::RowBatchNeeded { .. },
+                } if *id == client_id
+            )
+        })
+        .count();
+    assert_eq!(
+        re_offered, 0,
+        "the caught-up peer was re-offered {re_offered} rows"
+    );
+    assert!(
+        !server_qm
+            .sync_manager()
+            .client_has_undelivered_payloads(client_id),
+        "the peer is caught up but is still recorded as owed rows — the entry outlives \
+         every chance to confirm it, so it leaks until the client is reaped, and a \
+         connected client is never reaped"
     );
 }

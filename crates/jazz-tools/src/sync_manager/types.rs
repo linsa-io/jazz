@@ -690,6 +690,29 @@ impl Source {
     }
 }
 
+/// What a queued row still owes its client's bookkeeping until the receiver confirms it.
+///
+/// Held aside rather than applied at enqueue: the payload can be dropped after queueing,
+/// and a claim recorded for a payload nobody received is permanent — it short-circuits
+/// every later attempt to offer the row.
+#[derive(Debug, Clone)]
+pub struct PendingDelivery {
+    /// The batch this entry is about. Kept in the value, not the key: a later batch for the
+    /// same row REPLACES this entry, because a re-offer can only ever ship the row's
+    /// current state. Keying by batch would strand every superseded entry — nothing would
+    /// send that batch again, so nothing could confirm it, and the peer would count as owed
+    /// rows forever.
+    pub batch_id: BatchId,
+    pub branch_name: BranchName,
+    /// The row's metadata, kept so a re-offer is identical to the original attempt rather
+    /// than a reconstruction.
+    pub metadata: HashMap<String, String>,
+    /// Parents as they were BEFORE scope stripping — `scope_delivery_row` clears them on
+    /// the delivered copy, but the frontier cursor prunes by them.
+    pub parent_ids: Vec<BatchId>,
+    pub include_metadata: bool,
+}
+
 /// Outgoing message to be sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxEntry {

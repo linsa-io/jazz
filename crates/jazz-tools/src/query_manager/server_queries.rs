@@ -1046,7 +1046,31 @@ impl QueryManager {
                 .as_ref()
                 .is_some_and(|(equivalent, ..)| *equivalent);
 
-            if equivalent_existing_subscription
+            // A peer that was away replays the same query id, so the subscription looks
+            // equivalent and already settled. Answering from the cached scope re-derives
+            // nothing, and re-derivation is the only place that sets `force_resend` — which
+            // is why a row it never confirmed is otherwise never offered again. Decline the
+            // fast path for that one pass.
+            let owed_rows = self
+                .sync_manager
+                .client_has_undelivered_payloads(sub.client_id);
+            tracing::info!(
+                target: "jazz::conn",
+                client_id = %sub.client_id,
+                query_id = sub.query_id.0,
+                equivalent = equivalent_existing_subscription,
+                owed_rows,
+                decision = if owed_rows {
+                    "re-derive: peer is owed rows"
+                } else if equivalent_existing_subscription {
+                    "fast path: nothing re-derived"
+                } else {
+                    "re-derive: new or changed subscription"
+                },
+                "subscription registered"
+            );
+            if !owed_rows
+                && equivalent_existing_subscription
                 && existing_subscription_state
                     .as_ref()
                     .is_some_and(|(_, _, _, _, settled_once)| *settled_once)
@@ -1226,7 +1250,10 @@ impl QueryManager {
                 .and_then(|(_, _, last_emitted_settled_tier, _, _)| *last_emitted_settled_tier);
 
             if let Some(scope) = scope.as_ref() {
-                let scope_changed = !equivalent_existing_subscription
+                // A returning peer's scope is unchanged by definition — it was away, not
+                // re-scoped — so this gate would skip the one call that re-offers rows.
+                let scope_changed = owed_rows
+                    || !equivalent_existing_subscription
                     || existing_subscription_state
                         .as_ref()
                         .is_none_or(|(_, _, _, last_scope, _)| *last_scope != *scope);

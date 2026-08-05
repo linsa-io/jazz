@@ -351,6 +351,27 @@ fn sealed_submission_with_mode(
     )
 }
 
+/// Confirm everything currently queued, without draining the outbox.
+///
+/// Delivery claims are applied when the receiver confirms a row, not when it is queued, so
+/// a test that inspects `sent_batch_ids` has to say the rows arrived.
+fn confirm_queued(sm: &mut SyncManager) {
+    let confirmed: Vec<_> = sm
+        .outbox
+        .iter()
+        .filter_map(|entry| match (&entry.destination, &entry.payload) {
+            (Destination::Client(client_id), SyncPayload::RowBatchNeeded { row, .. }) => Some((
+                *client_id,
+                row.row_id,
+                BranchName::new(row.branch.as_str()),
+                row.batch_id,
+            )),
+            _ => None,
+        })
+        .collect();
+    sm.confirm_client_deliveries(&confirmed);
+}
+
 fn add_client(sm: &mut SyncManager, io: &MemoryStorage, client_id: ClientId) {
     sm.add_client_with_storage(io, client_id);
 }
@@ -417,6 +438,7 @@ fn push_query_subscription(
 /// reconcile.
 mod basic;
 mod client_lifecycle;
+mod dropped_payload;
 mod forwarding_recursion;
 mod frontier_pruning;
 mod permissions;

@@ -65,6 +65,17 @@ pub struct SyncManager {
 
     pub(super) inbox: Vec<InboxEntry>,
     pub(super) outbox: Vec<OutboxEntry>,
+
+    /// Rows queued to a client and not yet confirmed by it, per client per row.
+    ///
+    /// The claim used to be written at enqueue. A payload is dropped silently when the
+    /// client has no registered stream or its channel is dead, and nothing rolled the claim
+    /// back — so the row was never offered again and the receiver lost it for as long as
+    /// its server-side state lived. Entries wait here until the RECEIVER says it applied
+    /// the row: no sender-side signal is trustworthy, because a socket that is dying still
+    /// accepts writes for as long as TCP takes to notice.
+    pub(super) pending_client_deliveries:
+        HashMap<ClientId, HashMap<(ObjectId, BranchName), PendingDelivery>>,
     /// Pending permission checks awaiting policy evaluation.
     pub(super) pending_permission_checks: Vec<PendingPermissionCheck>,
     /// Pending query subscriptions awaiting QueryGraph building by QueryManager.
@@ -240,6 +251,7 @@ impl SyncManager {
             clients: HashMap::new(),
             inbox: Vec::new(),
             outbox: Vec::new(),
+            pending_client_deliveries: HashMap::new(),
             pending_permission_checks: Vec::new(),
             pending_query_subscriptions: Vec::new(),
             pending_query_unsubscriptions: Vec::new(),
@@ -623,6 +635,9 @@ impl SyncManager {
             return false;
         }
 
+        // A reaped client's unconfirmed rows go with it: its state is rebuilt from
+        // scratch on the next connection.
+        self.pending_client_deliveries.remove(&client_id);
         self.clients.remove(&client_id);
         // Clean up interest map
         self.row_batch_interest.retain(|_, clients| {
@@ -684,6 +699,81 @@ impl SyncManager {
     // ========================================================================
 
     /// Take all outbox entries, clearing the outbox.
+    /// Apply the delivery claims the receiver has confirmed.
+    ///
+    /// Only clears when the confirmation names the batch still owed: a late confirmation
+    /// for a superseded batch leaves the newer one outstanding.
+    pub fn confirm_client_deliveries(
+        &mut self,
+        confirmed: &[(ClientId, ObjectId, BranchName, BatchId)],
+    ) {
+        for (client_id, row_id, branch_name, batch_id) in confirmed.iter().cloned() {
+            let Some(owed) = self.pending_client_deliveries.get_mut(&client_id) else {
+                continue;
+            };
+            let key = (row_id, branch_name);
+            let Some(pending) = owed.get(&key).filter(|p| p.batch_id == batch_id).cloned() else {
+                continue;
+            };
+            owed.remove(&key);
+            if owed.is_empty() {
+                self.pending_client_deliveries.remove(&client_id);
+            }
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                continue;
+            };
+            tracing::debug!(
+                target: "jazz::delivery",
+                %client_id, object_id = %row_id, ?batch_id,
+                "receiver confirmed the row"
+            );
+            if pending.include_metadata {
+                client.sent_metadata.insert(row_id);
+            }
+            client
+                .sent_batch_ids
+                .entry((row_id, pending.branch_name))
+                .or_default()
+                .record_delivery(batch_id, &pending.parent_ids);
+        }
+    }
+
+    /// Whether this client is owed rows it never confirmed.
+    pub fn client_has_undelivered_payloads(&self, client_id: ClientId) -> bool {
+        self.pending_client_deliveries
+            .get(&client_id)
+            .is_some_and(|owed| !owed.is_empty())
+    }
+
+    /// The rows this client is owed, as scope entries.
+    ///
+    /// A re-offer is built from this rather than from the whole scope: the trigger is
+    /// per-client, so without narrowing one unconfirmed row would retransmit an entire
+    /// query on every resubscribe — and a phone resubscribes whenever it comes back to the
+    /// foreground.
+    fn undelivered_scope_entries(&self, client_id: ClientId) -> HashSet<(ObjectId, BranchName)> {
+        self.pending_client_deliveries
+            .get(&client_id)
+            .map(|owed| owed.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Publish how much is owed right now. Called once per tick; the map is empty on a
+    /// healthy server, so this is two length checks.
+    pub fn publish_undelivered_gauges(&self) {
+        crate::query_manager::settle_cost::set_gauge(
+            &crate::query_manager::settle_cost::UNDELIVERED_PAYLOADS,
+            self.pending_client_deliveries
+                .values()
+                .map(|owed| owed.len() as u64)
+                .sum(),
+        );
+        crate::query_manager::settle_cost::set_gauge(
+            &crate::query_manager::settle_cost::UNDELIVERED_CLIENTS,
+            self.pending_client_deliveries.len() as u64,
+        );
+    }
+
     pub fn take_outbox(&mut self) -> Vec<OutboxEntry> {
         std::mem::take(&mut self.outbox)
     }
@@ -793,8 +883,28 @@ impl SyncManager {
 
         let no_longer_visible: HashSet<(ObjectId, BranchName)> =
             old_scope.difference(&new_scope).cloned().collect();
-        let newly_visible_for_query: Vec<(ObjectId, BranchName)> =
-            scope.difference(&old_query_scope).cloned().collect();
+        // Plus whatever this peer never confirmed that is still in scope. For a returning
+        // peer the difference is empty — its scope did not change, it was away — so the
+        // owed rows are the whole of the re-offer. Re-offering a row the peer already holds
+        // is harmless: applying an identical batch is an idempotent no-op on the receiver.
+        let newly_visible_for_query: Vec<(ObjectId, BranchName)> = {
+            let mut entries: HashSet<(ObjectId, BranchName)> =
+                scope.difference(&old_query_scope).cloned().collect();
+            let owed = self.undelivered_scope_entries(client_id);
+            let re_offered = owed.intersection(&scope).count();
+            if re_offered > 0 {
+                tracing::info!(
+                    target: "jazz::conn",
+                    %client_id,
+                    query_id = query_id.0,
+                    rows = re_offered,
+                    scope = scope.len(),
+                    "re-offering rows the peer never confirmed"
+                );
+            }
+            entries.extend(owed.intersection(&scope).cloned());
+            entries.into_iter().collect()
+        };
 
         self.prune_client_scope_tracking(client_id, &no_longer_visible);
 
