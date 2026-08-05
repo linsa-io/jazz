@@ -404,6 +404,7 @@ mod tests {
             auth: crate::transport_manager::AuthConfig::default(),
             catalogue_state_hash: None,
             declared_schema_hash: None,
+            acks_deliveries: false,
         };
 
         // Authenticate should fail — the `authenticate_ws_handshake` function is
@@ -441,6 +442,7 @@ mod tests {
             auth: crate::transport_manager::AuthConfig::default(),
             catalogue_state_hash: None,
             declared_schema_hash: None,
+            acks_deliveries: false,
         };
         let mut request_headers = HeaderMap::new();
         request_headers.insert(axum::http::header::HOST, "example.test".parse().unwrap());
@@ -484,6 +486,7 @@ mod tests {
             auth: crate::transport_manager::AuthConfig::default(),
             catalogue_state_hash: None,
             declared_schema_hash: None,
+            acks_deliveries: false,
         };
         let mut request_headers = HeaderMap::new();
         request_headers.insert(axum::http::header::HOST, "localhost:4200".parse().unwrap());
@@ -527,6 +530,7 @@ mod tests {
             auth: crate::transport_manager::AuthConfig::default(),
             catalogue_state_hash: None,
             declared_schema_hash: None,
+            acks_deliveries: false,
         };
         let mut request_headers = HeaderMap::new();
         request_headers.insert(axum::http::header::HOST, "localhost:4200".parse().unwrap());
@@ -570,6 +574,7 @@ mod tests {
             auth: crate::transport_manager::AuthConfig::default(),
             catalogue_state_hash: None,
             declared_schema_hash: None,
+            acks_deliveries: false,
         };
         let mut request_headers = HeaderMap::new();
         request_headers.insert(axum::http::header::HOST, "example.test".parse().unwrap());
@@ -2256,6 +2261,7 @@ mod tests {
             auth: crate::transport_manager::AuthConfig::default(),
             catalogue_state_hash: state.runtime.catalogue_state_hash().ok(),
             declared_schema_hash: Some(declared_hash.to_string()),
+            acks_deliveries: false,
         };
 
         let diagnostics = connection_schema_diagnostics_from_handshake(&state, &handshake)
@@ -2293,6 +2299,7 @@ mod tests {
         let (mut ws, _) = connect_async(&ws_url).await.expect("connect ws");
 
         let handshake = crate::transport_manager::AuthHandshake {
+            acks_deliveries: false,
             sync_protocol_version: crate::transport_manager::SYNC_PROTOCOL_VERSION,
             client_id: client_id.clone(),
             auth: crate::transport_manager::AuthConfig {
@@ -2369,6 +2376,7 @@ mod tests {
         let (mut ws, _) = connect_async(&ws_url).await.expect("connect ws");
 
         let handshake = crate::transport_manager::AuthHandshake {
+            acks_deliveries: false,
             sync_protocol_version: crate::transport_manager::SYNC_PROTOCOL_VERSION,
             client_id: ClientId::new().to_string(),
             auth: crate::transport_manager::AuthConfig {

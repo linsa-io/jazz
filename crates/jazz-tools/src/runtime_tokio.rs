@@ -720,6 +720,17 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
         Ok(core.remove_client(client_id))
     }
 
+    /// Record whether a client confirms the rows it applies (negotiated in the handshake).
+    pub fn set_client_acks_deliveries(
+        &self,
+        client_id: ClientId,
+        acks: bool,
+    ) -> Result<(), RuntimeError> {
+        let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
+        core.set_client_acks_deliveries(client_id, acks);
+        Ok(())
+    }
+
     /// Promote a client to Admin role (full access, no ReBAC).
     pub fn set_client_admin(&self, client_id: ClientId) -> Result<(), RuntimeError> {
         let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;

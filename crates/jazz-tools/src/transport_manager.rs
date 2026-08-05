@@ -265,6 +265,14 @@ pub struct AuthHandshake {
     pub auth: AuthConfig,
     pub catalogue_state_hash: Option<String>,
     pub declared_schema_hash: Option<String>,
+    /// Whether this client confirms the rows it applies.
+    ///
+    /// Negotiated here rather than on a sync payload because the handshake is JSON, where a
+    /// missing field really is a default. The sync channel is postcard, which is not
+    /// self-describing: a new field there would fail to decode on an older peer and take
+    /// the whole frame with it.
+    #[serde(default)]
+    pub acks_deliveries: bool,
 }
 
 fn default_sync_protocol_version() -> u32 {
@@ -294,6 +302,7 @@ mod handshake_tests {
             auth: AuthConfig::default(),
             catalogue_state_hash: Some(catalogue_hash.clone()),
             declared_schema_hash: Some(declared_hash.to_string()),
+            acks_deliveries: false,
         };
 
         assert_eq!(handshake.declared_schema_hash(), Some(declared_hash));
@@ -304,6 +313,7 @@ mod handshake_tests {
             auth: AuthConfig::default(),
             catalogue_state_hash: Some(catalogue_hash),
             declared_schema_hash: None,
+            acks_deliveries: false,
         };
 
         assert_eq!(handshake_without_declared_hash.declared_schema_hash(), None);
@@ -353,6 +363,7 @@ mod handshake_tests {
     #[test]
     fn auth_handshake_postcard_roundtrip_preserves_backend_session() {
         let handshake = AuthHandshake {
+            acks_deliveries: false,
             sync_protocol_version: SYNC_PROTOCOL_VERSION,
             client_id: "client-1".to_string(),
             auth: AuthConfig {
@@ -390,6 +401,10 @@ pub struct ConnectedResponse {
     pub client_id: String,
     pub next_sync_seq: Option<u64>,
     pub catalogue_state_hash: Option<String>,
+    /// Whether this server understands delivery confirmations. A client that hears nothing
+    /// here is talking to an older server and must not send them.
+    #[serde(default)]
+    pub supports_delivery_acks: bool,
 }
 
 #[derive(Default)]
@@ -664,6 +679,9 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
             auth: self.auth.clone(),
             catalogue_state_hash,
             declared_schema_hash,
+            // This client applies rows and reports them, so the server can wait for the
+            // receiver instead of guessing from its own send path.
+            acks_deliveries: true,
         };
         let payload =
             serde_json::to_vec(&handshake).expect("AuthHandshake serialisation infallible");
@@ -1305,6 +1323,7 @@ mod tests {
                 client_id: "client-1".into(),
                 next_sync_seq: Some(0),
                 catalogue_state_hash: None,
+                supports_delivery_acks: false,
             };
             let payload = serde_json::to_vec(&resp).unwrap();
             let frame = frame_encode(&payload);
@@ -1410,6 +1429,7 @@ mod tests {
             client_id: "client-1".into(),
             next_sync_seq: Some(0),
             catalogue_state_hash: None,
+            supports_delivery_acks: false,
         };
         let payload = serde_json::to_vec(&resp).unwrap();
         frame_encode(&payload)

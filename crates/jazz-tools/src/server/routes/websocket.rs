@@ -484,6 +484,17 @@ async fn handle_ws_connection(
         }
     }
 
+    // 5a. Record whether this client confirms what it applies. Known here, before it
+    // subscribes, which is what the delivery bookkeeping needs: a client that does not
+    // confirm keeps the old claim-at-queue behaviour rather than accumulating rows nothing
+    // will ever clear.
+    if let Err(error) = state
+        .runtime
+        .set_client_acks_deliveries(client_id, handshake.acks_deliveries)
+    {
+        tracing::warn!(%client_id, ?error, "could not record the client's delivery-ack capability");
+    }
+
     // 5b. Dispatch connection schema diagnostics if client sent a declared schema hash.
     match connection_schema_diagnostics_from_handshake(&state, &handshake) {
         Ok(Some(diagnostics)) => {
@@ -509,6 +520,7 @@ async fn handle_ws_connection(
         client_id: client_id.to_string(),
         next_sync_seq: Some(next_sync_seq),
         catalogue_state_hash: state.runtime.catalogue_state_hash().ok(),
+        supports_delivery_acks: true,
     };
     let resp_bytes = match serde_json::to_vec(&resp) {
         Ok(b) => b,

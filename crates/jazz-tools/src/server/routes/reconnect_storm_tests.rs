@@ -108,6 +108,7 @@ async fn open_authenticated_ws(
         .map_err(|e| format!("ws upgrade failed: {e}"))?;
 
     let handshake = crate::transport_manager::AuthHandshake {
+        acks_deliveries: false,
         sync_protocol_version: crate::transport_manager::SYNC_PROTOCOL_VERSION,
         client_id: client_id_str.to_string(),
         auth: crate::transport_manager::AuthConfig {
