@@ -1,3 +1,8 @@
+> **This is a fork.** `linsa-io/jazz`, diverged from `garden-co/jazz` at `e84d84a6` on
+> 2026-07-27, running a local-first messenger in production. Defects we found in upstream
+> code while doing so — each with a fix, a test and a measurement — are written up in
+> [UPSTREAM-DEFECTS.md](UPSTREAM-DEFECTS.md).
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/public/jazz-logo-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/public/jazz-logo-light.svg">
