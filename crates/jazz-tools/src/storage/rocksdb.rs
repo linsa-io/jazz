@@ -87,37 +87,6 @@ impl RocksDBStorage {
         // LZ4 for L0-L2 (fast), Zstd for deeper levels (compact)
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
-        // Memtables, not the block cache, are what a blob workload leaves
-        // resident. RocksDB's default is 64 MiB per buffer with two of them, so
-        // writing 1 MiB rows parks up to 128 MiB that never comes back down.
-        //
-        // Measured on a 105 MiB store, ten 18 MiB uploads back to back, reading
-        // physical footprint (not `ps rss`, which does not count compressed
-        // pages): the plateau is 219 MB at the default, 73 MB at 16 MiB, and
-        // 50 MB at 4 MiB. Shrinking the block cache 64 -> 4 MiB instead moved
-        // nothing (248 MB), so this is the term that matters.
-        //
-        // 16 MiB rather than 4: smaller buffers flush more often, which costs
-        // L0 files and compaction on the read path. At 16 MiB neither the
-        // subscription plateau (170 vs 165 MB) nor the initial settle over 187
-        // rows (146 vs 162 ms) moved, so this keeps four times the buffer of
-        // the aggressive setting for the same practical saving.
-        opts.set_write_buffer_size(16 * 1024 * 1024);
-        opts.set_max_write_buffer_number(2);
-        // L0's stable size is `write_buffer_size * min_write_buffer_number_to_merge
-        // * level0_file_num_compaction_trigger`, and RocksDB's guide asks that
-        // `max_bytes_for_level_base` match it. With the shipped defaults
-        // (1 and 4, `options.h:258`) that is 64 * 1 * 4 = 256 MiB against a
-        // `max_bytes_for_level_base` of 256 MiB (`options.h:306`) — coherent.
-        // Shrinking the buffer alone would leave L1's budget four times L0's, so
-        // it moves too. Missing this is why the pair is written together here.
-        opts.set_max_bytes_for_level_base(64 * 1024 * 1024);
-        // Note for whoever adds `get_for_update`/`SetSnapshot` (nothing uses them
-        // today): `TransactionDB::PrepareWrap` derives
-        // `max_write_buffer_size_to_maintain` — the in-memory history window for
-        // conflict validation — as `max_write_buffer_number * write_buffer_size`
-        // when left at its default. Sizing the buffer for memory therefore also
-        // sizes that window, here to 32 MiB.
 
         let txdb_opts = TransactionDBOptions::default();
         let db = TransactionDB::open(&opts, &txdb_opts, path.as_ref())
