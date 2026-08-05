@@ -23,8 +23,12 @@ use std::collections::HashMap;
 /// operation the same run left 0.01 MiB.
 ///
 /// Boxing the payload separates the two lifetimes: a stale `Weak` now pins the Arc header
-/// (~24 bytes) and the bytes are freed with the last strong reference. Deduplication is
-/// unchanged — subscribers still share one payload allocation.
+/// (32 bytes — two counters plus the `Box` fat pointer) and the bytes are freed with the
+/// last strong reference. Deduplication is unchanged — subscribers still share one payload
+/// allocation. Nor is it a cost on the load path: an `Arc<[u8]>` can only be built through
+/// `impl From<Box<T>> for Arc<T>`, which allocates a fresh block and memcpys the whole
+/// payload into it on every row load; `Arc::new(Box<[u8]>)` allocates the header and moves
+/// a pointer.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RowBytes(Arc<Box<[u8]>>);
 
