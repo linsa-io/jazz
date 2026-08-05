@@ -2136,5 +2136,6 @@ mod incremental_scan;
 mod install_transport_tests;
 mod query_subscription;
 mod schema_catalogue;
+mod sealed_batch_cost;
 mod sync_replay;
 mod write_batch;

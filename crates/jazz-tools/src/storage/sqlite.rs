@@ -339,59 +339,103 @@ impl Storage for SqliteStorage {
     }
 
     fn raw_table_put(&mut self, table: &str, key: &str, value: &[u8]) -> Result<(), StorageError> {
-        self.with_inner_mut(|inner| {
-            inner.ensure_write_tx()?;
-            Self::with_savepoint(&inner.conn, || {
-                raw_table_put_core(table, key, value, |storage_key, bytes| {
-                    Self::set(&inner.conn, storage_key, bytes)
+        crate::query_manager::settle_cost::add(
+            &crate::query_manager::settle_cost::STORAGE_WRITE_BYTES,
+            value.len() as u64,
+        );
+        crate::query_manager::settle_cost::timed(
+            &crate::query_manager::settle_cost::STORAGE_WRITE_MICROS,
+            || {
+                self.with_inner_mut(|inner| {
+                    inner.ensure_write_tx()?;
+                    Self::with_savepoint(&inner.conn, || {
+                        raw_table_put_core(table, key, value, |storage_key, bytes| {
+                            Self::set(&inner.conn, storage_key, bytes)
+                        })
+                    })
                 })
-            })
-        })
+            },
+        )
     }
 
     fn raw_table_delete(&mut self, table: &str, key: &str) -> Result<(), StorageError> {
-        self.with_inner_mut(|inner| {
-            inner.ensure_write_tx()?;
-            Self::with_savepoint(&inner.conn, || {
-                raw_table_delete_core(table, key, |storage_key| {
-                    Self::delete(&inner.conn, storage_key)
+        crate::query_manager::settle_cost::timed(
+            &crate::query_manager::settle_cost::STORAGE_WRITE_MICROS,
+            || {
+                self.with_inner_mut(|inner| {
+                    inner.ensure_write_tx()?;
+                    Self::with_savepoint(&inner.conn, || {
+                        raw_table_delete_core(table, key, |storage_key| {
+                            Self::delete(&inner.conn, storage_key)
+                        })
+                    })
                 })
-            })
-        })
+            },
+        )
     }
 
     fn apply_raw_table_mutations(
         &mut self,
         mutations: &[RawTableMutation<'_>],
     ) -> Result<(), StorageError> {
-        self.with_inner_mut(|inner| {
-            inner.ensure_write_tx()?;
-            Self::with_savepoint(&inner.conn, || {
-                for mutation in mutations {
-                    match mutation {
-                        RawTableMutation::Put { table, key, value } => {
-                            raw_table_put_core(table, key, value, |storage_key, bytes| {
-                                Self::set(&inner.conn, storage_key, bytes)
-                            })?;
+        crate::query_manager::settle_cost::add(
+            &crate::query_manager::settle_cost::STORAGE_WRITE_BYTES,
+            mutations
+                .iter()
+                .map(|mutation| match mutation {
+                    RawTableMutation::Put { value, .. } => value.len() as u64,
+                    RawTableMutation::Delete { .. } => 0,
+                })
+                .sum(),
+        );
+        crate::query_manager::settle_cost::timed(
+            &crate::query_manager::settle_cost::STORAGE_WRITE_MICROS,
+            || {
+                self.with_inner_mut(|inner| {
+                    inner.ensure_write_tx()?;
+                    Self::with_savepoint(&inner.conn, || {
+                        for mutation in mutations {
+                            match mutation {
+                                RawTableMutation::Put { table, key, value } => {
+                                    raw_table_put_core(table, key, value, |storage_key, bytes| {
+                                        Self::set(&inner.conn, storage_key, bytes)
+                                    })?;
+                                }
+                                RawTableMutation::Delete { table, key } => {
+                                    raw_table_delete_core(table, key, |storage_key| {
+                                        Self::delete(&inner.conn, storage_key)
+                                    })?;
+                                }
+                            }
                         }
-                        RawTableMutation::Delete { table, key } => {
-                            raw_table_delete_core(table, key, |storage_key| {
-                                Self::delete(&inner.conn, storage_key)
-                            })?;
-                        }
-                    }
-                }
-                Ok(())
-            })
-        })
+                        Ok(())
+                    })
+                })
+            },
+        )
     }
 
     fn raw_table_get(&self, table: &str, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        self.with_inner(|inner| {
-            raw_table_get_core(table, key, |storage_key| {
-                Self::get(&inner.conn, storage_key)
-            })
-        })
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::STORAGE_READ_OPS,
+        );
+        crate::query_manager::settle_cost::timed(
+            &crate::query_manager::settle_cost::STORAGE_READ_MICROS,
+            || {
+                self.with_inner(|inner| {
+                    raw_table_get_core(table, key, |storage_key| {
+                        Self::get(&inner.conn, storage_key)
+                    })
+                })
+                .inspect(|found| {
+                    let bytes = found.as_ref().map_or(0, |bytes| bytes.len() as u64);
+                    crate::query_manager::settle_cost::add(
+                        &crate::query_manager::settle_cost::STORAGE_READ_BYTES,
+                        bytes,
+                    );
+                })
+            },
+        )
     }
 
     fn raw_table_scan_prefix(
@@ -399,11 +443,26 @@ impl Storage for SqliteStorage {
         table: &str,
         prefix: &str,
     ) -> Result<super::RawTableRows, StorageError> {
-        self.with_inner(|inner| {
-            raw_table_scan_prefix_core(table, prefix, |storage_prefix| {
-                Self::scan_prefix(&inner.conn, storage_prefix)
-            })
-        })
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::STORAGE_READ_OPS,
+        );
+        crate::query_manager::settle_cost::timed(
+            &crate::query_manager::settle_cost::STORAGE_READ_MICROS,
+            || {
+                self.with_inner(|inner| {
+                    raw_table_scan_prefix_core(table, prefix, |storage_prefix| {
+                        Self::scan_prefix(&inner.conn, storage_prefix)
+                    })
+                })
+                .inspect(|rows| {
+                    let bytes: u64 = rows.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+                    crate::query_manager::settle_cost::add(
+                        &crate::query_manager::settle_cost::STORAGE_READ_BYTES,
+                        bytes,
+                    );
+                })
+            },
+        )
     }
 
     fn raw_table_scan_prefix_keys(

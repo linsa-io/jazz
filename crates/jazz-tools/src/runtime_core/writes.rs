@@ -461,19 +461,19 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         record: &LocalBatchRecord,
     ) -> Result<SealedBatchSubmission, RuntimeError> {
         let (target_branch_name, members) = Self::sealed_batch_members_from_record(record)?;
-        let captured_frontier = if record.mode == BatchMode::Transactional {
-            // Compatibility payload only. The authority ignores this frontier
-            // for validation now; transactional conflicts are detected from the
-            // staged rows' parent frontiers. Remove this capture when the sealed
-            // batch storage/wire format can break compatibility.
-            self.storage
-                .capture_family_visible_frontier(target_branch_name)
-                .map_err(|err| {
-                    RuntimeError::WriteError(format!("capture family visible frontier: {err}"))
-                })?
-        } else {
-            Vec::new()
-        };
+        // The `captured_frontier` field is compatibility payload: nothing reads it.
+        // Transactional conflicts are decided from the staged rows' own parents, in
+        // `SyncManager::validate_transactional_parent_frontiers`, which looks up one row at
+        // a time. Upstream PR #920 removed the validation that consumed this frontier and
+        // left the capture in place, earmarked for the next storage-format break.
+        //
+        // Capturing it walked EVERY visible row of the branch family per transactional
+        // write. That is O(store) work on the write path for a value with no reader, and on
+        // a store holding 390 one-megabyte blob rows it measured 384 MB read per sent
+        // message — the app froze on every write. The field stays on the wire and in
+        // storage, empty; `capture_family_visible_frontier` stays on the `Storage` trait,
+        // still covered by the conformance suites, until the format break can remove both.
+        let captured_frontier = Vec::new();
         Ok(SealedBatchSubmission::new(
             record.batch_id,
             record.mode,

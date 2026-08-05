@@ -2036,6 +2036,13 @@ fn decode_history_row_bytes_in_table(
     batch_id: BatchId,
     bytes: &[u8],
 ) -> Result<StoredRowBatch, StorageError> {
+    // Every history-decoding path funnels through here, so this is the one place
+    // that can say what a settle actually spent on accumulated history.
+    crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::HISTORY_ENTRIES);
+    crate::query_manager::settle_cost::add(
+        &crate::query_manager::settle_cost::HISTORY_BYTES,
+        bytes.len() as u64,
+    );
     decode_flat_history_row_with_codecs(
         resolved.row_codecs.as_ref(),
         row_id,

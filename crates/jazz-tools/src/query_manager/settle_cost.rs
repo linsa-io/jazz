@@ -132,6 +132,74 @@ pub static LIVE_SUBQUERY_INSTANCES: AtomicU64 = AtomicU64::new(0);
 /// few wide includes or from many nested ones.
 pub static LIVE_SUBQUERY_NODES: AtomicU64 = AtomicU64::new(0);
 
+/// History scans issued — one per `scan_history_row_batches` or
+/// `scan_history_region` call, whatever the pass was nominally doing.
+///
+/// The counters above are all bounded by the SIZE OF THE CHANGE: rows loaded,
+/// index probes, instances re-evaluated. None of them can express work
+/// proportional to what a row has ACCUMULATED, and a history scan decodes every
+/// revision a row ever had. On a device store that difference is four orders of
+/// magnitude — a fresh row scans in microseconds, a row with 9,885 heartbeat
+/// revisions takes 45 ms, and a row holding a megabyte blob takes 11 ms for its
+/// single entry. A settle pass reporting `row_loads=7` and a wall time of 900 ms
+/// is unexplainable until these three are on the line.
+pub static HISTORY_SCANS: AtomicU64 = AtomicU64::new(0);
+
+/// History entries decoded — counted at `decode_history_row_bytes_in_table`,
+/// the choke point every scan path funnels through. Divided by
+/// [`HISTORY_SCANS`] it gives the mean depth the pass paid for.
+pub static HISTORY_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of row payload decoded out of history. Separated from the entry count
+/// because the two failure modes are different: many small revisions (heartbeat
+/// depth) versus few enormous ones (blob rows), and they need different fixes.
+pub static HISTORY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Wall time spent inside storage READS and WRITES, and the bytes written.
+///
+/// Every other counter here answers "how much work", none answer "where did the
+/// wall time go". A settle reporting 459 ms with `history_scans=0` says only
+/// that one suspect is innocent; splitting its wall time into storage versus
+/// everything else is the first fork that actually narrows anything, and it is
+/// the fork that separates "the store got big" from "the engine recomputes too
+/// much", which imply different fixes.
+pub static STORAGE_READ_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Storage read CALLS. Without it, read time cannot be divided into "each read
+/// is slow" and "there are far too many reads", and those have opposite fixes.
+pub static STORAGE_READ_OPS: AtomicU64 = AtomicU64::new(0);
+/// Bytes returned by storage reads. The history counters above cover only the
+/// history table; a blob upload lands megabyte rows in the VISIBLE table, and
+/// without this axis a settle that spends 37 of its 41 ms inside reads cannot
+/// say whether it read thirty small rows or one enormous one.
+pub static STORAGE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static STORAGE_WRITE_MICROS: AtomicU64 = AtomicU64::new(0);
+pub static STORAGE_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Run `f`, adding its wall time to `counter`.
+#[inline]
+pub(crate) fn timed<T>(counter: &AtomicU64, f: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let out = f();
+    add(counter, micros_of(started.elapsed()));
+    out
+}
+
+/// Entries in `QueryManager::pending_local_row_batches` at the moment a settle
+/// took the overlay path — a GAUGE, reported as a value, never as a delta.
+///
+/// The map is global across tables and drains only when a non-local update for
+/// the same object arrives confirmed at the global tier, so an upload whose rows
+/// never get that echo leaves it pinned at the part count for the life of the
+/// process. That is what makes a restart "fix" the freeze while the data on disk
+/// is untouched.
+pub static PENDING_LOCAL_ROW_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Publish a gauge reading.
+#[inline]
+pub(crate) fn set_gauge(gauge: &AtomicU64, value: u64) {
+    gauge.store(value, Ordering::Relaxed);
+}
+
 /// Count one event.
 #[inline]
 pub(crate) fn bump(counter: &AtomicU64) {
@@ -233,6 +301,15 @@ pub struct SettleCounts {
     pub row_loads: u64,
     pub index_reads: u64,
     pub rows_emitted: u64,
+    pub history_scans: u64,
+    pub history_entries: u64,
+    pub history_bytes: u64,
+    pub storage_read_micros: u64,
+    pub storage_read_ops: u64,
+    pub storage_read_bytes: u64,
+    pub storage_write_micros: u64,
+    pub storage_write_bytes: u64,
+    pub pending_local_row_batches: u64,
     /// Gauge, not a counter: live cached subgraph instances at the moment of
     /// the reading.
     pub live_instances: u64,
@@ -258,6 +335,15 @@ impl SettleCounts {
             row_loads: ROW_LOADS.load(Ordering::Relaxed),
             index_reads: INDEX_READS.load(Ordering::Relaxed),
             rows_emitted: ROWS_EMITTED.load(Ordering::Relaxed),
+            history_scans: HISTORY_SCANS.load(Ordering::Relaxed),
+            history_entries: HISTORY_ENTRIES.load(Ordering::Relaxed),
+            history_bytes: HISTORY_BYTES.load(Ordering::Relaxed),
+            storage_read_micros: STORAGE_READ_MICROS.load(Ordering::Relaxed),
+            storage_read_ops: STORAGE_READ_OPS.load(Ordering::Relaxed),
+            storage_read_bytes: STORAGE_READ_BYTES.load(Ordering::Relaxed),
+            storage_write_micros: STORAGE_WRITE_MICROS.load(Ordering::Relaxed),
+            storage_write_bytes: STORAGE_WRITE_BYTES.load(Ordering::Relaxed),
+            pending_local_row_batches: PENDING_LOCAL_ROW_BATCHES.load(Ordering::Relaxed),
             live_instances: LIVE_SUBQUERY_INSTANCES.load(Ordering::Relaxed),
             live_instance_nodes: LIVE_SUBQUERY_NODES.load(Ordering::Relaxed),
         }
@@ -287,6 +373,23 @@ impl SettleCounts {
             row_loads: self.row_loads.saturating_sub(base.row_loads),
             index_reads: self.index_reads.saturating_sub(base.index_reads),
             rows_emitted: self.rows_emitted.saturating_sub(base.rows_emitted),
+            history_scans: self.history_scans.saturating_sub(base.history_scans),
+            history_entries: self.history_entries.saturating_sub(base.history_entries),
+            history_bytes: self.history_bytes.saturating_sub(base.history_bytes),
+            storage_read_micros: self
+                .storage_read_micros
+                .saturating_sub(base.storage_read_micros),
+            storage_read_ops: self.storage_read_ops.saturating_sub(base.storage_read_ops),
+            storage_read_bytes: self
+                .storage_read_bytes
+                .saturating_sub(base.storage_read_bytes),
+            storage_write_micros: self
+                .storage_write_micros
+                .saturating_sub(base.storage_write_micros),
+            storage_write_bytes: self
+                .storage_write_bytes
+                .saturating_sub(base.storage_write_bytes),
+            pending_local_row_batches: self.pending_local_row_batches,
             live_instances: self.live_instances,
             live_instance_nodes: self.live_instance_nodes,
         }
@@ -363,6 +466,15 @@ impl Drop for SettlePass {
             row_loads = cost.row_loads,
             index_reads = cost.index_reads,
             rows_emitted = cost.rows_emitted,
+            history_scans = cost.history_scans,
+            history_entries = cost.history_entries,
+            history_bytes = cost.history_bytes,
+            storage_read_micros = cost.storage_read_micros,
+            storage_read_ops = cost.storage_read_ops,
+            storage_read_bytes = cost.storage_read_bytes,
+            storage_write_micros = cost.storage_write_micros,
+            storage_write_bytes = cost.storage_write_bytes,
+            pending_local_row_batches = cost.pending_local_row_batches,
             live_instances = cost.live_instances,
             live_instance_nodes = cost.live_instance_nodes,
             hot_micros,

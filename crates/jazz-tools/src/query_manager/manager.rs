@@ -1578,6 +1578,16 @@ impl QueryManager {
                         )
                     };
 
+                // This map is QueryManager-global and table-blind: every entry in it is
+                // walked, and its full row bytes read, by every full IndexScanNode rescan
+                // in every qualifying subscription. Its length is therefore a multiplier
+                // on a settle's storage reads, and it is the number that says whether a
+                // settle reading hundreds of megabytes does so because the overlay never
+                // drained.
+                crate::query_manager::settle_cost::set_gauge(
+                    &crate::query_manager::settle_cost::PENDING_LOCAL_ROW_BATCHES,
+                    self.pending_local_row_batches.len() as u64,
+                );
                 let source_overlay_rows = if !subscription.local_overlay_rows.is_empty() {
                     Some(&subscription.local_overlay_rows)
                 } else if subscription.local_updates == LocalUpdates::Immediate

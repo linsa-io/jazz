@@ -1552,6 +1552,7 @@ pub trait Storage {
         table: &str,
         row_id: ObjectId,
     ) -> Result<Vec<StoredRowBatch>, StorageError> {
+        crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::HISTORY_SCANS);
         let resolved_tables = resolved_row_tables_for_table(self, RowRawTableKind::History, table)?;
         let prefix = key_codec::history_row_raw_table_prefix(Some(row_id));
         let mut rows = Vec::new();
@@ -1578,6 +1579,7 @@ pub trait Storage {
         branch: &str,
         scan: HistoryScan,
     ) -> Result<Vec<StoredRowBatch>, StorageError> {
+        crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::HISTORY_SCANS);
         let resolved_tables = resolved_row_tables_for_table(self, RowRawTableKind::History, table)?;
         let prefix = match scan {
             HistoryScan::Branch | HistoryScan::AsOf { .. } => {

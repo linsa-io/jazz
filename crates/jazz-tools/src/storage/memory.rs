@@ -422,11 +422,21 @@ impl Storage for MemoryStorage {
     }
 
     fn raw_table_get(&self, table: &str, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(self
+        // Counted here as well as in the sqlite backend so a bytes-read gate can run on
+        // the in-memory storage every unit test already uses.
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::STORAGE_READ_OPS,
+        );
+        let found = self
             .raw_tables
             .get(table)
             .and_then(|rows| rows.get(key))
-            .cloned())
+            .cloned();
+        crate::query_manager::settle_cost::add(
+            &crate::query_manager::settle_cost::STORAGE_READ_BYTES,
+            found.as_ref().map_or(0, |bytes| bytes.len() as u64),
+        );
+        Ok(found)
     }
 
     fn upsert_authoritative_batch_fate(
@@ -495,14 +505,22 @@ impl Storage for MemoryStorage {
         table: &str,
         prefix: &str,
     ) -> Result<RawTableRows, StorageError> {
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::STORAGE_READ_OPS,
+        );
         let Some(rows) = self.raw_tables.get(table) else {
             return Ok(Vec::new());
         };
-        Ok(rows
+        let scanned: RawTableRows = rows
             .range(prefix.to_string()..)
             .take_while(|(key, _)| key.starts_with(prefix))
             .map(|(key, value)| (key.clone(), value.clone()))
-            .collect())
+            .collect();
+        crate::query_manager::settle_cost::add(
+            &crate::query_manager::settle_cost::STORAGE_READ_BYTES,
+            scanned.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
+        );
+        Ok(scanned)
     }
 
     fn raw_table_scan_prefix_keys(

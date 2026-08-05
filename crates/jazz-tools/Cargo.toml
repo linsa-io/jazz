@@ -189,3 +189,7 @@ required-features = ["sqlite", "test"]
 [[test]]
 name = "sync_telemetry_otel"
 required-features = ["test", "otel-core"]
+
+[[example]]
+name = "store_probe"
+required-features = ["sqlite"]

@@ -176,6 +176,98 @@ frontier coverage and the decline cases.
 
 ---
 
+## 9. Every transactional write reads the whole store to build a payload nobody reads
+
+**Severity: the app freezes on every write once the store holds large rows.**
+
+`RuntimeCore::sealed_batch_submission` (`runtime_core/writes.rs:459`) calls
+`Storage::capture_family_visible_frontier` for every `Transactional` batch, and that helper
+(`storage/storage_trait.rs:1271`) scans every visible raw table with an empty prefix and
+decodes every row it finds. The result is compatibility payload: PR #920 removed the
+validation that consumed it — transactional conflicts are decided from the staged rows' own
+parents in `SyncManager::validate_transactional_parent_frontiers`
+(`sync_manager/inbox.rs:151`), one targeted lookup per row — and left the capture in place,
+commented for removal "with the next storage-format break". Nothing has read it since.
+
+While rows are small this is invisible. Our messenger stores file attachments as 1 MiB rows,
+and the cost became the dominant term the moment a user sent a file.
+
+Measured on a device store of 741 rows, of which 780 raw values exceed 500 KB (768.3 MB of
+1 MiB attachment parts, 17.4 MB everything else): **every settle pass read 768.38 MB in 2207
+operations** — every blob row, both its visible and its history copy, exactly once, byte for
+byte, pass after pass. 148 of 469 settle passes in one minute of ordinary use, ~1000 ms each,
+~113 GB read in that minute. This defect accounts for the visible half, 384.2 MB; defect 10
+accounts for the other.
+
+**Reproduced on pristine upstream.** The gate below was checked out into a clean
+`origin/main` worktree at `e84d84a6` — not one line of this fork — and fails there
+identically: "sealing one row carried a frontier of 25 members with 25 unrelated rows in the
+store". So the behaviour is upstream's, not something our changes induce. One honest limit:
+the trigger is `BatchMode::Transactional`, which the APPLICATION chooses. An app that never
+writes transactionally never pays this. Ours does, on every message.
+
+The fix removes the capture; the field stays on the wire and in storage, empty. The gate is
+`runtime_core/tests/sealed_batch_cost.rs`, which asserts SHAPE rather than duration or bytes —
+the captured frontier must be bounded by the batch, never by the store. It fails on the
+unfixed code with "sealing one row carried a frontier of 25 members with 25 unrelated rows in
+the store". Shape rather than bytes because `MemoryStorage` overrides the capture with an
+in-memory walk that costs nothing to traverse: a bytes-read assertion passes there while the
+real backends bleed.
+
+One pre-existing test, `rc_missing_batch_fate_retransmits_original_captured_frontier`, pinned
+the old behaviour. Its real contract is that a retransmission replays what was sealed instead
+of re-deriving it; with an empty frontier that would pass vacuously, so it now seeds an
+old-format submission itself and demands it back verbatim.
+
+**After both fixes, on the same device and the same scenario: settle passes over 100 MB went
+148 of 469 → 0, passes over 500 ms 148 → 0, worst pass 1000 ms / 768 MB → 178 ms / 0.27 MB.**
+
+## 10. An index scan reads — and can admit — rows belonging to other tables
+
+**Severity: cost proportional to unrelated data, plus a correctness hazard.**
+
+`IndexScanNode::apply_local_overlay_rows` (`query_manager/graph_nodes/index_scan.rs:257`)
+walks `QueryManager::pending_local_row_batches` and loads each entry's full row bytes. That
+map is process-global and table-blind (`query_manager/manager.rs:541`), the loop filters only
+on branch, and the resolver it calls ignores the table name it is handed —
+`load_history_row_batch_row_bytes_with_storage` takes `_table` and addresses purely by row id
+(`storage/mod.rs:2133`). So a scan over one table reads the megabyte payloads of rows in
+another, and where the condition happens to match, `new_ids.insert(row_id)` admits a foreign
+row into that index's id set.
+
+The map also gates the cheap path: while it is non-empty, `IndexScanNode` takes the full
+rescan branch for every dirty settle in every qualifying subscription
+(`index_scan.rs:344-353`). And it drains only when a NON-local update for the same object
+arrives with `confirmed_tier == GlobalServer` (`manager.rs:1930`), so rows written locally and
+never echoed back that way pin it for the life of the process. That is why restarting the app
+"fixes" the freeze while the data on disk is untouched — the map lives only in memory. It is
+also why the defect is asymmetric between peers: the device that UPLOADS accumulates the
+entries; the device that downloads receives the same rows as non-local updates and does not.
+
+Measured: ~390 unconfirmed 1 MiB parts in the map, **384.2 MB read per settle pass**, on a
+subscription that loaded 7 rows and emitted none.
+
+**Evidence is weaker here than for defect 9, and stated as such.** All three functions
+involved — `apply_local_overlay_rows`, `load_history_row_batch_row_bytes_with_storage` and
+`common_case_exact_history_row_table_locator` — are byte-identical to `origin/main`
+(`e84d84a6`), verified by diffing them function by function. But we have NOT reproduced it
+on a pristine upstream tree: populating the overlay needs a live scenario with an
+unconfirmed local write, which a unit test does not reach. What can be said without a run:
+the incremental fast path that gates this walk (`index_scan.rs:344-353`) exists only in this
+fork — upstream always takes the full-scan branch — so upstream cannot be less exposed than
+we are.
+
+The fix skips overlay entries whose row locator names a different table than the one being
+scanned, keeping the resolver's fallback for rows that have no locator yet. Fixing the shared
+resolver instead was considered and rejected: its table parameter is ignored deliberately and
+it serves many callers, so a strict check there risks silently dropping rows — the failure
+mode this document already contains two entries about.
+
+**After the fix, with the overlay demonstrably populated (peak 73 entries), reads per overlay
+entry went from ~2 MB to 2.8 KB.**
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed

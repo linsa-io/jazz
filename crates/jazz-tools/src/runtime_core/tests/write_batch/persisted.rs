@@ -792,13 +792,16 @@ fn rc_missing_batch_fate_retransmits_original_captured_frontier() {
             .load_sealed_batch_submission(batch_id)
             .unwrap()
             .expect("sealed batch should persist its original submission");
-    assert_eq!(
-        sealed_submission.captured_frontier,
-        vec![CapturedFrontierMember {
-            object_id: existing_row_id,
-            branch_name: existing_branch_name,
-            batch_id: existing_batch_id,
-        }]
+    // The engine no longer captures a frontier at seal time — it walked every visible row
+    // in the store for a payload nothing reads (see `sealed_batch_submission`). This test
+    // is about a different property: that a retransmission REPLAYS what was sealed instead
+    // of re-deriving it. With an empty frontier both would look alike, so an old-format
+    // submission is written here deliberately; the replay below must carry it back
+    // verbatim, including the row inserted after sealing, which a re-derivation would
+    // have swept in.
+    assert!(
+        sealed_submission.captured_frontier.is_empty(),
+        "sealing must not walk the store to build a frontier nobody reads"
     );
 
     s.a.batched_tick();
@@ -813,6 +816,25 @@ fn rc_missing_batch_fate_retransmits_original_captured_frontier() {
 
     s.a.insert("users", user_insert_values(later_row_id, "Later"), None)
         .unwrap();
+
+    // Stand in an old-format submission, the kind sealed before the capture was dropped.
+    // The replay below must hand back exactly this, including the frontier member — a
+    // re-derivation would produce something else (and would sweep in "Later"), which is
+    // the property this test exists to pin.
+    let sealed_submission = SealedBatchSubmission::new(
+        batch_id,
+        crate::batch_fate::BatchMode::Transactional,
+        branch_name,
+        sealed_submission.members.clone(),
+        vec![CapturedFrontierMember {
+            object_id: existing_row_id,
+            branch_name: existing_branch_name,
+            batch_id: existing_batch_id,
+        }],
+    );
+    s.a.storage_mut()
+        .upsert_sealed_batch_submission(&sealed_submission)
+        .expect("stand in an old-format sealed submission");
 
     s.a.park_sync_message(InboxEntry {
         source: Source::Server(s.b_server_for_a),

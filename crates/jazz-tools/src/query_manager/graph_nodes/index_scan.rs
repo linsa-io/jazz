@@ -263,6 +263,21 @@ impl IndexScanNode {
             if row_batch_key.branch_name.as_str() != self.branch {
                 continue;
             }
+            // The overlay is `QueryManager::pending_local_row_batches`, which is global: it
+            // holds every locally written row of every table until a non-local update
+            // confirms it. The load below resolves by row id and ignores the table name it
+            // is handed, so without this check a scan over one table reads the full bytes
+            // of rows belonging to another — and, where the condition happens to match,
+            // admits them into this index's id set. Measured on a device store, an upload
+            // left ~390 unconfirmed one-megabyte `file_parts` rows in the overlay and every
+            // settle paid 384 MB walking them.
+            //
+            // A row with no locator falls through, preserving the resolver's own fallback.
+            if let Ok(Some(locator)) = ctx.storage.load_row_locator(row_id)
+                && locator.table.as_str() != self.table.as_str()
+            {
+                continue;
+            }
             let Ok(Some(row)) = ctx.storage.load_history_query_row_batch(
                 self.table.as_str(),
                 self.branch.as_str(),
