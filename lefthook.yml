@@ -16,6 +16,12 @@ pre-commit:
       exclude: "crates/jazz-rn/src/**, examples/*/schema/app.ts, examples/docs/*/schema/app.ts, crates/jazz-napi/index.d.ts, crates/jazz-napi/index.js"
       run: pnpm oxlint --fix {staged_files}
       stage_fixed: true
+    # The generated uniffi bindings are tracked files; a Rust FFI signature change
+    # that forgets them ships a checksum mismatch that no test catches. Runs on
+    # both sides so neither half can move alone.
+    rn-bindings:
+      glob: "crates/jazz-rn/**/*.{rs,ts}"
+      run: node dev/scripts/check-rn-bindings-current.mjs
     starters-parity:
       glob: "starters/**"
       run: node dev/scripts/check-starters-parity.mjs
