@@ -105,6 +105,123 @@ async fn park_offline_unreaped(server: &JazzServer) {
     }
 }
 
+/// An EDIT to a row the peer already had arrives today — and must keep arriving.
+///
+/// This was written expecting a second, separate failure. A review argued that resettle
+/// resends only `scope.difference(&old_query_scope)` (`sync_manager/mod.rs:795-812`), that
+/// an edit never changes membership, and that an unreaped peer therefore never hears about
+/// it. That reading of the code is right and the conclusion is wrong: measured here, the
+/// edit does arrive. Some other path repairs already-visible rows on reconnect.
+///
+/// So the defect is narrower than it looked — it is about rows that become NEWLY VISIBLE
+/// during the gap. This test stays as a guard, because a fix that touches per-client
+/// delivery state could easily break the half that works.
+///
+/// Asserted on the SUBSCRIPTION, not on `query`: the row id is already in the peer's local
+/// store, so an id-only assertion is vacuous, and a one-shot `query` is worse — the first
+/// version of this test read the edited value back in 0.49 s with the peer's store
+/// untouched, which is `query` fetching from the server, not the peer being up to date.
+/// What cannot be faked is an `updated` delta: the peer's local state only changes when the
+/// edited batch is actually applied to it. Verified by a control run with the edit
+/// suppressed — the assertion then times out, so it is capable of failing.
+#[tokio::test]
+async fn an_edit_made_during_the_gap_reaches_a_returning_peer() {
+    let schema = test_schema();
+    let server = JazzServer::start_with_schema(schema.clone()).await;
+
+    let alice = TestingClient::builder()
+        .with_server(&server)
+        .with_schema(schema.clone())
+        .with_user_id("alice-edit-gap")
+        .ready_on("todos", READY_TIMEOUT)
+        .connect()
+        .await;
+
+    let (bob_ctx, bob) = TestingClient::builder()
+        .with_server(&server)
+        .with_schema(schema.clone())
+        .with_user_id("bob-edit-gap")
+        .with_persistent_storage()
+        .ready_on("todos", READY_TIMEOUT)
+        .connect_with_context()
+        .await;
+    let pinned_client_id = bob.client_id();
+
+    let query = QueryBuilder::new("todos").build();
+    let (row_id, _, _) = alice.insert("todos", todo("original")).expect("insert");
+    let mut before = bob.subscribe(query.clone()).await.expect("bob subscribes");
+    expect_delivered(
+        &mut before,
+        &[row_id].into_iter().collect(),
+        "bob while online",
+    )
+    .await;
+
+    bob.shutdown().await.expect("bob goes offline");
+    park_offline_unreaped(&server).await;
+
+    // Nothing is inserted here on purpose: an insert would land in the newly-visible diff
+    // and could carry the test to green while the edit path stayed broken.
+    alice
+        .update(
+            row_id,
+            vec![(
+                "title".to_string(),
+                Value::Text("edited-while-away".to_string()),
+            )],
+        )
+        .expect("alice edits while bob is away");
+    wait_for_query(
+        &alice,
+        query.clone(),
+        Some(DurabilityTier::EdgeServer),
+        QUERY_TIMEOUT,
+        "alice's edit reached the server",
+        |rows| {
+            matches!(rows.first(), Some((_, values)) if matches!(values.first(), Some(Value::Text(t)) if t == "edited-while-away"))
+                .then_some(())
+        },
+    )
+    .await;
+
+    let mut reconnect_ctx = bob_ctx.clone();
+    reconnect_ctx.client_id = pinned_client_id;
+    let bob_back = JazzClient::connect(reconnect_ctx)
+        .await
+        .expect("bob reconnects with the same identity");
+    let mut sub = bob_back
+        .subscribe(query.clone())
+        .await
+        .expect("bob resubscribes");
+
+    // The initial snapshot replays what bob already had, so `added` proves nothing here.
+    // Only an `updated` for this row means the edited batch was applied to his store.
+    let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
+    let mut applied = false;
+    while !applied {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "bob's store never took the edit made while he was away — no update for the row \
+             ever arrived on the subscription",
+        );
+        let delta = tokio::time::timeout(remaining, sub.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "bob's store never took the edit made while he was away — no update for \
+                     the row ever arrived on the subscription",
+                )
+            })
+            .expect("subscription stream closed early");
+        applied = delta.updated.iter().any(|row| row.id == row_id);
+    }
+
+    bob_back.shutdown().await.ok();
+    alice.shutdown().await.ok();
+    server.shutdown().await;
+}
+
 /// Every row written during the gap arrives — not just the newest.
 ///
 /// A fix that re-derives the subscription but leaves the delivery cursor claiming the whole
