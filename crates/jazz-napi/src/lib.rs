@@ -175,6 +175,18 @@ fn value_to_js<'env>(env: &'env Env, value: &Value) -> napi::Result<Unknown<'env
             // back through Rust's allocator, which is what this crate's header
             // asks for, and falls back to a copy on runtimes that refuse
             // external buffers.
+            //
+            // The `clone` is a known cost, deliberately left: it is one memcpy,
+            // invisible against the 3 GiB/s this path now runs at, but it does
+            // mean a blob exists twice for the length of the conversion — the
+            // source stays alive in the result set while the copy is pinned by
+            // the Buffer. That doubles PEAK memory in proportion to the size of
+            // one query's results. It does not show up in this app, which reads
+            // media in windows of four ~1 MiB parts; it would on a query that
+            // returns a large result set. Removing it means a consuming
+            // `value_into_js(env, value: Value)` so the Vec can be moved. Note
+            // there is no honest test for it — the win is peak RSS, which flakes
+            // as an assertion, so this is a comment rather than a gate.
             tagged.set("value", BufferSlice::from_data(env, bytes.clone())?)?;
             into_unknown(env, tagged)
         }
@@ -324,6 +336,14 @@ fn parse_subscription_inputs(
 /// bytes. This is the path the app actually reads media on: it subscribes to a
 /// window of `file_parts` rather than querying, so fixing `query` alone left
 /// every download on the per-byte route.
+///
+/// NOTE this fixes node only. `jazz-rn` has the same defect and cannot use this
+/// fix: its bridge is uniffi with a string callback, so its delta goes out as
+/// `serde_json::to_string` (`crates/jazz-rn/rust/src/lib.rs`) with the blob as
+/// an array of numbers inside the JSON text, and the JS side then walks it byte
+/// by byte. A phone is slow at downloads for that reason and stays slow after
+/// this commit. Fixing it needs either base64/hex in the JSON or a
+/// bytes-capable uniffi type — a different change, not a port of this one.
 pub struct SubscriptionDeltaJs(SubscriptionDelta);
 
 impl ToNapiValue for SubscriptionDeltaJs {
