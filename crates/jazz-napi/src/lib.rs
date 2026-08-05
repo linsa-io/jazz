@@ -43,7 +43,7 @@ use jazz_tools::binding_support::{
     parse_batch_id_input, parse_batch_mode_input, parse_durability_tier as parse_binding_tier,
     parse_external_object_id, parse_query_input, parse_read_durability_options,
     parse_runtime_schema_input, parse_session_input, parse_write_context_input,
-    serialize_mutation_error_event, subscription_delta_to_json,
+    serialize_mutation_error_event,
 };
 use jazz_tools::identity;
 use jazz_tools::middleware::AuthConfig;
@@ -316,12 +316,73 @@ fn parse_subscription_inputs(
     Ok((query, session, durability, propagation))
 }
 
+/// One subscription delta on its way to JS.
+///
+/// Mirrors `subscription_delta_to_json` (`jazz_tools::query_manager::bindings`)
+/// exactly — same `kind` numbering, same keys, `updated` carrying an optional
+/// row — but decodes row values through [`value_to_js`] so a blob crosses as
+/// bytes. This is the path the app actually reads media on: it subscribes to a
+/// window of `file_parts` rather than querying, so fixing `query` alone left
+/// every download on the per-byte route.
+pub struct SubscriptionDeltaJs(SubscriptionDelta);
+
+impl ToNapiValue for SubscriptionDeltaJs {
+    unsafe fn to_napi_value(
+        raw_env: napi::sys::napi_env,
+        delta: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        let env = Env::from_raw(raw_env);
+        let delta = delta.0;
+        let descriptor = &delta.descriptor;
+        let row_to_js = |env: &Env, row: &jazz_tools::query_manager::types::Row| {
+            let values =
+                jazz_tools::row_format::decode_row(descriptor, &row.data).unwrap_or_default();
+            let mut js_row = Object::new(env)?;
+            js_row.set("id", row.id.uuid().to_string())?;
+            js_row.set("values", values_to_js(env, &values)?)?;
+            napi::Result::Ok(js_row)
+        };
+
+        let mut changes: Vec<Unknown> = Vec::new();
+        for change in &delta.ordered_delta.removed {
+            let mut js = Object::new(&env)?;
+            js.set("kind", 1u32)?;
+            js.set("id", change.id.uuid().to_string())?;
+            js.set("index", change.index as u32)?;
+            changes.push(into_unknown(&env, js)?);
+        }
+        for change in &delta.ordered_delta.updated {
+            let mut js = Object::new(&env)?;
+            js.set("kind", 2u32)?;
+            js.set("id", change.id.uuid().to_string())?;
+            js.set("index", change.new_index as u32)?;
+            match change.row.as_ref() {
+                Some(row) => js.set("row", row_to_js(&env, row)?)?,
+                // `serde_json::json!` emitted an explicit null here, so keep it:
+                // the TS side distinguishes "no row carried" from "key absent".
+                None => js.set("row", Null)?,
+            }
+            changes.push(into_unknown(&env, js)?);
+        }
+        for change in &delta.ordered_delta.added {
+            let mut js = Object::new(&env)?;
+            js.set("kind", 0u32)?;
+            js.set("id", change.id.uuid().to_string())?;
+            js.set("index", change.index as u32)?;
+            js.set("row", row_to_js(&env, &change.row)?)?;
+            changes.push(into_unknown(&env, js)?);
+        }
+
+        unsafe { ToNapiValue::to_napi_value(raw_env, changes) }
+    }
+}
+
 fn make_subscription_callback(
-    tsfn: ThreadsafeFunction<serde_json::Value>,
+    tsfn: ThreadsafeFunction<SubscriptionDeltaJs>,
 ) -> impl Fn(SubscriptionDelta) + Send + 'static {
     move |delta: SubscriptionDelta| {
         tsfn.call(
-            Ok(subscription_delta_to_json(&delta)),
+            Ok(SubscriptionDeltaJs(delta)),
             ThreadsafeFunctionCallMode::NonBlocking,
         );
     }
@@ -876,7 +937,7 @@ impl NapiRuntime {
         &self,
         handle: f64,
         #[napi(ts_arg_type = "(...args: any[]) => any")] on_update: ThreadsafeFunction<
-            serde_json::Value,
+            SubscriptionDeltaJs,
         >,
     ) -> napi::Result<()> {
         let sub_handle = SubscriptionHandle(handle as u64);

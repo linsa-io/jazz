@@ -167,6 +167,52 @@ describe.skipIf(!hasJazzNapiBuild())("Bytea nested inside other values", () => {
   });
 });
 
+describe.skipIf(!hasJazzNapiBuild())("Bytea through a subscription", () => {
+  it(
+    "delivers blobs in a delta as bytes, not as an array of numbers",
+    { timeout: 20_000 },
+    async () => {
+      // This is the path the app actually reads blobs on — `media-file-cache` subscribes
+      // to a window of `file_parts` rather than querying — and it is a different code
+      // path from `query()`: deltas go out through a ThreadsafeFunction. Fixing the query
+      // path did nothing for it, which is why this case exists separately.
+      const schema = blobSchema();
+      const runtime = await createNapiRuntime(schema, { appId: "blob-marshalling-subscription" });
+
+      runtime.insert("blobs", blobRow(3, "subscribed") as never);
+
+      const firstDelta = await new Promise<unknown[]>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("no delta arrived")), 10_000);
+        const handle = runtime.createSubscription(blobQuery(schema), null, null, null);
+        // The threadsafe function calls back node-style, `(err, value)`.
+        runtime.executeSubscription(handle, (error: unknown, delta: unknown) => {
+          if (error != null) {
+            reject(error instanceof Error ? error : new Error(String(error)));
+            return;
+          }
+          if (Array.isArray(delta) && delta.length > 0) {
+            clearTimeout(timer);
+            resolve(delta);
+          }
+        });
+      });
+
+      const added = firstDelta.find((change) => (change as { kind?: number }).kind === 0) as
+        | { row?: { values?: { type?: string; value?: unknown }[] } }
+        | undefined;
+      expect(added?.row, "the delta carried no added row to inspect").toBeDefined();
+
+      const data = added!.row!.values![0]!;
+      expect(data.type).toBe("Bytea");
+      expect(
+        Array.isArray(data.value),
+        "a subscription delta shipped the blob as a JS array — this is the read path the app uses",
+      ).toBe(false);
+      expect(ArrayBuffer.isView(data.value)).toBe(true);
+    },
+  );
+});
+
 describe.skipIf(!RUN_BENCH || !hasJazzNapiBuild())("Bytea throughput across the boundary", () => {
   it("reports MiB/s and CPU for a write and a read of the same blobs", async () => {
     const schema = blobSchema();
