@@ -104,6 +104,20 @@ impl RocksDBStorage {
         // the aggressive setting for the same practical saving.
         opts.set_write_buffer_size(16 * 1024 * 1024);
         opts.set_max_write_buffer_number(2);
+        // L0's stable size is `write_buffer_size * min_write_buffer_number_to_merge
+        // * level0_file_num_compaction_trigger`, and RocksDB's guide asks that
+        // `max_bytes_for_level_base` match it. With the shipped defaults
+        // (1 and 4, `options.h:258`) that is 64 * 1 * 4 = 256 MiB against a
+        // `max_bytes_for_level_base` of 256 MiB (`options.h:306`) — coherent.
+        // Shrinking the buffer alone would leave L1's budget four times L0's, so
+        // it moves too. Missing this is why the pair is written together here.
+        opts.set_max_bytes_for_level_base(64 * 1024 * 1024);
+        // Note for whoever adds `get_for_update`/`SetSnapshot` (nothing uses them
+        // today): `TransactionDB::PrepareWrap` derives
+        // `max_write_buffer_size_to_maintain` — the in-memory history window for
+        // conflict validation — as `max_write_buffer_number * write_buffer_size`
+        // when left at its default. Sizing the buffer for memory therefore also
+        // sizes that window, here to 32 MiB.
 
         let txdb_opts = TransactionDBOptions::default();
         let db = TransactionDB::open(&opts, &txdb_opts, path.as_ref())
