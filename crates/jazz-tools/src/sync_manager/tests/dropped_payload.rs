@@ -168,3 +168,43 @@ fn a_row_that_is_never_confirmed_stops_being_re_offered() {
          never ends and is worse than the loss it replaced"
     );
 }
+
+/// Reaping a client takes its outstanding rows with it.
+///
+/// A peer that stays away long enough is reaped, and its whole server-side state goes: the
+/// next connection rebuilds it from scratch and re-derives everything in scope, which
+/// delivers what it missed by a different route. What must not survive is the bookkeeping —
+/// an entry left behind would keep a client that no longer exists counted as owed rows, and
+/// nothing would ever clear it.
+#[test]
+fn reaping_a_client_clears_what_it_was_owed() {
+    let io = MemoryStorage::new();
+    let mut sm = SyncManager::new();
+    let client_id = ClientId::new();
+    add_client(&mut sm, &io, client_id);
+    let row_id = ObjectId::new();
+    set_client_query_scope(
+        &mut sm,
+        &io,
+        client_id,
+        QueryId(1),
+        HashSet::from([(row_id, BranchName::new("main"))]),
+        None,
+    );
+
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"owed-at-reap");
+    sm.queue_row_to_client(client_id, row_id, row_metadata("users"), row, false);
+    let _dropped = sm.take_outbox();
+    assert!(
+        sm.client_has_undelivered_payloads(client_id),
+        "precondition: the client should be owed the row whose payload was dropped"
+    );
+
+    assert!(sm.remove_client(client_id), "the client should reap");
+
+    assert!(
+        !sm.client_has_undelivered_payloads(client_id),
+        "a reaped client is still recorded as owed rows — the entry outlives the client it \
+         belongs to, and nothing will ever confirm or clear it"
+    );
+}
