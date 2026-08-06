@@ -815,7 +815,7 @@ impl SyncManager {
     pub fn client_has_undelivered_payloads(&self, client_id: ClientId) -> bool {
         self.pending_client_deliveries
             .get(&client_id)
-            .is_some_and(|owed| !owed.is_empty())
+            .is_some_and(|owed| owed.values().any(|pending| !pending.demoted))
     }
 
     /// The rows this client is owed, as scope entries.

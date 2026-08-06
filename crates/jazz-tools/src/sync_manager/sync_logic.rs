@@ -391,38 +391,27 @@ impl SyncManager {
                 .filter(|pending| pending.batch_id == batch_id)
                 .map(|pending| (pending.attempts + 1, pending.first_offered_at))
                 .unwrap_or((1, now));
-            if attempts > crate::sync_manager::MAX_REDELIVERY_ATTEMPTS
+            let demoted = attempts > crate::sync_manager::MAX_REDELIVERY_ATTEMPTS
                 && now.saturating_sub(first_offered_at)
-                    > crate::sync_manager::REDELIVERY_GIVE_UP_AFTER_MICROS
+                    > crate::sync_manager::REDELIVERY_GIVE_UP_AFTER_MICROS;
+            if demoted
+                && !owed
+                    .get(&(object_id, branch_name))
+                    .is_some_and(|pending| pending.demoted)
             {
-                // Give up on hearing back about this row. Recording the claim stops the
-                // re-offer: the row is as lost as it was under the old behaviour, but the
-                // peer is no longer pinned as owed rows forever, re-deriving its scope on
-                // every registration.
-                owed.remove(&(object_id, branch_name));
-                if owed.is_empty() {
-                    self.pending_client_deliveries.remove(&client_id);
-                }
                 tracing::warn!(
                     %client_id, %object_id, ?batch_id, attempts,
-                    "giving up on a delivery confirmation; the peer never reported this row"
+                    "row keeps going unconfirmed; it no longer forces re-derivations but \
+                     stays owed"
                 );
-                if let Some(client) = self.clients.get_mut(&client_id) {
-                    if include_metadata {
-                        client.sent_metadata.insert(object_id);
-                    }
-                    client
-                        .sent_batch_ids
-                        .entry((object_id, branch_name))
-                        .or_default()
-                        .record_delivery(batch_id, &parent_ids);
-                }
-            } else {
+            }
+            {
                 owed.insert(
                     (object_id, branch_name),
                     crate::sync_manager::types::PendingDelivery {
                         attempts,
                         first_offered_at,
+                        demoted,
                         batch_id,
                         branch_name,
                         metadata: metadata.clone(),

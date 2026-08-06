@@ -733,6 +733,13 @@ pub struct PendingDelivery {
     /// message. Giving up requires attempts over the cap AND enough elapsed time for many
     /// round trips.
     pub first_offered_at: u64,
+    /// Past the attempt cap and the grace, the row stops FORCING scope re-derivations —
+    /// but stays owed. Giving it up entirely would record a delivery that never happened:
+    /// the exact lie this bookkeeping exists to remove, acceptable for a heartbeat that
+    /// the next beat supersedes, and unacceptable for a message nothing will ever rewrite.
+    /// A demoted row still rides along whenever a re-derivation happens for other reasons,
+    /// a late confirmation still clears it, and a newer batch resets it.
+    pub demoted: bool,
     /// The batch this entry is about. Kept in the value, not the key: a later batch for the
     /// same row REPLACES this entry, because a re-offer can only ever ship the row's
     /// current state. Keying by batch would strand every superseded entry — nothing would

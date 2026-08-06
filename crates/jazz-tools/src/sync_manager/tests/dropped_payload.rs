@@ -160,14 +160,15 @@ fn a_registration_storm_does_not_burn_the_give_up_cap() {
     );
 }
 
-/// A row that is never confirmed must still stop being re-offered — once real time has
-/// passed.
+/// A row that is never confirmed stops FORCING re-derivations — but is never given up.
 ///
-/// Some rows can never be applied by a given peer, and nothing will ever confirm them.
-/// After the cap AND a comfortable multiple of the confirmation round trip, the sender
-/// gives up loudly and records the claim — the old behaviour for that one row.
+/// Past the cap and the grace the row is demoted: it no longer makes every subscription
+/// registration re-derive the peer's scope, which is the livelock the bound exists for.
+/// It is NOT recorded as delivered — that would be the exact lie this bookkeeping removes,
+/// and for a message nothing ever rewrites it would be permanent loss. The row stays owed:
+/// a late confirmation still clears it.
 #[test]
-fn a_row_that_is_never_confirmed_stops_being_re_offered_after_the_grace() {
+fn an_unconfirmable_row_is_demoted_but_never_surrendered() {
     let io = MemoryStorage::new();
     let mut sm = SyncManager::new();
     let client_id = ClientId::new();
@@ -182,7 +183,7 @@ fn a_row_that_is_never_confirmed_stops_being_re_offered_after_the_grace() {
         None,
     );
 
-    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"never-applies");
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"never-confirmed");
 
     for _ in 0..=MAX_REDELIVERY_ATTEMPTS {
         sm.queue_row_to_client(client_id, row_id, row_metadata("users"), row.clone(), true);
@@ -202,13 +203,29 @@ fn a_row_that_is_never_confirmed_stops_being_re_offered_after_the_grace() {
             .saturating_sub(crate::sync_manager::REDELIVERY_GIVE_UP_AFTER_MICROS + 1);
     }
 
-    sm.queue_row_to_client(client_id, row_id, row_metadata("users"), row, true);
-    let _discarded = sm.take_outbox();
+    sm.queue_row_to_client(client_id, row_id, row_metadata("users"), row.clone(), true);
+    let delivered = sm.take_outbox();
 
     assert!(
         !sm.client_has_undelivered_payloads(client_id),
-        "a row nothing can confirm is still recorded as owed past the cap and the grace — \
-         every later subscription re-derives and re-sends it, a livelock that never ends"
+        "a demoted row must stop forcing re-derivations — that is the livelock the bound \
+         exists to prevent"
+    );
+    assert!(
+        sm.pending_client_deliveries
+            .get(&client_id)
+            .is_some_and(|owed| owed.contains_key(&(row_id, BranchName::new("main")))),
+        "the row was given up entirely: a delivery that never happened is now recorded, \
+         and a message on this path is permanently lost"
+    );
+
+    // The late confirmation still lands.
+    confirm_queued_entries(&mut sm, &delivered);
+    assert!(
+        sm.pending_client_deliveries
+            .get(&client_id)
+            .is_none_or(|owed| !owed.contains_key(&(row_id, BranchName::new("main")))),
+        "a late confirmation no longer clears a demoted row"
     );
 }
 
