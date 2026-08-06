@@ -120,16 +120,54 @@ fn a_delivered_payload_is_not_offered_twice() {
     );
 }
 
-/// A row that is never confirmed must stop being re-offered.
+/// A burst of re-offers must NOT burn the give-up cap.
 ///
-/// Some rows can never be applied by the peer — a rejected fate, a decode failure, a bug on
-/// its side. Nothing confirms them, so nothing clears them, and the peer stays marked as
-/// owed rows forever: every subscription registration re-derives its scope and re-sends.
-/// That is a retransmission livelock, and it is worse than losing the row, because it never
-/// stops. After a bounded number of attempts the sender gives up loudly and records the
-/// claim, which is the same outcome as the old behaviour for that one row.
+/// An app registers its subscriptions in waves at startup, and every wave re-offers the
+/// rows the peer is owed — while the confirmation is still making its round trip through
+/// deliver, apply, tick, barrier and ack. Measured in the field: six waves inside one
+/// round trip crossed a count-only cap, the sender recorded the claim, and a message a
+/// user sent was permanently lost. Attempts without elapsed time justify nothing.
 #[test]
-fn a_row_that_is_never_confirmed_stops_being_re_offered() {
+fn a_registration_storm_does_not_burn_the_give_up_cap() {
+    let io = MemoryStorage::new();
+    let mut sm = SyncManager::new();
+    let client_id = ClientId::new();
+    add_client(&mut sm, &io, client_id);
+    let row_id = ObjectId::new();
+    set_client_query_scope(
+        &mut sm,
+        &io,
+        client_id,
+        QueryId(1),
+        HashSet::from([(row_id, BranchName::new("main"))]),
+        None,
+    );
+
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"in-flight");
+
+    // Far more offers than the cap, all within microseconds — the startup storm.
+    for _ in 0..(MAX_REDELIVERY_ATTEMPTS * 4) {
+        sm.queue_row_to_client(client_id, row_id, row_metadata("users"), row.clone(), true);
+        let _discarded = sm.take_outbox();
+    }
+
+    assert!(
+        sm.client_has_undelivered_payloads(client_id),
+        "a burst of {} rapid re-offers made the sender give up while the confirmation \
+         was still in flight — this is the storm that permanently dropped a user's \
+         message in the field",
+        MAX_REDELIVERY_ATTEMPTS * 4
+    );
+}
+
+/// A row that is never confirmed must still stop being re-offered — once real time has
+/// passed.
+///
+/// Some rows can never be applied by a given peer, and nothing will ever confirm them.
+/// After the cap AND a comfortable multiple of the confirmation round trip, the sender
+/// gives up loudly and records the claim — the old behaviour for that one row.
+#[test]
+fn a_row_that_is_never_confirmed_stops_being_re_offered_after_the_grace() {
     let io = MemoryStorage::new();
     let mut sm = SyncManager::new();
     let client_id = ClientId::new();
@@ -146,26 +184,31 @@ fn a_row_that_is_never_confirmed_stops_being_re_offered() {
 
     let row = visible_row(row_id, "main", Vec::new(), 1_000, b"never-applies");
 
-    // Offer it up to the cap, never confirming. Each attempt is what a re-offer does when
-    // the peer is owed the row.
-    for attempt in 1..=MAX_REDELIVERY_ATTEMPTS {
+    for _ in 0..=MAX_REDELIVERY_ATTEMPTS {
         sm.queue_row_to_client(client_id, row_id, row_metadata("users"), row.clone(), true);
         let _discarded = sm.take_outbox();
-        assert!(
-            sm.client_has_undelivered_payloads(client_id),
-            "the sender stopped waiting after only {attempt} attempts"
-        );
+    }
+    assert!(
+        sm.client_has_undelivered_payloads(client_id),
+        "the cap must not fire before the grace has elapsed"
+    );
+
+    // Rewind the first offer beyond the grace, as only a test can.
+    if let Some(owed) = sm.pending_client_deliveries.get_mut(&client_id)
+        && let Some(pending) = owed.get_mut(&(row_id, BranchName::new("main")))
+    {
+        pending.first_offered_at = pending
+            .first_offered_at
+            .saturating_sub(crate::sync_manager::REDELIVERY_GIVE_UP_AFTER_MICROS + 1);
     }
 
-    // One more, and it must give up rather than keep the peer marked forever.
     sm.queue_row_to_client(client_id, row_id, row_metadata("users"), row, true);
     let _discarded = sm.take_outbox();
 
     assert!(
         !sm.client_has_undelivered_payloads(client_id),
-        "a row nothing can confirm is still recorded as owed past {MAX_REDELIVERY_ATTEMPTS} \
-         attempts, so every later subscription re-derives and re-sends it — a livelock that \
-         never ends and is worse than the loss it replaced"
+        "a row nothing can confirm is still recorded as owed past the cap and the grace — \
+         every later subscription re-derives and re-sends it, a livelock that never ends"
     );
 }
 

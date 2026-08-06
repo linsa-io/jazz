@@ -724,6 +724,15 @@ impl Source {
 pub struct PendingDelivery {
     /// How many times this row has been offered without a confirmation coming back.
     pub attempts: u32,
+    /// When the first of those offers was made, in the sync clock's microseconds.
+    ///
+    /// Attempts alone cannot justify giving up: an app registers its subscriptions in
+    /// waves at startup, and every wave re-offers before the previous offer's
+    /// confirmation could possibly have completed its round trip. Measured in the field:
+    /// six waves inside one round trip burned a count-only cap and permanently dropped a
+    /// message. Giving up requires attempts over the cap AND enough elapsed time for many
+    /// round trips.
+    pub first_offered_at: u64,
     /// The batch this entry is about. Kept in the value, not the key: a later batch for the
     /// same row REPLACES this entry, because a re-offer can only ever ship the row's
     /// current state. Keying by batch would strand every superseded entry — nothing would

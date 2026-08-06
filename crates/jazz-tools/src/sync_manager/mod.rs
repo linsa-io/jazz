@@ -58,6 +58,12 @@ pub(crate) struct OutgoingQuerySubscription {
 /// behaviour for that one row, and a warning names it.
 pub const MAX_REDELIVERY_ATTEMPTS: u32 = 5;
 
+/// How long a row must have been outstanding, in microseconds, before the attempt cap may
+/// give up on it. Confirmation is a full round trip — deliver, apply, tick, WAL barrier,
+/// ack — while re-offers arrive in registration bursts; without this floor a startup storm
+/// burns the cap in milliseconds and converts eventual delivery into permanent loss.
+pub const REDELIVERY_GIVE_UP_AFTER_MICROS: u64 = 60_000_000;
+
 /// Manages synchronization state atop storage-backed row and catalogue state.
 ///
 /// Coordinates:
