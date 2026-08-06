@@ -610,7 +610,21 @@ async fn handle_ws_connection(
                 };
                 let bytes = match event.encode_payload() {
                     Ok(b) => b,
-                    Err(_) => continue,
+                    Err(error) => {
+                        // This payload is GONE, and the delivery bookkeeping has no way to
+                        // learn that: silently continuing leaves the connection healthy and
+                        // the row undelivered until the client happens to resubscribe.
+                        // Tearing the connection down makes the client's transport
+                        // reconnect, replay its subscriptions, and pick the row back up
+                        // through the re-offer.
+                        tracing::error!(
+                            %client_id,
+                            ?error,
+                            "sync frame failed to encode; tearing the connection down so \
+                             the reconnect replay can re-offer what this frame carried"
+                        );
+                        break;
+                    }
                 };
                 let frame = crate::transport_manager::frame_encode(&bytes);
                 if socket.send(Message::Binary(frame)).await.is_err() {
