@@ -29,6 +29,7 @@ pub use rocksdb::RocksDBStorage;
 mod sqlite;
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub use sqlite::SqliteStorage;
+pub mod graft;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};

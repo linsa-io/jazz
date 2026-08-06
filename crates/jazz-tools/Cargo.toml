@@ -193,3 +193,11 @@ required-features = ["test", "otel-core"]
 [[example]]
 name = "store_probe"
 required-features = ["sqlite"]
+
+[[example]]
+name = "chain_doctor"
+required-features = ["sqlite", "rocksdb"]
+
+[[example]]
+name = "graft_row"
+required-features = ["sqlite", "rocksdb"]
