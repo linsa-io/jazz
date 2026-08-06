@@ -16,9 +16,22 @@ import {
 } from "../typed-app.js";
 import { generateAuthSecret } from "../runtime/auth-secret-store.js";
 
-export { col, defineApp, defineSchema, defineSliceableApp, TypedTableQueryBuilder, permissionIntrospectionColumns };
+export {
+  col,
+  defineApp,
+  defineSchema,
+  defineSliceableApp,
+  TypedTableQueryBuilder,
+  permissionIntrospectionColumns,
+};
 export { defineMigration, renameTableFrom } from "../migrations.js";
-export { table, migrate, getCollectedSchema, getCollectedMigration, resetCollectedState } from "../dsl.js";
+export {
+  table,
+  migrate,
+  getCollectedSchema,
+  getCollectedMigration,
+  resetCollectedState,
+} from "../dsl.js";
 export * from "../permissions/index.js";
 export { generateAuthSecret };
 

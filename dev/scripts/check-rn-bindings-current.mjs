@@ -107,9 +107,7 @@ try {
       } catch {
         return true; // the generated set changed shape — also drift
       }
-      return (
-        identifiers(fresh) !== identifiers(readFileSync(join(committedDir, name), "utf8"))
-      );
+      return identifiers(fresh) !== identifiers(readFileSync(join(committedDir, name), "utf8"));
     });
 
   if (drifted.length > 0) {
