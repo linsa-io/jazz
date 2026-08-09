@@ -2140,3 +2140,185 @@ mod schema_catalogue;
 mod sealed_batch_cost;
 mod sync_replay;
 mod write_batch;
+
+/// A wiped upstream (fresh store behind the same endpoint) RELEARNS settled
+/// rows on reconnect: the reconnect replay re-offers the client's durable
+/// batches (`RowBatchCreated`), and the amnesiac server accepts them and
+/// forwards them to its own upstream. This is the recovery property the
+/// "full wipe" story leans on — if it ever regresses, a wipe permanently
+/// strands every deterministic-id singleton (Saved Messages, assistant chat).
+///
+/// Also documented here: the ENGINE has no column-based duplicate refusal —
+/// re-inserting the same column values mints a fresh row ObjectId. The
+/// "row already exists" behavior the app sees for deterministic ids lives in
+/// the TS binding (which maps the caller-provided id onto the engine row id
+/// and checks the local store), not in the core.
+#[test]
+fn a_wiped_upstream_relearns_settled_rows_on_reconnect() {
+    let mut s = create_3tier_rc();
+
+    let fixed_id = ObjectId::new();
+    let deterministic_row = || {
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(fixed_id)),
+            (
+                "name".to_string(),
+                Value::Text("Saved Messages".to_string()),
+            ),
+        ])
+    };
+
+    // The app always holds live queries; reconnect replays exactly these.
+    let _sub =
+        s.a.subscribe(Query::new("users"), |_delta| {}, None)
+            .unwrap();
+
+    let ((created_row_id, _values), _ack) = insert_and_wait_for_batch(
+        &mut s.a,
+        "users",
+        deterministic_row(),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("the first create must succeed");
+
+    // Positive control at the emission level: the client offers the batch upstream.
+    s.a.batched_tick();
+    let first_out = s.a.sync_sender().take();
+    assert!(
+        first_out.iter().any(|e| matches!(
+            &e.payload,
+            SyncPayload::RowBatchCreated { row, .. } if row.row_id == created_row_id
+        )),
+        "the fresh insert must be offered to the server"
+    );
+    for e in first_out {
+        if e.destination == Destination::Server(s.b_server_for_a) {
+            s.b.park_sync_message(InboxEntry {
+                source: Source::Client(s.a_client_of_b),
+                payload: e.payload,
+            });
+        }
+    }
+    pump_3tier(&mut s);
+
+    // The wipe: same endpoint from the client's point of view, brand-new server
+    // state behind it (the client keeps its own store and settled state).
+    let app_id = AppId::from_name("durability-test");
+    let sm_b2 = SyncManager::new().with_durability_tier(DurabilityTier::Local);
+    let mgr_b2 = SchemaManager::new(sm_b2, test_schema(), app_id, "dev", "main").unwrap();
+    let mut b2 = new_test_core(mgr_b2, MemoryStorage::new(), NoopScheduler);
+    b2.add_client(s.a_client_of_b, None);
+    b2.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .set_client_role(s.a_client_of_b, ClientRole::Peer);
+    b2.add_server(s.c_server_for_b);
+    b2.immediate_tick();
+    b2.batched_tick();
+    b2.sync_sender().take();
+    s.b = b2;
+
+    // Reconnect semantics: drop and re-add the upstream — this is what replays
+    // active query subscriptions (rc_replays_active_queries_on_upstream_reconnect).
+    s.a.remove_server(s.b_server_for_a);
+    s.a.add_server(s.b_server_for_a);
+
+    // Pump manually so every payload the client sends after the reconnect is
+    // recorded before being delivered.
+    let mut reoffered_fixed_row = false;
+    let mut reoffer_kinds: Vec<&'static str> = Vec::new();
+    let mut b2_forwarded_to_c = false;
+    for _ in 0..10 {
+        let mut any_messages = false;
+
+        s.a.batched_tick();
+        for entry in s.a.sync_sender().take() {
+            if entry.destination == Destination::Server(s.b_server_for_a) {
+                any_messages = true;
+                match &entry.payload {
+                    SyncPayload::RowBatchCreated { row, .. } if row.row_id == created_row_id => {
+                        reoffered_fixed_row = true;
+                        reoffer_kinds.push("RowBatchCreated");
+                    }
+                    SyncPayload::RowBatchNeeded { row, .. } if row.row_id == created_row_id => {
+                        reoffered_fixed_row = true;
+                        reoffer_kinds.push("RowBatchNeeded");
+                    }
+                    _ => {}
+                }
+                s.b.park_sync_message(InboxEntry {
+                    source: Source::Client(s.a_client_of_b),
+                    payload: entry.payload,
+                });
+            }
+        }
+
+        s.b.batched_tick();
+        s.b.immediate_tick();
+        s.b.batched_tick();
+        for entry in s.b.sync_sender().take() {
+            match &entry.destination {
+                Destination::Client(cid) if *cid == s.a_client_of_b => {
+                    any_messages = true;
+                    s.a.park_sync_message(InboxEntry {
+                        source: Source::Server(s.b_server_for_a),
+                        payload: entry.payload,
+                    });
+                }
+                Destination::Server(sid) if *sid == s.c_server_for_b => {
+                    any_messages = true;
+                    if matches!(
+                        &entry.payload,
+                        SyncPayload::RowBatchCreated { row, .. } if row.row_id == created_row_id
+                    ) {
+                        b2_forwarded_to_c = true;
+                    }
+                    s.c.park_sync_message(InboxEntry {
+                        source: Source::Client(s.b_client_of_c),
+                        payload: entry.payload,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        s.c.batched_tick();
+        s.c.immediate_tick();
+        for entry in s.c.sync_sender().take() {
+            if entry.destination == Destination::Client(s.b_client_of_c) {
+                any_messages = true;
+                s.b.park_sync_message(InboxEntry {
+                    source: Source::Server(s.c_server_for_b),
+                    payload: entry.payload,
+                });
+            }
+        }
+
+        s.a.batched_tick();
+        s.a.immediate_tick();
+
+        if !any_messages {
+            break;
+        }
+    }
+
+    let duplicate = s.a.insert("users", deterministic_row(), None);
+
+    assert!(
+        reoffered_fixed_row && reoffer_kinds.contains(&"RowBatchCreated"),
+        "reconnect must re-offer the settled row to the wiped upstream \
+         (got kinds {reoffer_kinds:?}) — without this a wipe strands every \
+         deterministic-id singleton"
+    );
+    assert!(
+        b2_forwarded_to_c,
+        "the wiped upstream must accept the re-offered row and forward it to its own upstream"
+    );
+    let ((second_row_id, _), _) =
+        duplicate.expect("engine-level insert has no column-id dedupe; the TS binding owns that");
+    assert_ne!(
+        second_row_id, created_row_id,
+        "engine identity is the row ObjectId, not the id column — a re-insert mints a new row"
+    );
+}
