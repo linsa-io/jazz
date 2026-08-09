@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { WasmSchema } from "../drivers/types.js";
-import { translateQuery } from "./query-adapter.js";
+import { BLOB_BYTES, blobQuery, blobRow, blobSchema, cell } from "./testing/blob-fixtures.js";
 import { createNapiRuntime, hasJazzNapiBuild } from "./testing/napi-runtime-test-utils.js";
 
 /**
@@ -23,58 +22,8 @@ import { createNapiRuntime, hasJazzNapiBuild } from "./testing/napi-runtime-test
  * timings live behind `JAZZ_BLOB_BENCH=1`.
  */
 
-const BLOB_BYTES = 1024 * 1024;
 const BENCH_ROWS = 16;
 const RUN_BENCH = process.env.JAZZ_BLOB_BENCH === "1";
-
-function blobSchema(): WasmSchema {
-  return {
-    blobs: {
-      columns: [
-        { name: "data", column_type: { type: "Bytea" as const }, nullable: false },
-        { name: "label", column_type: { type: "Text" as const }, nullable: false },
-        // A blob nested one level down. `value_to_js` restates the `{type, value}`
-        // wrapper for `Array` by hand so it can recurse into it, and that
-        // restatement is the part of this change that can silently drift from
-        // `ValueHuman`. Nothing else in the napi tests covers it.
-        {
-          name: "parts",
-          column_type: { type: "Array" as const, element: { type: "Bytea" as const } },
-          nullable: true,
-        },
-        { name: "note", column_type: { type: "Text" as const }, nullable: true },
-      ],
-    },
-  } as unknown as WasmSchema;
-}
-
-function blobQuery(schema: WasmSchema): string {
-  return translateQuery(
-    JSON.stringify({ table: "blobs", conditions: [], includes: {}, orderBy: [] }),
-    schema,
-  );
-}
-
-function payload(seed: number): Uint8Array {
-  const bytes = new Uint8Array(BLOB_BYTES);
-  bytes.fill(seed % 251);
-  return bytes;
-}
-
-function blobRow(seed: number, label: string) {
-  return {
-    data: { type: "Bytea" as const, value: payload(seed) },
-    label: { type: "Text" as const, value: label },
-  };
-}
-
-function cell(row: unknown, index: number): { type?: string; value?: unknown } {
-  const values = (row as { values?: unknown[] })?.values;
-  if (!Array.isArray(values)) {
-    throw new Error(`unexpected wire row shape: ${JSON.stringify(row)?.slice(0, 200)}`);
-  }
-  return values[index] as { type?: string; value?: unknown };
-}
 
 /** What the binding handed back for the `data` column, before any JS normalisation. */
 function byteaFromWireRow(row: unknown): unknown {

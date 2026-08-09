@@ -308,6 +308,35 @@ answer, at most one scan, and cache reuse across derivations).
 
 ---
 
+## 12. The browser binding still hands blobs over one byte at a time
+
+Defect 9's napi fix (blobs as bytes rather than as an array of a million Numbers) was never
+applied to `jazz-wasm`, and nothing measured it: the crate has two Rust tests and had no
+TypeScript coverage of the boundary at all.
+
+`WasmRuntime::query` and the `insert()` echo both marshal through
+`serde_wasm_bindgen::Serializer` (crates/jazz-wasm/src/runtime.rs), where
+`ValueHuman::Bytea` is a bare `Vec<u8>` with no `serde_bytes` — so it serialises as a JS
+Array. Subscriptions escape it: on wasm32 `make_subscription_callback` goes through
+`native_subscription_delta_to_js`, which packs whole encoded rows into a single
+`Uint8Array`.
+
+The surviving cost therefore lands on the WRITE path, which is exactly where a browser app
+meets it: a chunked upload calls `insert()` once per 1 MiB part and every call echoes that
+megabyte back as an array. Measured at the binding, 16 rows of 1 MiB: **write 8.3 MB/s,
+read 29.7 MB/s**. Measured independently from the application on top of it (a Vue client
+writing `file_parts`): **8.0-8.5 MB/s upload, flat from 2 MB to the 100 MB cap** — the same
+number from both sides of the boundary, and ~12 s of uninterrupted main-thread work for a
+100 MB attachment.
+
+Gates: `packages/jazz-tools/src/runtime/blob-marshalling.wasm.test.ts`. The two crossings
+that still marshal per byte are `it.fails`, so they pass while the defect stands and fail
+the moment the Rust side starts handing bytes; the subscription case is an ordinary gate
+that keeps the fast path fast. Both bindings now share `testing/blob-fixtures.ts`, so each
+boundary is asked the identical question.
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed
