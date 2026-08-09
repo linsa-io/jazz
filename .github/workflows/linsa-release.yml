@@ -35,7 +35,9 @@ permissions:
 
 jobs:
   build:
-    uses: ./.github/workflows/build-jazz-packages.yml
+    # The GitHub-hosted port: the original build workflow runs on Blacksmith
+    # runners this org does not have, so its jobs would queue forever.
+    uses: ./.github/workflows/linsa-build-packages.yml
 
   release:
     name: Pack and publish
