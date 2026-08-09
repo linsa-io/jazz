@@ -268,6 +268,46 @@ entry went from ~2 MB to 2.8 KB.**
 
 ---
 
+## 11. A seal whose rows died in transit loops the authority into full-store scans
+
+Two-phase uploads have no recovery path when the row payloads are lost on a dying
+connection but the `SealBatch` survives onto the next one. The authority persists the
+sealed submission, then `try_accept_completed_sealed_batch_from_client` finds no declared
+rows and returns **silently** — the sealer is never told anything, so it retries the seal
+indefinitely. Every retry (and every later reconciliation over the orphan: reconnect
+pending-set derivation, re-received rejected fates via `mark_local_batch_rows_rejected`)
+lands in `local_batch_rows`, misses all four member sources, and pays the "last-resort"
+full-store history scan.
+
+Measured in production (2026-08-09, ~430 MB store): one diverged client held a core at
+100% for 38+ minutes — one ~3.5 s full scan per retry, the runtime serialized behind the
+`RuntimeCore` mutex the whole time (a second worker sat blocked in
+`push_sync_inbox_batch` from the websocket handler, so no other client could even park a
+message). The store had accumulated **609** such orphan submissions in three days of
+ordinary mobile traffic; a restart sweep walked them all, one full scan each. Captured
+end-to-end with gdb: `apply_received_batch_fate → mark_local_batch_rows_rejected →
+local_batch_rows → scan_local_batch_rows → scan_history_row_batches`, reading 1 MiB
+media blocks with a per-row hex branch-name decode.
+
+Fix shipped in this fork, two halves:
+
+- **Answer the sealer.** The silent return now queues `BatchFate::Missing` to the sealing
+  client — the existing Missing semantics ("pends retransmission") make its fate handler
+  retransmit rows + seal, closing the two-phase loop. Not persisted: the fate-request
+  path already synthesizes Missing for unknown batches, and a stored Missing would
+  wrongly outlive the rows' arrival.
+- **Never scan twice for the same void.** `local_batch_rows` keeps an in-memory set of
+  batch ids whose full scan already answered "no rows"; repeats answer from it.
+  Invalidated when a row batch (or seal) with that id is pushed into the inbox or a
+  local write tracks the batch. After a restart the first question pays one scan and
+  re-learns.
+
+Gate: `a_seal_without_rows_must_not_loop_full_store_scans` (drops the row payload,
+delivers the seal, retries it, then derives the pending set twice — asserts the Missing
+answer, at most one scan, and cache reuse across derivations).
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed

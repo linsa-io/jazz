@@ -214,6 +214,12 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             }
         }
         if rows.is_empty() {
+            // A scan that already answered "no rows" stays valid until a row
+            // batch with this id arrives (see `known_empty_batch_scans`) —
+            // answer repeat questions from the cache instead of re-scanning.
+            if self.known_empty_batch_scans.borrow().contains(&batch_id) {
+                return Vec::new();
+            }
             // Last-resort fallback if the batchId->rows index is not found.
             // This is extremely inefficient, as we're scanning across all tables' rows.
             LOCAL_BATCH_FULL_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -222,6 +228,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                 "batchId->rows index missed; falling back to full-store history scan"
             );
             rows = self.scan_local_batch_rows(batch_id);
+            if rows.is_empty() {
+                self.known_empty_batch_scans.borrow_mut().insert(batch_id);
+            }
         }
 
         Self::sort_local_batch_rows(&mut rows);

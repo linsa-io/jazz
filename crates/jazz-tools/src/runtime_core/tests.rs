@@ -2322,3 +2322,372 @@ fn a_wiped_upstream_relearns_settled_rows_on_reconnect() {
         "engine identity is the row ObjectId, not the id column — a re-insert mints a new row"
     );
 }
+
+/// RED GATE (prod incident 2026-08-09, UPSTREAM-DEFECTS #11): a seal that
+/// arrives for a batch whose ROWS never made it (they rode a dying connection)
+/// must not become an eternal full-store-scan loop on the server. In the field
+/// this pinned a core: every pass scanned the whole history region (~3.5s on
+/// the production store), made no progress, and repeated on the next tick,
+/// starving sync entirely.
+///
+/// The contract this gate encodes for the fix:
+///   1. the full-store fallback runs AT MOST ONCE per stuck batch while no new
+///      writes land (negative cache), and
+///   2. the sealer is answered with `BatchFate::Missing` — whose client-side
+///      handler already retransmits the batch rows — so the two-phase loop
+///      closes instead of spinning.
+#[test]
+fn a_seal_without_rows_must_not_loop_full_store_scans() {
+    // Two nodes, prod-shaped: the server is the AUTHORITY tier (EdgeServer,
+    // like production jazz-sync). Client fates recorded here become
+    // authoritative — the ingredient the 3-tier middle node lacks.
+    let app_id = AppId::from_name("durability-test");
+    let schema = test_schema();
+    let sm_a = SyncManager::new();
+    let mgr_a = SchemaManager::new(sm_a, schema.clone(), app_id, "dev", "main").unwrap();
+    let mut a = new_test_core(mgr_a, MemoryStorage::new(), NoopScheduler);
+    let sm_e = SyncManager::new().with_durability_tier(DurabilityTier::EdgeServer);
+    let mgr_e = SchemaManager::new(sm_e, schema, app_id, "dev", "main").unwrap();
+    let mut e = new_test_core(mgr_e, MemoryStorage::new(), NoopScheduler);
+    let a_client_of_e = ClientId::new();
+    let e_server_for_a = ServerId::new();
+    e.add_client(a_client_of_e, None);
+    e.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .set_client_role(a_client_of_e, ClientRole::Peer);
+    a.add_server(e_server_for_a);
+    a.immediate_tick();
+    e.immediate_tick();
+    a.batched_tick();
+    e.batched_tick();
+    a.sync_sender().take();
+    e.sync_sender().take();
+    struct Pair {
+        a: TestCore,
+        b: TestCore,
+        a_client_of_b: ClientId,
+        b_server_for_a: ServerId,
+    }
+    let mut s = Pair {
+        a,
+        b: e,
+        a_client_of_b: a_client_of_e,
+        b_server_for_a: e_server_for_a,
+    };
+
+    let ((row_id, _values), _ack) = insert_and_wait_for_batch(
+        &mut s.a,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(ObjectId::new())),
+            ("name".to_string(), Value::Text("lost rows".to_string())),
+        ]),
+        None,
+        DurabilityTier::EdgeServer,
+    )
+    .expect("client-side insert");
+
+    // Capture the client's upload and deliver everything EXCEPT the row
+    // payload itself: the rows died with the first connection, the seal
+    // arrived on the second.
+    s.a.batched_tick();
+    let mut dropped_row_payloads = 0usize;
+    let mut retried_payloads = Vec::new();
+    for entry in s.a.sync_sender().take() {
+        if entry.destination != Destination::Server(s.b_server_for_a) {
+            continue;
+        }
+        match &entry.payload {
+            SyncPayload::RowBatchCreated { row, .. } if row.row_id == row_id => {
+                dropped_row_payloads += 1;
+            }
+            _ => retried_payloads.push(entry.payload),
+        }
+    }
+    assert!(
+        dropped_row_payloads > 0,
+        "the scenario requires actually dropping the row payload"
+    );
+    assert!(
+        !retried_payloads.is_empty(),
+        "the seal/durability payloads must survive to be retried"
+    );
+    // Deliver the seal once and check what the server persisted — production
+    // stores an orphan sealed submission for every such batch (609 of them in
+    // the incident store). If this harness delivery does not persist one,
+    // seed it exactly as production holds it: from the client's own payload.
+    for payload in retried_payloads.clone() {
+        s.b.park_sync_message(InboxEntry {
+            source: Source::Client(s.a_client_of_b),
+            payload,
+        });
+    }
+    s.b.batched_tick();
+    s.b.immediate_tick();
+    {
+        use crate::storage::Storage as _;
+        let batch_id = retried_payloads
+            .iter()
+            .find_map(|p| match p {
+                SyncPayload::SealBatch { submission } => Some(submission.batch_id),
+                _ => None,
+            })
+            .expect("a SealBatch payload");
+        let persisted =
+            s.b.storage()
+                .load_sealed_batch_submission(batch_id)
+                .unwrap();
+        eprintln!(
+            "server persisted orphan submission after seal: {}",
+            persisted.is_some()
+        );
+        if persisted.is_none() {
+            if let Some(SyncPayload::SealBatch { submission }) = retried_payloads
+                .iter()
+                .find(|p| matches!(p, SyncPayload::SealBatch { .. }))
+            {
+                s.b.storage_mut()
+                    .upsert_sealed_batch_submission(submission)
+                    .expect("seed the production-shaped orphan submission");
+                eprintln!("seeded orphan submission (production shape)");
+            }
+        }
+    }
+
+    // Let the server process the orphan seal across several ticks, re-parking
+    // whatever the client keeps retrying (the field client retried its seal on
+    // a live connection for 38+ minutes).
+    let scans_before =
+        crate::runtime_core::LOCAL_BATCH_FULL_SCANS.load(std::sync::atomic::Ordering::Relaxed);
+    let _orphan_batch_id = retried_payloads
+        .iter()
+        .find_map(|p| match p {
+            SyncPayload::SealBatch { submission } => Some(submission.batch_id),
+            _ => None,
+        })
+        .expect("a SealBatch payload");
+    let mut missing_answered = false;
+    for round in 0..5 {
+        // The field driver, named by the production stack dump: a DIVERGED
+        // client keeps uploading rows whose parents this store never had
+        // (ParentNotFound). Each one the server rejects walks
+        // apply_received_batch_fate -> mark_local_batch_rows_rejected ->
+        // local_batch_rows -> full-store scan.
+        let diverged_parent = crate::row_histories::BatchId(*ObjectId::new().uuid().as_bytes());
+        let diverged_batch_id = crate::row_histories::BatchId(*ObjectId::new().uuid().as_bytes());
+        let diverged_row_id = ObjectId::new();
+        let diverged_row = crate::row_histories::StoredRowBatch::new_with_batch_id(
+            diverged_batch_id,
+            diverged_row_id,
+            "main",
+            vec![diverged_parent],
+            encode_row(
+                &test_schema()[&TableName::new("users")].columns,
+                &user_row_values(diverged_row_id, &format!("diverged-{round}")),
+            )
+            .expect("diverged row encodes"),
+            crate::metadata::RowProvenance::for_insert(diverged_row_id.to_string(), 1),
+            HashMap::new(),
+            crate::row_histories::RowState::StagingPending,
+            None,
+        );
+        s.b.park_sync_message(InboxEntry {
+            source: Source::Client(s.a_client_of_b),
+            payload: SyncPayload::RowBatchCreated {
+                metadata: None,
+                row: diverged_row,
+            },
+        });
+        // Plus the seal retries the same client kept sending for 38 minutes.
+        for payload in retried_payloads.clone() {
+            s.b.park_sync_message(InboxEntry {
+                source: Source::Client(s.a_client_of_b),
+                payload,
+            });
+        }
+        // Production is never quiet: unrelated writes land continuously
+        // (presence heartbeats, tokens). Feed one per round so any
+        // "re-scan on new input" behavior surfaces.
+        let (_, _bg_ack) = insert_and_wait_for_batch(
+            &mut s.a,
+            "users",
+            HashMap::from([
+                ("id".to_string(), Value::Uuid(ObjectId::new())),
+                (
+                    "name".to_string(),
+                    Value::Text(format!("background-{round}")),
+                ),
+            ]),
+            None,
+            DurabilityTier::EdgeServer,
+        )
+        .expect("background write");
+        s.a.batched_tick();
+        for entry in s.a.sync_sender().take() {
+            if entry.destination == Destination::Server(s.b_server_for_a) {
+                s.b.park_sync_message(InboxEntry {
+                    source: Source::Client(s.a_client_of_b),
+                    payload: entry.payload,
+                });
+            }
+        }
+        s.b.batched_tick();
+        s.b.immediate_tick();
+        for entry in s.b.sync_sender().take() {
+            if let Destination::Client(cid) = &entry.destination {
+                if *cid == s.a_client_of_b
+                    && matches!(
+                        &entry.payload,
+                        SyncPayload::BatchFate {
+                            fate: crate::batch_fate::BatchFate::Missing { .. },
+                            ..
+                        }
+                    )
+                {
+                    missing_answered = true;
+                }
+            }
+        }
+    }
+    let scans = crate::runtime_core::LOCAL_BATCH_FULL_SCANS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - scans_before;
+
+    eprintln!("gate observation: scans={scans} missing_answered={missing_answered}");
+    // The cost contract, driver-agnostic: ANY path deriving the pending set
+    // over the persisted orphan pays local_batch_rows; with the orphan seeded,
+    // repeated derivations must answer from the first scan's result.
+    let scans_p0 =
+        crate::runtime_core::LOCAL_BATCH_FULL_SCANS.load(std::sync::atomic::Ordering::Relaxed);
+    let pending_first = s.b.pending_batch_ids_needing_reconciliation_for_test();
+    let pending_second = s.b.pending_batch_ids_needing_reconciliation_for_test();
+    let derivation_scans = crate::runtime_core::LOCAL_BATCH_FULL_SCANS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - scans_p0;
+    eprintln!(
+        "pending derivations: first={} second={} scans={derivation_scans}",
+        pending_first.len(),
+        pending_second.len()
+    );
+
+    assert!(
+        scans <= 1,
+        "a stuck seal must cost at most one full-store scan while nothing changes; \
+         got {scans} scans across 5 ticks — the production CPU-pin loop"
+    );
+    assert!(
+        derivation_scans <= 1,
+        "two pending-set derivations over one persisted orphan cost {derivation_scans} \
+         full-store scans — repeated derivations must reuse the first scan's answer"
+    );
+    assert!(
+        missing_answered,
+        "the sealer must be told the batch is Missing so it retransmits the rows"
+    );
+}
+
+/// RED GATE #2 (prod incident 2026-08-09, the "conveyor" half): settled
+/// history must not cost full-store scans when the pending set is derived.
+///
+/// Production holds tens of thousands of settled batches (heartbeats, every
+/// row ever written) whose batchId->rows index was cleared at settlement while
+/// their fates/records persist. Deriving the pending-reconciliation set walks
+/// those and, for every one whose fate still reads as unsettled, pays the
+/// full-store fallback: one ~0.45s scan per batch, hours of pinned CPU after
+/// every server restart, with the tick loop blocked the whole time.
+#[test]
+fn settled_history_must_not_cost_full_store_scans_on_reconciliation() {
+    let app_id = AppId::from_name("durability-test");
+    let schema = test_schema();
+    let sm_a = SyncManager::new();
+    let mgr_a = SchemaManager::new(sm_a, schema.clone(), app_id, "dev", "main").unwrap();
+    let mut a = new_test_core(mgr_a, MemoryStorage::new(), NoopScheduler);
+    let sm_e = SyncManager::new().with_durability_tier(DurabilityTier::EdgeServer);
+    let mgr_e = SchemaManager::new(sm_e, schema, app_id, "dev", "main").unwrap();
+    let mut e = new_test_core(mgr_e, MemoryStorage::new(), NoopScheduler);
+    let a_client_of_e = ClientId::new();
+    let e_server_for_a = ServerId::new();
+    e.add_client(a_client_of_e, None);
+    e.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .set_client_role(a_client_of_e, ClientRole::Backend);
+    a.add_server(e_server_for_a);
+    a.immediate_tick();
+    e.immediate_tick();
+    a.batched_tick();
+    e.batched_tick();
+    a.sync_sender().take();
+    e.sync_sender().take();
+
+    // The "heartbeat backlog": a run of ordinary writes, fully settled.
+    for i in 0..8 {
+        let (_, _ack) = insert_and_wait_for_batch(
+            &mut a,
+            "users",
+            HashMap::from([
+                ("id".to_string(), Value::Uuid(ObjectId::new())),
+                ("name".to_string(), Value::Text(format!("heartbeat-{i}"))),
+            ]),
+            None,
+            DurabilityTier::EdgeServer,
+        )
+        .expect("insert");
+        // Full roundtrip: client -> server, server acks -> client.
+        for _ in 0..4 {
+            a.batched_tick();
+            for entry in a.sync_sender().take() {
+                if entry.destination == Destination::Server(e_server_for_a) {
+                    e.park_sync_message(InboxEntry {
+                        source: Source::Client(a_client_of_e),
+                        payload: entry.payload,
+                    });
+                }
+            }
+            e.batched_tick();
+            e.immediate_tick();
+            for entry in e.sync_sender().take() {
+                if let Destination::Client(cid) = &entry.destination {
+                    if *cid == a_client_of_e {
+                        a.park_sync_message(InboxEntry {
+                            source: Source::Server(e_server_for_a),
+                            payload: entry.payload,
+                        });
+                    }
+                }
+            }
+            a.batched_tick();
+            a.immediate_tick();
+        }
+    }
+
+    // The server-side leftovers a restart sweep will walk.
+    {
+        use crate::storage::Storage as _;
+        let fates = e.storage().scan_authoritative_batch_fates().unwrap();
+        let submissions = e.storage().scan_sealed_batch_submissions().unwrap();
+        eprintln!(
+            "server leftovers: fates={} submissions={}",
+            fates.len(),
+            submissions.len()
+        );
+    }
+
+    let scans_before =
+        crate::runtime_core::LOCAL_BATCH_FULL_SCANS.load(std::sync::atomic::Ordering::Relaxed);
+    let pending = e.pending_batch_ids_needing_reconciliation_for_test();
+    let scans = crate::runtime_core::LOCAL_BATCH_FULL_SCANS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - scans_before;
+    eprintln!(
+        "pending={} full_scans={} (settled history must answer from records, not scans)",
+        pending.len(),
+        scans
+    );
+    assert_eq!(
+        scans, 0,
+        "deriving the pending set over settled history cost {scans} full-store scans — \
+         the production restart conveyor"
+    );
+}

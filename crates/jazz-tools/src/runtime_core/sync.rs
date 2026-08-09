@@ -145,6 +145,23 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         ) {
             self.mark_transport_catalogue_state_hash_dirty();
         }
+        // Rows (or a seal whose rows may follow) for a batch invalidate a
+        // cached "the full-store scan found nothing" answer for it — the one
+        // event that can change that scan's result.
+        match &entry.payload {
+            crate::sync_manager::SyncPayload::RowBatchCreated { row, .. }
+            | crate::sync_manager::SyncPayload::RowBatchNeeded { row, .. } => {
+                self.known_empty_batch_scans
+                    .borrow_mut()
+                    .remove(&row.batch_id);
+            }
+            crate::sync_manager::SyncPayload::SealBatch { submission } => {
+                self.known_empty_batch_scans
+                    .borrow_mut()
+                    .remove(&submission.batch_id);
+            }
+            _ => {}
+        }
         if entry.payload.writes_storage() {
             self.mark_storage_write_pending_flush();
         }

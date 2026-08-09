@@ -335,6 +335,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         batch_id: BatchId,
         mode: BatchMode,
     ) -> Result<(), RuntimeError> {
+        // A locally tracked row is new evidence for this batch — drop any
+        // cached "scan found nothing" answer.
+        self.known_empty_batch_scans.borrow_mut().remove(&batch_id);
         let mut record = self
             .local_batch_record_cache
             .remove(&batch_id)

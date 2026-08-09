@@ -380,6 +380,20 @@ pub struct RuntimeCore<S: Storage, Sch: Scheduler> {
     /// not survive process restarts, so this intentionally stays runtime-local.
     batch_contexts: HashMap<BatchId, RuntimeBatchContext>,
 
+    /// Batches whose full-store fallback scan already answered "no rows".
+    ///
+    /// The fallback in `local_batch_rows` costs a scan of every table's
+    /// history (seconds on a real store, holding the core lock the whole
+    /// time). Its result is deterministic while no new rows for that batch
+    /// land, so a repeat question — reconnect reconciliation, a re-received
+    /// rejected fate, a seal retry — must answer from here instead of
+    /// scanning again. Production incident 2026-08-09: one diverged client's
+    /// retries drove one such scan every ~3.5s for 38 minutes, pinning a core.
+    /// Entries are invalidated when a row batch with that id is parked or
+    /// tracked locally. In-memory only: after a restart the first question
+    /// pays one scan and re-learns.
+    known_empty_batch_scans: std::cell::RefCell<HashSet<BatchId>>,
+
     /// Label for tracing (e.g. "local", "edge", "client").
     tier_label: &'static str,
 
@@ -490,6 +504,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             rejected_batch_acknowledged_callback: None,
             acknowledged_rejected_batches,
             local_batch_record_cache: HashMap::new(),
+            known_empty_batch_scans: std::cell::RefCell::new(HashSet::new()),
             batch_contexts: HashMap::new(),
             tier_label: "unknown",
             synthesize_direct_write_fate: true,

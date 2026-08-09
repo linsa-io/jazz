@@ -1191,6 +1191,15 @@ impl SyncManager {
         }
         let Some(declared_rows) = Self::declared_rows_for_submission(&submission, &batch_rows)
         else {
+            // The seal arrived but its declared rows never did — they died with
+            // an earlier connection. Staying silent here left the sealer
+            // retrying forever while this authority re-derived the void on
+            // every attempt (production incident 2026-08-09). `Missing` is the
+            // existing answer whose client-side handler retransmits rows +
+            // seal, closing the two-phase loop. Not persisted: the fate-request
+            // path already synthesizes Missing for unknown batches, and a
+            // stored Missing would wrongly outlive the arrival of the rows.
+            self.queue_batch_fate_to_client_unfiltered(client_id, BatchFate::Missing { batch_id });
             return;
         };
         let mode = match self.infer_sealed_batch_mode(&submission, &batch_rows) {
