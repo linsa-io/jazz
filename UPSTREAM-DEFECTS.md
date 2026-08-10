@@ -289,6 +289,11 @@ end-to-end with gdb: `apply_received_batch_fate → mark_local_batch_rows_reject
 local_batch_rows → scan_local_batch_rows → scan_history_row_batches`, reading 1 MiB
 media blocks with a per-row hex branch-name decode.
 
+The protocol gap is the defect: there is no path back from "the seal outlived
+its rows". The scan amplification below is the same fallback as defect 12
+being reached repeatedly; the cache we added for it is hardening, not a claim
+that the fallback is wrong.
+
 Fix shipped in this fork, two halves:
 
 - **Answer the sealer.** The silent return now queues `BatchFate::Missing` to the sealing
@@ -337,42 +342,46 @@ boundary is asked the identical question.
 
 ---
 
-## 12. A policy denial buys a walk of every table's history
+## 12. A policy denial reaches a fallback that cannot succeed for it
 
-`mark_local_batch_rows_rejected` resolves a rejected batch's rows through
-`local_batch_rows`, whose four point-lookup member sources all miss for a row
-that never landed — so it pays the "last-resort" full-store history scan. A
-rejected write is precisely the case where nothing landed: **zero** of the
-1049 rejected batches in the incident store existed anywhere in its history
-(checked against all 1998 row locators). The scan can therefore never find
-anything, and its cost is bought with peer input: one walk of every table's
-history per denied write, under the `RuntimeCore` mutex, so nothing else in
-the runtime proceeds meanwhile.
+**Not a claim that the fallback is wrong.** `local_batch_rows`'s full-store
+scan is deliberate and documented as a last resort for a batch whose
+`batchId->rows` index was lost. The claim here is narrower: one caller reaches
+it where it can never pay off, and reaching it is peer-triggered.
 
-Measured in production 2026-08-10: a client whose chains predate this store
-wrote presence heartbeats onto a `users` row the server cannot see. The server
-classifies such a write by
+`mark_local_batch_rows_rejected` resolves a rejected batch's rows through the
+scanning lookup. For a write **this node did not author**, a rejection means
+nothing landed here — the row was refused before storage — so the four
+point-lookup sources miss and the scan then walks every table's history to
+find rows that cannot exist. Checked in the incident store: **zero** of its
+1049 rejected batches appear anywhere in its history, across all 1998 row
+locators.
+
+Because policy evaluates per incoming write, a peer buys one walk of the whole
+store per denied write, under the `RuntimeCore` mutex, so the rest of the
+runtime stops for its duration. Measured in production 2026-08-10: a client
+whose chains predate this store wrote presence heartbeats onto a `users` row
+the server cannot see. The server classifies such a write by
 `if old_content.is_some() || !row.parents.is_empty() { Update } else { Insert }`
-(`sync_manager/inbox.rs`), so the same condition — no visible old content —
+(`sync_manager/inbox.rs`), so the one condition — no visible old content —
 produced 934 `Insert denied by policy on table users` and 114 `Update denied
-by USING policy on table users - no old content`. Each denial cost one scan:
-264 distinct batches in 26 minutes, one core pinned at 100%, sync stalled.
+by USING policy on table users - no old content`. 264 distinct batches in 26
+minutes, one core pinned at 100%, sync stalled.
 
-Fix: the rejection path uses `local_batch_rows_tracked_only`, which consults
-only what this node already tracks. Marking rows rejected is bookkeeping over
-rows we hold; with no bookkeeping there is nothing to mark.
+Fix: the rejection path uses `local_batch_rows_tracked_only` — only what this
+node already tracks.
+
+**The tradeoff, stated plainly.** The scan's one possible payoff is a batch
+whose rows are in storage while _all_ its bookkeeping (sealed submission,
+cached record, persisted record, row index) is gone; the rejection path can no
+longer recover that case. We believe it is unreachable — bookkeeping is pruned
+only at settlement, and a settled batch is terminal, so a later rejection for
+it would contradict the settlement — but that is an argument, not a
+measurement, and it is the thing to re-examine if a rejected local batch is
+ever seen keeping visible rows.
 
 Gate: `a_policy_rejected_write_costs_no_full_store_scan` — six policy-denied
 writes, six rejected fates, zero full-store scans (6/6 before the fix).
-
-Also shipped with it: the fallback warn now names its caller
-(`confirmed_fate` / `retransmit` / `pending_reconciliation` / `worker_sync`),
-what that caller was doing, what the scan walked (`objects_scanned`,
-`history_entries_scanned`, `scan_millis`) and which bookkeeping was present
-(`has_sealed_submission`, `has_local_record`, `has_row_index`,
-`cached_record`). The bare warn it replaces cost this team hours during the
-incident: it named neither the driver nor the price, and a gdb stack dump on
-the live server was the only way to find both.
 
 ---
 
