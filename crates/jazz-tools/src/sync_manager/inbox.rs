@@ -367,51 +367,58 @@ impl SyncManager {
         .flatten()
     }
 
-    fn history_rows_visible_before_batch(
+    pub(super) fn history_rows_visible_before_batch(
         row: &StoredRowBatch,
-        visible_rows: Vec<StoredRowBatch>,
+        mut visible_rows: Vec<StoredRowBatch>,
         allow_unresolved_fallback: bool,
     ) -> Option<Vec<StoredRowBatch>> {
         if row.parents.is_empty() {
             return allow_unresolved_fallback.then_some(visible_rows);
         }
 
-        // Index by REFERENCE. The walk below needs each candidate's parents,
-        // nothing else — cloning every visible row to build this map cost one
-        // full copy of a row's history per incoming batch. On a presence row
-        // with 2541 history entries taking ~52 writes a second (production
-        // 2026-08-10), that was ~132k row clones a second, each with its own
-        // payload and parent allocations, and the runtime pinned a core doing
-        // it. Only the selected ancestors are cloned, at the end.
-        let visible_rows_by_batch = visible_rows
-            .iter()
-            .map(|candidate| (candidate.batch_id(), candidate))
-            .collect::<HashMap<_, _>>();
+        // Resolve the ancestor set by REFERENCE, then narrow the caller's own
+        // vector in place. Nothing here copies a row.
+        //
+        // It used to copy every visible row twice — once to index them by
+        // batch id, once to collect the selection — though the walk reads
+        // nothing but each candidate's parents, and the selection is a subset
+        // of a vector we already own. On a row whose history is long that cost
+        // tracked the history, not the change: production 2026-08-10, a
+        // presence row at 2541 entries taking ~52 unappliable writes a second
+        // meant a quarter of a million row copies a second, payloads and
+        // parent vectors included, and a core pinned doing it. A linear
+        // history makes every entry an ancestor, so trimming the index alone
+        // would only have halved it.
+        let included_batch_ids = {
+            let visible_rows_by_batch = visible_rows
+                .iter()
+                .map(|candidate| (candidate.batch_id(), candidate))
+                .collect::<HashMap<_, _>>();
 
-        let mut included_batch_ids = HashSet::new();
-        let mut frontier = row.parents.iter().copied().collect::<Vec<_>>();
-        while let Some(batch_id) = frontier.pop() {
-            if !included_batch_ids.insert(batch_id) {
-                continue;
+            let mut included_batch_ids = HashSet::new();
+            let mut frontier = row.parents.iter().copied().collect::<Vec<_>>();
+            while let Some(batch_id) = frontier.pop() {
+                if !included_batch_ids.insert(batch_id) {
+                    continue;
+                }
+                if let Some(parent_row) = visible_rows_by_batch.get(&batch_id) {
+                    frontier.extend(parent_row.parents.iter().copied());
+                }
             }
-            if let Some(parent_row) = visible_rows_by_batch.get(&batch_id) {
-                frontier.extend(parent_row.parents.iter().copied());
-            }
-        }
+            included_batch_ids
+        };
 
-        let parent_rows = visible_rows
+        if !visible_rows
             .iter()
-            .filter(|candidate| included_batch_ids.contains(&candidate.batch_id()))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if parent_rows.is_empty() {
+            .any(|candidate| included_batch_ids.contains(&candidate.batch_id()))
+        {
             // A migrated branch may not carry parents from the old schema
             // branch, so its first write must still consider all visible rows.
-            allow_unresolved_fallback.then_some(visible_rows)
-        } else {
-            Some(parent_rows)
+            return allow_unresolved_fallback.then_some(visible_rows);
         }
+
+        visible_rows.retain(|candidate| included_batch_ids.contains(&candidate.batch_id()));
+        Some(visible_rows)
     }
 
     fn apply_row_updated<H: Storage>(

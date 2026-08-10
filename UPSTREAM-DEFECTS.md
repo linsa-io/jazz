@@ -385,6 +385,37 @@ writes, six rejected fates, zero full-store scans (6/6 before the fix).
 
 ---
 
+## 13. Resolving a batch's ancestors copies the whole row history, twice
+
+`history_rows_visible_before_batch` (upstream `sync_manager/inbox.rs`, from
+"Fix replay idempotency for stored history rows", refactored 2026-07-13)
+resolves which of a row's visible history entries precede an incoming batch.
+It indexed the candidates by **cloning every one of them** into a map — though
+the walk reads nothing but each candidate's `parents` — and then cloned the
+selection out again, into a fresh vector. The selection is a subset of a
+vector the function already owns by value, so both copies are avoidable.
+
+Cost per incoming batch is therefore two copies of the row's whole visible
+history, payloads and parent vectors included. In a linear history — the
+normal shape, and what a presence row grows into — every entry is an ancestor,
+so neither copy shrinks with the selection.
+
+Measured in production 2026-08-10: a `users` row grown to 2541 history entries
+by presence heartbeats, taking ~52 unappliable writes a second from one
+client, put a core at 100% with a stack dump landing repeatedly in
+`smallvec::grow` under this function — roughly a quarter of a million row
+copies a second.
+
+Fix: index by reference, then `retain` the caller's own vector in place. No
+row is copied at all.
+
+Gate: `resolving_ancestors_does_not_clone_the_whole_history` — a 200-entry
+linear history whose every entry is an ancestor; asserts the returned vector
+is the caller's own allocation (same pointer, same capacity). Verified red
+against the upstream shape and green with the fix.
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed
