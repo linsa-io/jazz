@@ -1785,11 +1785,15 @@ impl SyncManager {
                             return;
                         }
 
-                        let payload_metadata = metadata
-                            .as_ref()
-                            .map(|meta| meta.metadata.clone())
-                            .unwrap_or_default();
-                        let (stored_metadata, existing_history_row, pre_batch_visible_row) = self
+                        // Resolve only what the replay decision needs: the
+                        // table, and the stored row for this exact batch.
+                        // Everything heavier waits until we know this is not a
+                        // replay — a peer that reconnects, or that was answered
+                        // `Missing`, resends rows we already hold byte for byte,
+                        // and preparing a policy check for those is work for a
+                        // check that never runs. Production 2026-08-10: a core
+                        // pinned with an empty log, absorbing a peer's replays.
+                        let (stored_metadata, existing_history_row) = self
                             .row_metadata_from_payload(storage, row, metadata.as_ref())
                             .and_then(|stored_metadata| {
                                 let table =
@@ -1803,11 +1807,9 @@ impl SyncManager {
                                     )
                                     .ok()
                                     .flatten();
-                                let pre_batch_visible_row =
-                                    self.pre_batch_visible_row(storage, &table, row);
-                                Some((stored_metadata, existing_history_row, pre_batch_visible_row))
+                                Some((stored_metadata, existing_history_row))
                             })
-                            .unwrap_or_else(|| (HashMap::new(), None, None));
+                            .unwrap_or_else(|| (HashMap::new(), None));
 
                         // Idempotent replay short-circuit: reconnect replays row
                         // history, so only an exact stored row-batch match counts as
@@ -1831,6 +1833,15 @@ impl SyncManager {
                                 .insert(row.batch_id);
                             return;
                         }
+
+                        // Not a replay: now pay for the policy check's inputs.
+                        let payload_metadata = metadata
+                            .as_ref()
+                            .map(|meta| meta.metadata.clone())
+                            .unwrap_or_default();
+                        let pre_batch_visible_row = stored_metadata
+                            .get(MetadataKey::Table.as_str())
+                            .and_then(|table| self.pre_batch_visible_row(storage, table, row));
 
                         let old_content = pre_batch_visible_row
                             .as_ref()

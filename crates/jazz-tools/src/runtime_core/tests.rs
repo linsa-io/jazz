@@ -2890,3 +2890,106 @@ fn a_parentless_write_does_not_read_the_whole_row_history() {
          as it likes"
     );
 }
+
+/// An exact replay must be recognised before the work it does not need.
+///
+/// A peer that retransmits rows it already sent — what every reconnect and
+/// every `Missing` answer produces — sends batches the authority holds byte
+/// for byte. `process_from_client` recognises that
+/// (`matches_replayed_row_batch`) and short-circuits, but the preparation for
+/// the policy check that will never run used to happen FIRST: another history
+/// row read and decode, or a walk of the whole history for a parentless row.
+/// The decision needs only the row the first read already fetched.
+///
+/// Production 2026-08-10: a core pinned with an empty log, the runtime
+/// absorbing a peer's replays — silently, because the short-circuit logs
+/// nothing.
+#[test]
+fn an_exact_replay_costs_one_history_read() {
+    let schema = test_schema();
+    let mut server = create_runtime_with_schema(schema, "replay-cost");
+    let client_id = ClientId::new();
+    server.add_client(client_id, Some(Session::new("writer")));
+
+    // A row with history, so a replay has a parent that could be looked up.
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut server,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("v0".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row");
+    server.batched_tick();
+    server.immediate_tick();
+    server.sync_sender().take();
+
+    let live_branch = crate::storage::sole_branch_name(server.storage())
+        .expect("branch registry readable")
+        .expect("the seeded row registered a branch");
+    let history = server
+        .storage()
+        .scan_history_row_batches("users", server_row_id)
+        .expect("history readable");
+    let root = history.first().expect("the row has a version").clone();
+
+    // What a peer sends: a child of what it holds.
+    let child = crate::row_histories::StoredRowBatch::new(
+        server_row_id,
+        live_branch.as_str(),
+        vec![root.batch_id],
+        encode_row(
+            &test_schema()[&TableName::new("users")].columns,
+            &user_row_values(server_row_id, "from the peer"),
+        )
+        .expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 5_000),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+    let deliver = |server: &mut TestCore, row: crate::row_histories::StoredRowBatch| {
+        server.park_sync_message(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::RowBatchCreated {
+                metadata: None,
+                row,
+            },
+        });
+        server.batched_tick();
+        server.immediate_tick();
+    };
+    deliver(&mut server, child.clone());
+
+    let stored = server
+        .storage()
+        .load_history_row_batch("users", live_branch.as_str(), server_row_id, child.batch_id)
+        .expect("history lookup");
+    assert!(
+        stored.is_some(),
+        "the first send must land, else the second is not a replay and this gates nothing"
+    );
+
+    // The same batch again, byte for byte.
+    server.storage().reset_history_row_lookups();
+    server.storage().reset_history_scans();
+    deliver(&mut server, child);
+    let lookups = server.storage().history_row_lookups();
+    let scans = server.storage().history_scans();
+
+    eprintln!("exact replay cost: history_row_lookups={lookups} history_scans={scans}");
+    assert_eq!(
+        scans, 0,
+        "an exact replay walked the row's whole history {scans} time(s)"
+    );
+    assert!(
+        lookups <= 1,
+        "an exact replay cost {lookups} history row reads; one fetches the row the \
+         short-circuit is decided from, and everything past that decision prepares a \
+         policy check that never runs"
+    );
+}

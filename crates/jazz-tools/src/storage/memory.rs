@@ -52,6 +52,10 @@ pub struct MemoryStorage {
     /// one. A row that accumulates thousands of versions makes each expensive.
     #[cfg(test)]
     history_scans: std::cell::Cell<usize>,
+    /// Point reads of one history row. Each costs a get plus a full row
+    /// decode, so a gate can pin how many an inbound message may pay.
+    #[cfg(test)]
+    history_row_lookups: std::cell::Cell<usize>,
     /// Ordered raw-table storage.
     raw_tables: HashMap<String, RawTableEntries>,
     authoritative_batch_fates: std::cell::RefCell<HashMap<BatchId, BatchFate>>,
@@ -80,6 +84,16 @@ impl MemoryStorage {
     #[cfg(test)]
     pub(crate) fn reset_history_scans(&self) {
         self.history_scans.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_row_lookups(&self) -> usize {
+        self.history_row_lookups.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_history_row_lookups(&self) {
+        self.history_row_lookups.set(0);
     }
 
     #[cfg(test)]
@@ -152,6 +166,8 @@ impl Default for MemoryStorage {
             flush_wal_call_count: std::cell::RefCell::new(0),
             #[cfg(test)]
             history_scans: std::cell::Cell::new(0),
+            #[cfg(test)]
+            history_row_lookups: std::cell::Cell::new(0),
             raw_tables: HashMap::new(),
             authoritative_batch_fates: std::cell::RefCell::new(HashMap::new()),
             ensured_raw_table_headers: HashSet::new(),
@@ -1119,6 +1135,9 @@ impl Storage for MemoryStorage {
         row_id: ObjectId,
         batch_id: BatchId,
     ) -> Result<Option<StoredRowBatch>, StorageError> {
+        #[cfg(test)]
+        self.history_row_lookups
+            .set(self.history_row_lookups.get() + 1);
         Ok(self.row_histories.get(table).and_then(|regions| {
             regions
                 .history
