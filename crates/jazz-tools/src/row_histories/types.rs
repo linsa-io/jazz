@@ -359,6 +359,27 @@ impl StoredRowBatch {
         )
     }
 
+    /// The same identity with `parents` left out.
+    ///
+    /// `content_digest` covers `parents`, and delivery clears them
+    /// (`SyncManager::scope_delivery_row`), so a peer's copy of a row it was
+    /// SENT hashes differently from the authority's own — through no fault of
+    /// either. Anything comparing a peer's declaration against a locally held
+    /// row has to be blind to that one field, or it reads a normal round trip
+    /// as divergence. The graft tool reached the same conclusion independently
+    /// (see `storage/graft.rs`). Everything else identity is built on —
+    /// branch, payload, timestamp, author, metadata — is still covered.
+    pub fn content_digest_ignoring_parents(&self) -> Digest32 {
+        compute_row_digest(
+            &self.branch,
+            &[],
+            &self.data,
+            self.updated_at,
+            &self.updated_by,
+            (!self.metadata.is_empty()).then_some(&self.metadata),
+        )
+    }
+
     pub fn accepted_transaction_output(&self, confirmed_tier: DurabilityTier) -> Self {
         let mut row = self.clone();
         row.parents = self.parents.clone();

@@ -455,6 +455,7 @@ fn push_query_subscription(
 /// reconcile.
 mod basic;
 mod client_lifecycle;
+mod delivered_row_reseal;
 mod dropped_payload;
 mod forwarding_recursion;
 mod frontier_pruning;

@@ -498,7 +498,16 @@ impl SyncManager {
                     submission.target_branch_name.as_str() == row.branch.as_str()
                         && submission.members.iter().any(|member| {
                             member.object_id == row.row_id
-                                && member.row_digest == row.content_digest()
+                                // Both forms of the identity, for the same
+                                // reason as `declared_rows_for_submission`:
+                                // a peer resending its copy of a DELIVERED row
+                                // declares the digest without parents, because
+                                // we stripped them. Reading that as "not a
+                                // declared member" dropped the row silently
+                                // instead of storing it as rejected.
+                                && (member.row_digest == row.content_digest()
+                                    || member.row_digest
+                                        == row.content_digest_ignoring_parents())
                         })
                 });
             if !is_declared_member {
@@ -1061,7 +1070,16 @@ impl SyncManager {
             let matching_row = batch_rows.iter().find(|(_, row)| {
                 row.row_id == member.object_id
                     && row.branch.as_str() == submission.target_branch_name.as_str()
-                    && row.content_digest() == member.row_digest
+                    // Either form of the identity: a peer that authored the row
+                    // declares the digest with parents, a peer that RECEIVED it
+                    // declares one without, because the sender stripped them
+                    // (`scope_delivery_row`). Reading the second as a mismatch
+                    // made the seal permanently uncompletable, and the answer to
+                    // an uncompletable seal — `Missing` — asks the peer to send
+                    // the rows again, which is a cycle with no exit (production
+                    // 2026-08-10: a pinned core and an empty log).
+                    && (row.content_digest() == member.row_digest
+                        || row.content_digest_ignoring_parents() == member.row_digest)
             })?;
             declared_rows.push(matching_row.clone());
         }
