@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use web_time::Instant;
@@ -64,6 +64,79 @@ pub const MAX_REDELIVERY_ATTEMPTS: u32 = 5;
 /// burns the cap in milliseconds and converts eventual delivery into permanent loss.
 pub const REDELIVERY_GIVE_UP_AFTER_MICROS: u64 = 60_000_000;
 
+/// How often, how many times, and for how long this authority tells a client that a batch
+/// is `Missing`.
+///
+/// `Missing` is not advice, it is an instruction: on the peer it drives
+/// `retransmit_local_batch_to_servers`, and `force_row_batch_to_servers` clears the dedup
+/// bookkeeping so nothing suppresses the resend. Every answer therefore costs the peer a
+/// full retransmission of the batch, and each retransmitted row asks the question again —
+/// the replay short-circuit queues a fate request for its batch, so rows alone regenerate
+/// it. When the batch cannot be completed, the answer buys the work that produces the next
+/// question and the cycle's only limit is how fast this side answers: one pinned core,
+/// sync dead behind it (production 2026-08-10).
+///
+/// The bound is on the answer rather than on any single reason a batch fails to complete,
+/// because the reasons are many — a member this authority never indexed, a branch
+/// mismatch, drift in a payload or its authorship — and the amplification is common to all
+/// of them.
+///
+/// Three limits, because they bound different things. The interval bounds the RATE, and is
+/// what a burst runs into first: without it a peer retrying in a tight loop collects
+/// thousands of retransmission instructions inside any grace we could choose. The cap and
+/// the grace are the give-up policy, carried over unchanged from `MAX_REDELIVERY_ATTEMPTS`
+/// / `REDELIVERY_GIVE_UP_AFTER_MICROS` for the reasons stated there: the cap alone would
+/// be spent by a reconnect storm in milliseconds, and the grace keeps a merely slow peer
+/// working.
+/// All three are wall-clock microseconds, compared against `MonotonicClock::reserve_timestamp`
+/// — the same units and the same source as the redelivery bound they are drawn from.
+pub const MISSING_ANSWER_MIN_INTERVAL_MICROS: u64 = 5_000_000;
+pub const MAX_MISSING_ANSWERS: u32 = MAX_REDELIVERY_ATTEMPTS;
+pub const MISSING_ANSWER_GIVE_UP_AFTER_MICROS: u64 = REDELIVERY_GIVE_UP_AFTER_MICROS;
+
+/// How many distinct batches are tracked per client, and how many a single request may ask
+/// about.
+///
+/// The budget above needs one entry per batch to count against, so the tracking is itself
+/// something a peer can grow, and the first answer for a batch is deliberately free — a
+/// genuinely interrupted upload must be repaired without waiting out an interval. Those
+/// two together mean the tracking cap is what stands between a peer and an endless supply
+/// of free answers: it can have this many, and then only as fast as it can drive batches
+/// to silence.
+///
+/// So room is made only by evicting a batch this authority has already given up on, and a
+/// `BatchFateNeeded` naming more ids than can be tracked is answered up to the cap and no
+/// further. A peer that cycles fresh ids to dodge the budget hits both.
+pub(super) const MAX_TRACKED_MISSING_ANSWERS: usize = 1024;
+
+/// What this authority has already told one client about the batches it cannot complete.
+///
+/// The tracked ids are kept in creation order so making room is O(1): the cap is reached
+/// exactly when a peer is producing ids faster than they settle, which is when a scan over
+/// the tracked set would be a cost the peer sets the size of.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ClientMissingAnswers {
+    pub(super) budgets: HashMap<BatchId, MissingAnswerBudget>,
+    pub(super) order: VecDeque<BatchId>,
+}
+
+/// What this authority has already told one client about one batch it cannot complete.
+///
+/// Deliberately holds no copy of what the peer declared. An earlier draft remembered the
+/// declaration so a *different* one could re-arm the budget, which reads as fairness and
+/// is in fact the hole: a peer alternating two declarations, or perturbing one member per
+/// round, resets the budget every round and the bound never engages. A declaration that
+/// can be matched never reaches here at all, so re-arming on a changed one buys nothing
+/// except that hole.
+#[derive(Debug, Clone)]
+pub(super) struct MissingAnswerBudget {
+    pub(super) answers: u32,
+    pub(super) first_answered_at: u64,
+    pub(super) last_answered_at: u64,
+    /// Set when the budget ran out, so the warning names it once instead of per attempt.
+    pub(super) silenced: bool,
+}
+
 /// Manages synchronization state atop storage-backed row and catalogue state.
 ///
 /// Coordinates:
@@ -93,6 +166,15 @@ pub struct SyncManager {
     /// accepts writes for as long as TCP takes to notice.
     pub(super) pending_client_deliveries:
         HashMap<ClientId, HashMap<(ObjectId, BranchName), PendingDelivery>>,
+
+    /// What this authority has already said about batches it cannot complete, per client,
+    /// so an answer that cannot help stops repeating.
+    ///
+    /// Connection-scoped on purpose: dropped with the client, which re-arms the answer on
+    /// reconnect. Silence defers a batch, it never abandons one — the submission stays put
+    /// and no fate is invented, because on the peer a `Rejected` destroys the row and the
+    /// graft tool is offline-only.
+    pub(super) missing_answers: HashMap<ClientId, ClientMissingAnswers>,
 
     /// Rows this node has applied and not yet reported upstream.
     ///
@@ -278,6 +360,7 @@ impl SyncManager {
             inbox: Vec::new(),
             outbox: Vec::new(),
             pending_client_deliveries: HashMap::new(),
+            missing_answers: HashMap::new(),
             applied_rows_to_confirm: Vec::new(),
             upstream_supports_delivery_acks: false,
             pending_permission_checks: Vec::new(),
@@ -618,6 +701,9 @@ impl SyncManager {
     /// Add a client connection without automatically replaying catalogue state.
     pub fn add_client(&mut self, client_id: ClientId) {
         self.clients.insert(client_id, ClientState::default());
+        // A fresh connection is new information about what the peer can send, so whatever
+        // this authority stopped answering for the previous one gets another chance.
+        self.missing_answers.remove(&client_id);
     }
 
     /// Add a client connection using storage-backed catalogue replay.
@@ -666,6 +752,7 @@ impl SyncManager {
         // A reaped client's unconfirmed rows go with it: its state is rebuilt from
         // scratch on the next connection.
         self.pending_client_deliveries.remove(&client_id);
+        self.missing_answers.remove(&client_id);
         self.clients.remove(&client_id);
         // Clean up interest map
         self.row_batch_interest.retain(|_, clients| {
@@ -713,6 +800,21 @@ impl SyncManager {
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.session = Some(session);
         }
+    }
+
+    /// Note that a client is on a fresh connection.
+    ///
+    /// A reconnect does not always mint a new client, and the session is not a reliable
+    /// marker either — the same user reconnecting presents the same session value.
+    /// `ensure_client_with_session` updates the client in place, and the server pulls a
+    /// reconnecting client back out of the disconnect candidates rather than reaping it,
+    /// so nothing else here observes the new socket.
+    ///
+    /// A fresh connection is new information about what the peer can send, so it re-arms
+    /// the answers this authority stopped giving. That is what keeps a bounded answer a
+    /// deferral rather than an abandonment.
+    pub fn note_client_connected(&mut self, client_id: ClientId) {
+        self.missing_answers.remove(&client_id);
     }
 
     /// Set the role for a client.

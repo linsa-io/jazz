@@ -290,7 +290,7 @@ local_batch_rows → scan_local_batch_rows → scan_history_row_batches`, readin
 media blocks with a per-row hex branch-name decode.
 
 The protocol gap is the defect: there is no path back from "the seal outlived
-its rows". The scan amplification below is the same fallback as defect 12
+its rows". The scan amplification below is the same fallback as defect 13
 being reached repeatedly; the cache we added for it is hardening, not a claim
 that the fallback is wrong.
 
@@ -342,7 +342,7 @@ boundary is asked the identical question.
 
 ---
 
-## 12. A policy denial reaches a fallback that cannot succeed for it
+## 13. A policy denial reaches a fallback that cannot succeed for it
 
 **Not a claim that the fallback is wrong.** `local_batch_rows`'s full-store
 scan is deliberate and documented as a last resort for a batch whose
@@ -385,7 +385,7 @@ writes, six rejected fates, zero full-store scans (6/6 before the fix).
 
 ---
 
-## 13. Resolving a batch's ancestors copies the whole row history, twice
+## 14. Resolving a batch's ancestors copies the whole row history, twice
 
 `history_rows_visible_before_batch` (upstream `sync_manager/inbox.rs`, from
 "Fix replay idempotency for stored history rows", refactored 2026-07-13)
@@ -416,7 +416,7 @@ against the upstream shape and green with the fix.
 
 ---
 
-## 14. A parentless write reads the row's entire history to prove nothing
+## 15. A parentless write reads the row's entire history to prove nothing
 
 `pre_batch_visible_row` prepares the pre-batch content every incoming write is
 policy-checked against. A batch with ONE parent takes a point-lookup fast path
@@ -450,6 +450,107 @@ answering "which branches does THIS row span" cheaply needs a storage
 primitive that does not exist yet.
 
 ---
+
+## 16. A seal over delivered rows can never be matched, and the answer for that is unbounded
+
+Two independent halves, and the second one is ours.
+
+**The declaration cannot match.** `RowHistoryEntry::content_digest()` covers `parents`,
+and `scope_delivery_row` clears `parents` before a row goes out to a peer. A peer that
+seals rows it _received_ rather than authored therefore declares digests computed over the
+stripped form, while the authority holds the full form and computes a different digest.
+Both sides are behaving exactly as written; the identity is simply not the same identity on
+the two sides of the wire. No retry can converge, because retrying re-derives the same two
+digests.
+
+**The answer for an unmatched declaration is an instruction.** `BatchFate::Missing` is not
+advice: on the peer it drives `retransmit_local_batch_to_servers`, and
+`force_row_batch_to_servers` deliberately clears the sent-metadata bookkeeping so nothing
+suppresses the resend. Rows and seal come back, the seal is unmatchable again, and the
+answer buys the work that produces the next question. The cycle's only limit is how fast
+the authority answers.
+
+That second half arrived with this fork's own fix for defect 11, which replaced silence
+with `Missing`. Silence was worse in its own way — the sealer retried forever with no path
+forward — but the replacement had no bound, and on 2026-08-10 a diverged client held a
+production core at 100% with sync dead behind it. The lesson is narrow and worth stating:
+an answer whose handler generates the next question needs a bound before it needs anything
+else.
+
+**The answer has two emitters, and bounding one bounds nothing.** Besides the seal that
+cannot complete, `respond_to_batch_fate_request` synthesises `Missing` for any batch with
+no stored fate — and the replay short-circuit queues a fate request for _every replayed
+row_. So the rows a `Missing` asks for each buy another `Missing`, with no seal involved.
+A first version of this fix bounded only the seal emitter; its gates passed because they
+sent seals and never a replayed row.
+
+**Fix shipped in this fork, three parts.**
+
+- `content_digest_ignoring_parents()`, accepted **alongside** the full digest at the two
+  sites that match declared members (`declared_rows_for_submission`, and the rejected-batch
+  membership check in `apply_row_updated`). Delivered rows can now settle. The full digest
+  is still accepted, so nothing that matched before stops matching. Membership is only the
+  question of which stored rows a seal is about; whether they may commit is still answered
+  from their real stored parents, gated by a test that declares a stale frontier with the
+  blind digest and still expects `transaction_conflict`.
+- One answer policy, `may_tell_client_a_batch_is_missing`, through which **both** emitters
+  pass — keyed on the fate being `Missing` rather than on where it came from, because a
+  node with an upstream can hold a _stored_ one and it drives retransmission just the same. Three limits, bounding different things: a rate limit
+  (`MISSING_ANSWER_MIN_INTERVAL_MICROS`, 5 s per client per batch) is what a burst runs
+  into first and is the one that makes "a peer cannot set our workrate" true; the cap and
+  the grace (`MAX_MISSING_ANSWERS` / `MISSING_ANSWER_GIVE_UP_AFTER_MICROS`, aliases of the
+  redelivery constants) are the give-up policy, both halves load-bearing for the reasons
+  stated where they were first introduced. Silence retracts nothing — the submission stays,
+  no fate is invented (a `Rejected` would destroy the peer's row and the graft tool is
+  offline-only) — and the budget is connection-scoped, re-armed by the
+  handshake itself, because nothing else observes a new socket: a reconnect does not always
+  mint a new client (`ensure_client_with_session` updates it in place, and the server pulls
+  a reconnecting client back out of the disconnect candidates rather than reaping it), and
+  the session does not mark one either, since the same user presents the same session
+  value.
+- The replay short-circuit in `apply_row_updated` is decided _before_ the inputs to the
+  check it skips are prepared, so absorbing a replay costs one history read instead of two.
+  This is what the loop's traffic actually spends its time on once the answer is bounded.
+
+**The first answer for a batch is free, and the tracking cap is what protects that.** A
+genuinely interrupted upload must be repaired without first waiting out an interval, so a
+fresh batch id is the cheapest thing a peer can buy an answer with — and it can mint them
+endlessly. Room is therefore made only out of a batch that is no longer being repaired:
+one already given up on, or one nobody has asked about in a give-up window. Evicting a
+live budget instead would hand back the free answer for a batch already being throttled,
+which is the alternation hole moved into the id space; evicting _only_ the given-up ones
+would lock out a client that named many batches once and then went quiet, because
+silencing takes sustained interest. Oldest-created first, which is O(1) and cannot stall —
+the head either keeps being asked about and goes silent, or stops and goes dormant. A fate
+request is likewise answered, and registers interest, only up to the cap, capped inside
+`respond_to_batch_fate_request` so every caller inherits it: nothing limited how many
+batches one frame may name, and 64 MiB of ids is about four million of them.
+
+**The budget deliberately remembers nothing about what the peer declared.** An earlier
+version kept the declaration so that a _different_ one could re-arm, which reads as
+fairness and is exactly the hole: a peer alternating two declarations, or perturbing one
+member per round, resets the budget every round and the bound never engages. A declaration
+that can be matched never reaches this path, so re-arming on a changed one buys nothing
+else. It also removed a peer-controlled allocation — member counts are not capped, so a
+remembered declaration is memory a client chooses the size of.
+
+Gates: `delivered_row_reseal.rs`; `transaction_sealing.rs`'s blind-digest conflict case;
+and `missing_answer_bound.rs` — a burst inside one window draws one answer, an
+unanswerable seal is answered 40/40 within the grace and 0/40 past it, replayed rows alone
+(the production shape: a `User` client through the inbox, not a `Peer` through
+`process_from_client`) stop drawing answers, alternating declarations buy nothing,
+cycling fresh batch ids stops buying answers, one oversized request is answered only up to
+the cap, making room never takes a live budget, a client at the tracking cap can still be
+told about a new batch, and a new connection — not merely a new session — asks again, that
+last one gated twice: once on the hook and once, in `runtime_core`, on the registration a
+handshake actually goes through. Each was falsified by disabling the mechanism it claims
+to test.
+
+**Residuals, stated rather than fixed.** A replayed `SealBatch` persists the submission and
+then deletes it again when the fate is already settled — two storage writes per replayed
+seal, client-driven, no amplification. And `an_exact_replay_costs_one_history_read` counts
+`load_history_row_batch` only; the sealed path's `load_history_row_batch_for_schema_hash`
+is not instrumented, so that gate proves the reorder rather than the whole replay cost.
 
 ## Notes on method
 

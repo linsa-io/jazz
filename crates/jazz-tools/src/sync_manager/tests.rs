@@ -459,6 +459,7 @@ mod delivered_row_reseal;
 mod dropped_payload;
 mod forwarding_recursion;
 mod frontier_pruning;
+mod missing_answer_bound;
 mod permissions;
 mod query_scope;
 mod server_sync;

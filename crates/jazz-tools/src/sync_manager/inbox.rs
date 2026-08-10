@@ -607,14 +607,43 @@ impl SyncManager {
     ) {
         batch_ids.sort();
         batch_ids.dedup();
+        // The list is the peer's to choose and nothing capped its length: a frame may name
+        // millions of batches, each one a storage read and a queued answer. Capped here
+        // rather than at a call site, because the two client arms are easy to mistake for
+        // each other and only one of them is on the path a socket takes. Whoever asked —
+        // including an upstream, which is trusted but not therefore unlimited — asks again
+        // on its next connection, which is the same deferral silence gives.
+        if batch_ids.len() > MAX_TRACKED_MISSING_ANSWERS {
+            tracing::warn!(
+                target: "jazz::sync",
+                ?destination, asked = batch_ids.len(), answered = MAX_TRACKED_MISSING_ANSWERS,
+                "answering only part of an oversized fate request"
+            );
+            batch_ids.truncate(MAX_TRACKED_MISSING_ANSWERS);
+        }
         for batch_id in batch_ids {
             let fate = self
                 .load_batch_fate_by_batch_id_from_storage(storage, batch_id)
                 .unwrap_or(BatchFate::Missing { batch_id });
             match destination {
                 Destination::Client(client_id) => {
+                    // Every other fate is an answer this authority owes and can only give
+                    // once it exists. `Missing` is the one that asks for work back, and
+                    // where it came from does not change that: a node with an upstream can
+                    // hold a STORED Missing, and the replay short-circuit queues a request
+                    // here for every replayed row.
+                    if matches!(fate, BatchFate::Missing { .. })
+                        && !self.may_tell_client_a_batch_is_missing(client_id, batch_id)
+                    {
+                        continue;
+                    }
                     self.queue_batch_fate_to_client_unfiltered(client_id, fate);
                 }
+                // Not bounded towards a server, and that is a trust argument rather than a
+                // mechanical one: `apply_received_batch_fate` turns a `Missing` into a
+                // retransmission there exactly as it does on a client. Upstreams are
+                // trusted to ask only about batches they hold; if that ever stops being
+                // true, this needs the same budget.
                 Destination::Server(_) => {
                     self.outbox.push(OutboxEntry {
                         destination: destination.clone(),
@@ -673,7 +702,31 @@ impl SyncManager {
         client_id: ClientId,
         batch_ids: &[crate::row_histories::BatchId],
     ) {
-        for batch_id in batch_ids {
+        // Same list, same reason as in `respond_to_batch_fate_request`: one entry per named
+        // batch, held until the client goes away, and the peer picks how many.
+        //
+        // Past the cap the list is put in the same order that function truncates in, so the
+        // batches registered are the batches answered. Taking the peer's raw order instead
+        // would answer about batches this client is not recorded as interested in, and that
+        // interest is what gates every later fate broadcast.
+        if batch_ids.len() <= MAX_TRACKED_MISSING_ANSWERS {
+            for batch_id in batch_ids {
+                self.batch_fate_interest
+                    .entry(*batch_id)
+                    .or_default()
+                    .insert(client_id);
+            }
+            return;
+        }
+        tracing::warn!(
+            target: "jazz::sync",
+            %client_id, asked = batch_ids.len(), registered = MAX_TRACKED_MISSING_ANSWERS,
+            "registering interest in only part of an oversized fate request"
+        );
+        let mut canonical = batch_ids.to_vec();
+        canonical.sort();
+        canonical.dedup();
+        for batch_id in canonical.iter().take(MAX_TRACKED_MISSING_ANSWERS) {
             self.batch_fate_interest
                 .entry(*batch_id)
                 .or_default()
@@ -1204,6 +1257,116 @@ impl SyncManager {
         }
     }
 
+    /// Decide whether to tell a client that a batch is `Missing` — and record having done
+    /// so, because the deciding factor is how often we have said it already.
+    ///
+    /// Both places that produce the answer go through here: the seal that cannot be
+    /// completed, and the fate request synthesised for a batch with no stored fate. The
+    /// second one is not a lesser case — the replay short-circuit queues a fate request for
+    /// every replayed row, so a peer retransmitting rows regenerates the answer without
+    /// ever re-sending the seal. Bounding one emitter and not the other bounds nothing.
+    ///
+    /// Refusing to answer retracts nothing. The submission stays in storage, no fate is
+    /// invented — a `Rejected` would destroy the peer's row and the graft tool is
+    /// offline-only — and the budget is connection-scoped, so a reconnect asks again. What
+    /// the peer loses is the instruction to retransmit, which is exactly the thing that was
+    /// costing both sides everything.
+    fn may_tell_client_a_batch_is_missing(
+        &mut self,
+        client_id: ClientId,
+        batch_id: crate::row_histories::BatchId,
+    ) -> bool {
+        let now = self.clock.reserve_timestamp();
+        let tracked = self.missing_answers.entry(client_id).or_default();
+        if !tracked.budgets.contains_key(&batch_id)
+            && tracked.budgets.len() >= MAX_TRACKED_MISSING_ANSWERS
+        {
+            // Make room only out of a batch that is no longer being repaired: one this
+            // authority has given up on, or one nobody has asked about in a give-up
+            // window. Evicting a live budget instead would hand the peer back the free
+            // first answer for a batch it is already being throttled on — the same hole as
+            // re-arming on a changed declaration, moved into the id space — and would drop
+            // the bookkeeping of a batch that was genuinely mid-repair.
+            //
+            // Oldest-created first, which is O(1) and cannot stall. Staying non-dormant
+            // costs the head an answer per window, and every answer counts against the
+            // cap, so a peer cannot both keep it fresh and keep it under the cap: it goes
+            // silent or it goes dormant. The worst case is not one window, though — a peer
+            // asking about the head just inside every window spends one answer each time,
+            // so silencing takes `MAX_MISSING_ANSWERS` of them and the head can block
+            // eviction for that many give-up windows.
+            let evicted = loop {
+                let Some(candidate) = tracked.order.front().copied() else {
+                    break None;
+                };
+                let Some(budget) = tracked.budgets.get(&candidate) else {
+                    tracked.order.pop_front();
+                    continue;
+                };
+                let dormant = now.saturating_sub(budget.last_answered_at)
+                    > MISSING_ANSWER_GIVE_UP_AFTER_MICROS;
+                if !budget.silenced && !dormant {
+                    break None;
+                }
+                tracked.order.pop_front();
+                break Some(candidate);
+            };
+            match evicted {
+                Some(evicted) => {
+                    tracked.budgets.remove(&evicted);
+                }
+                None => {
+                    tracing::warn!(
+                        target: "jazz::sync",
+                        %client_id, ?batch_id,
+                        tracked = tracked.budgets.len(),
+                        "not answering: this client is tracking the maximum number of \
+                         batches and every one of them is still live"
+                    );
+                    return false;
+                }
+            }
+        }
+        if !tracked.budgets.contains_key(&batch_id) {
+            tracked.order.push_back(batch_id);
+        }
+        let budget = tracked
+            .budgets
+            .entry(batch_id)
+            .or_insert_with(|| MissingAnswerBudget {
+                answers: 0,
+                first_answered_at: now,
+                last_answered_at: 0,
+                silenced: false,
+            });
+        if budget.silenced {
+            return false;
+        }
+        let answers = budget.answers;
+        if answers >= MAX_MISSING_ANSWERS
+            && now.saturating_sub(budget.first_answered_at) > MISSING_ANSWER_GIVE_UP_AFTER_MICROS
+        {
+            budget.silenced = true;
+            tracing::warn!(
+                target: "jazz::sync",
+                %client_id, ?batch_id, answers,
+                "stopping the Missing answer for a batch that never completed; the \
+                 submission is kept and a reconnect will ask again"
+            );
+            return false;
+        }
+        // The rate limit is checked after the give-up policy so a throttled attempt cannot
+        // hold the budget open, and before the count so it cannot spend it either.
+        if budget.answers > 0
+            && now.saturating_sub(budget.last_answered_at) < MISSING_ANSWER_MIN_INTERVAL_MICROS
+        {
+            return false;
+        }
+        budget.answers += 1;
+        budget.last_answered_at = now;
+        true
+    }
+
     pub(super) fn try_accept_completed_sealed_batch_from_client<H: Storage>(
         &mut self,
         storage: &mut H,
@@ -1285,7 +1448,16 @@ impl SyncManager {
             // seal, closing the two-phase loop. Not persisted: the fate-request
             // path already synthesizes Missing for unknown batches, and a
             // stored Missing would wrongly outlive the arrival of the rows.
-            self.queue_batch_fate_to_client_unfiltered(client_id, BatchFate::Missing { batch_id });
+            //
+            // Bounded, because that same handler is what makes the answer worth
+            // repeating and what makes repeating it dangerous: see
+            // `may_tell_client_a_batch_is_missing`.
+            if self.may_tell_client_a_batch_is_missing(client_id, batch_id) {
+                self.queue_batch_fate_to_client_unfiltered(
+                    client_id,
+                    BatchFate::Missing { batch_id },
+                );
+            }
             return;
         };
         let mode = match self.infer_sealed_batch_mode(&submission, &batch_rows) {
@@ -2077,9 +2249,14 @@ impl SyncManager {
                     return;
                 }
                 match storage.load_authoritative_batch_fate(submission.batch_id) {
+                    Ok(Some(fate @ BatchFate::Missing { .. })) => {
+                        if self.may_tell_client_a_batch_is_missing(client_id, submission.batch_id) {
+                            self.queue_batch_fate_to_client(client_id, fate);
+                        }
+                        return;
+                    }
                     Ok(Some(fate @ BatchFate::Rejected { .. }))
-                    | Ok(Some(fate @ BatchFate::AcceptedTransaction { .. }))
-                    | Ok(Some(fate @ BatchFate::Missing { .. })) => {
+                    | Ok(Some(fate @ BatchFate::AcceptedTransaction { .. })) => {
                         self.queue_batch_fate_to_client(client_id, fate);
                         return;
                     }

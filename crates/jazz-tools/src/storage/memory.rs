@@ -56,6 +56,10 @@ pub struct MemoryStorage {
     /// decode, so a gate can pin how many an inbound message may pay.
     #[cfg(test)]
     history_row_lookups: std::cell::Cell<usize>,
+    /// Lookups of a batch's authoritative fate. One per batch a peer names in a
+    /// fate request, so a gate can pin what the length of that list may cost.
+    #[cfg(test)]
+    authoritative_fate_lookups: std::cell::Cell<usize>,
     /// Ordered raw-table storage.
     raw_tables: HashMap<String, RawTableEntries>,
     authoritative_batch_fates: std::cell::RefCell<HashMap<BatchId, BatchFate>>,
@@ -94,6 +98,16 @@ impl MemoryStorage {
     #[cfg(test)]
     pub(crate) fn reset_history_row_lookups(&self) {
         self.history_row_lookups.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authoritative_fate_lookups(&self) -> usize {
+        self.authoritative_fate_lookups.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_authoritative_fate_lookups(&self) {
+        self.authoritative_fate_lookups.set(0);
     }
 
     #[cfg(test)]
@@ -168,6 +182,8 @@ impl Default for MemoryStorage {
             history_scans: std::cell::Cell::new(0),
             #[cfg(test)]
             history_row_lookups: std::cell::Cell::new(0),
+            #[cfg(test)]
+            authoritative_fate_lookups: std::cell::Cell::new(0),
             raw_tables: HashMap::new(),
             authoritative_batch_fates: std::cell::RefCell::new(HashMap::new()),
             ensured_raw_table_headers: HashSet::new(),
@@ -508,6 +524,9 @@ impl Storage for MemoryStorage {
         &self,
         batch_id: BatchId,
     ) -> Result<Option<BatchFate>, StorageError> {
+        #[cfg(test)]
+        self.authoritative_fate_lookups
+            .set(self.authoritative_fate_lookups.get() + 1);
         if let Some(settlement) = self.authoritative_batch_fates.borrow().get(&batch_id) {
             return Ok(Some(settlement.clone()));
         }

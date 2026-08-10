@@ -271,6 +271,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     pub fn ensure_client_with_session(&mut self, client_id: ClientId, session: Session) {
         let sm = self.schema_manager.query_manager_mut().sync_manager_mut();
         if sm.get_client(client_id).is_some() {
+            sm.note_client_connected(client_id);
             sm.set_client_session(client_id, session);
         } else {
             sm.add_client_with_storage(&self.storage, client_id);
@@ -351,6 +352,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     pub fn ensure_client_as_admin(&mut self, client_id: ClientId) {
         use crate::sync_manager::ClientRole;
         let sm = self.schema_manager.query_manager_mut().sync_manager_mut();
+        sm.note_client_connected(client_id);
         if sm.get_client(client_id).is_some() {
             sm.set_client_role(client_id, ClientRole::Admin);
         } else {
@@ -390,6 +392,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     pub fn ensure_client_as_backend(&mut self, client_id: ClientId) {
         use crate::sync_manager::ClientRole;
         let sm = self.schema_manager.query_manager_mut().sync_manager_mut();
+        sm.note_client_connected(client_id);
         if sm.get_client(client_id).is_some() {
             sm.set_client_role(client_id, ClientRole::Backend);
         } else {
@@ -437,6 +440,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         if !client_existed {
             sm.add_client(client_id);
         }
+        sm.note_client_connected(client_id);
         sm.set_client_role(client_id, ClientRole::Peer);
 
         let queued_catalogue_replay = sm.queue_catalogue_sync_to_client_if_hash_mismatch(
@@ -463,6 +467,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         if sm.get_client(client_id).is_none() {
             sm.add_client(client_id);
         }
+        sm.note_client_connected(client_id);
         sm.set_client_role(client_id, role);
         if let Some(session) = session {
             sm.set_client_session(client_id, session);

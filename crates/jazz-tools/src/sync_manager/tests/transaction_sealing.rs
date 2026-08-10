@@ -1906,3 +1906,118 @@ fn seal_batch_replay_returns_existing_settlement_after_frontier_moves() {
         } if *id == client_id && *fate == accepted_settlement
     )));
 }
+
+/// Accepting the parents-blind digest must not weaken the frontier check.
+///
+/// A delivered row arrives with `parents` stripped, so its digest cannot match
+/// the full form this authority stores, and membership matching accepts either
+/// (see `delivered_row_reseal.rs`). Membership is only the question of WHICH
+/// stored rows a seal is about; whether those rows may commit is a separate
+/// question, answered from their real stored parents. This pins that separation:
+/// the same conflict must still be rejected when the declaration is blind.
+#[test]
+fn seal_batch_rejects_a_stale_frontier_declared_with_the_parents_blind_digest() {
+    let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::Local);
+    let mut io = MemoryStorage::new();
+    let client_id = ClientId::new();
+    let batch_id = crate::row_histories::BatchId::new();
+    let row_id = ObjectId::new();
+    let target_branch = "dev-aaaaaaaaaaaa-main";
+    seed_users_schema(&mut io);
+
+    add_client(&mut sm, &io, client_id);
+    sm.set_client_role(client_id, ClientRole::Peer);
+    sm.take_outbox();
+
+    let base_row = visible_row(row_id, target_branch, Vec::new(), 900, b"base");
+    seed_visible_row(&mut sm, &mut io, "users", base_row.clone());
+
+    let staged_row = row_with_batch_state(
+        visible_row(
+            row_id,
+            target_branch,
+            vec![base_row.batch_id()],
+            1_000,
+            b"alice",
+        ),
+        batch_id,
+        crate::row_histories::RowState::StagingPending,
+        None,
+    );
+    sm.process_from_client(
+        &mut io,
+        client_id,
+        SyncPayload::RowBatchCreated {
+            metadata: Some(RowMetadata {
+                id: staged_row.row_id,
+                metadata: row_metadata("users"),
+            }),
+            row: staged_row.clone(),
+        },
+    );
+    sm.take_outbox();
+
+    // Someone else moved the row on after the transaction staged its write.
+    let newer_row = visible_row(
+        row_id,
+        target_branch,
+        vec![base_row.batch_id()],
+        1_100,
+        b"bob",
+    );
+    io.append_history_region_rows("users", std::slice::from_ref(&newer_row))
+        .unwrap();
+    io.upsert_visible_region_rows(
+        "users",
+        std::slice::from_ref(&crate::row_histories::VisibleRowEntry::rebuild(
+            newer_row.clone(),
+            &[base_row.clone(), newer_row.clone()],
+        )),
+    )
+    .unwrap();
+
+    let blind_digest = staged_row.content_digest_ignoring_parents();
+    assert_ne!(
+        blind_digest,
+        staged_row.content_digest(),
+        "the staged row has parents, so the two digest forms must differ — otherwise this \
+         gates nothing"
+    );
+
+    sm.process_from_client(
+        &mut io,
+        client_id,
+        SyncPayload::SealBatch {
+            submission: sealed_submission(
+                batch_id,
+                target_branch,
+                vec![SealedBatchMember {
+                    object_id: row_id,
+                    row_digest: blind_digest,
+                }],
+                vec![CapturedFrontierMember {
+                    object_id: row_id,
+                    branch_name: BranchName::new(target_branch),
+                    batch_id: newer_row.batch_id(),
+                }],
+            ),
+        },
+    );
+
+    assert_eq!(
+        io.load_authoritative_batch_fate(batch_id).unwrap(),
+        Some(BatchFate::Rejected {
+            batch_id,
+            code: "transaction_conflict".to_string(),
+            reason: "row visible parent changed since transaction write was staged".to_string(),
+        }),
+        "a blind declaration matched the member and then skipped the frontier check"
+    );
+    assert_eq!(
+        io.load_visible_region_row("users", target_branch, row_id)
+            .unwrap()
+            .expect("the newer visible row must remain visible")
+            .batch_id(),
+        newer_row.batch_id()
+    );
+}

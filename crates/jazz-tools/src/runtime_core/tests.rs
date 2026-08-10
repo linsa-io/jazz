@@ -2993,3 +2993,63 @@ fn an_exact_replay_costs_one_history_read() {
          policy check that never runs"
     );
 }
+
+/// The registration a real handshake goes through must re-arm the `Missing`
+/// answers this authority gave up on.
+///
+/// `may_tell_client_a_batch_is_missing` stops answering a batch that never
+/// completes, which is only a deferral because a reconnect asks again. The
+/// SyncManager-level gate proves the hook clears the budget; this one proves the
+/// path a socket actually takes reaches the hook — `handle_ws_connection` step 5
+/// calls exactly this, once per connection, before any frame is processed. The
+/// two are separate claims, and the second is the one that broke twice: first
+/// because `add_client` is skipped for an existing client, then because the same
+/// user reconnects with an equal session.
+#[test]
+fn the_registration_a_handshake_uses_re_arms_the_missing_answers() {
+    let app_id = AppId::from_name("missing-answer-rearm");
+    let sm = SyncManager::new().with_durability_tier(DurabilityTier::Local);
+    let mgr = SchemaManager::new(sm, test_schema(), app_id, "dev", "main").unwrap();
+    let mut core = new_test_core(mgr, MemoryStorage::new(), NoopScheduler);
+
+    let client_id = ClientId::new();
+    let session = crate::query_manager::session::Session::new("alice");
+    let batch_id = crate::row_histories::BatchId::new();
+    core.ensure_client_with_session_and_catalogue_state_hash(client_id, session.clone(), None);
+
+    let sm = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut();
+    sm.missing_answers
+        .entry(client_id)
+        .or_default()
+        .budgets
+        .insert(
+            batch_id,
+            crate::sync_manager::MissingAnswerBudget {
+                answers: crate::sync_manager::MAX_MISSING_ANSWERS,
+                first_answered_at: 1,
+                last_answered_at: 1,
+                silenced: true,
+            },
+        );
+
+    // The same client, the same session: a reconnect on a fresh socket, which is
+    // all the server can tell us and all it needs to.
+    core.ensure_client_with_session_and_catalogue_state_hash(client_id, session, None);
+
+    let tracked = core
+        .schema_manager()
+        .query_manager()
+        .sync_manager()
+        .missing_answers
+        .get(&client_id)
+        .map(|tracked| tracked.budgets.len())
+        .unwrap_or(0);
+    assert_eq!(
+        tracked, 0,
+        "the registration every connection goes through left {tracked} given-up batches in \
+         place; silence that survives a reconnect is not a deferral, it is a loss"
+    );
+}
