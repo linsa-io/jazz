@@ -48,6 +48,7 @@ impl SyncManager {
             check.client_id,
             check.payload,
             AuthoritativeFateRecording::Skip,
+            super::inbox::ApplySource::PermissionApproval,
         );
         if let Some(batch_id) = batch_id {
             self.try_accept_completed_sealed_batch_from_client(storage, check.client_id, batch_id);

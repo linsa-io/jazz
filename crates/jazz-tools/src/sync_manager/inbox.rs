@@ -40,6 +40,31 @@ enum SealedBatchMode {
     Transactional,
 }
 
+/// Where an inbound row batch came from when it was applied.
+///
+/// A refused batch looks the same in the log whether a peer just sent it or
+/// the server fed it back to itself from its own queues — and telling those
+/// apart on a live server cost this team a day. The apply warn carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApplySource {
+    /// Straight off a peer's connection.
+    ClientFrame,
+    /// Released by the permission queue after its policy check settled.
+    PermissionApproval,
+    /// Replicated down from an upstream server.
+    UpstreamServer,
+}
+
+impl ApplySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientFrame => "client_frame",
+            Self::PermissionApproval => "permission_approval",
+            Self::UpstreamServer => "upstream_server",
+        }
+    }
+}
+
 impl SyncManager {
     fn retain_client_batch_fate(&mut self, fate: &BatchFate) -> bool {
         tracing::debug!(
@@ -450,6 +475,7 @@ impl SyncManager {
         metadata: Option<RowMetadata>,
         mut row: StoredRowBatch,
         fate_recording: AuthoritativeFateRecording,
+        source: ApplySource,
     ) -> Option<AppliedRowBatch> {
         let authoritative_tier = match (row.confirmed_tier, self.max_local_durability_tier()) {
             (Some(incoming), Some(local)) => Some(incoming.max(local)),
@@ -507,6 +533,9 @@ impl SyncManager {
                             tracing::warn!(
                                 row_id = %row.row_id,
                                 %branch_name,
+                                batch_id = ?row.batch_id,
+                                source = source.as_str(),
+                                parents = row.parents.len(),
                                 ?err,
                                 "failed to apply synced row batch"
                             );
@@ -521,6 +550,9 @@ impl SyncManager {
                             tracing::warn!(
                                 row_id = %row.row_id,
                                 %branch_name,
+                                batch_id = ?row.batch_id,
+                                source = source.as_str(),
+                                parents = row.parents.len(),
                                 ?err,
                                 "failed to apply synced row batch"
                             );
@@ -1413,6 +1445,7 @@ impl SyncManager {
                     metadata,
                     row.clone(),
                     AuthoritativeFateRecording::AcceptedByLocalAuthority,
+                    ApplySource::UpstreamServer,
                 ) {
                     // Applied — and only now may the sender record it as delivered. A
                     // duplicate re-offer lands here too: the apply is an idempotent no-op
@@ -1612,6 +1645,7 @@ impl SyncManager {
                             client_id,
                             payload,
                             AuthoritativeFateRecording::Skip,
+                            ApplySource::ClientFrame,
                         );
                     }
                     ClientRole::User => {
@@ -1633,6 +1667,7 @@ impl SyncManager {
                                 client_id,
                                 payload,
                                 AuthoritativeFateRecording::Skip,
+                                ApplySource::ClientFrame,
                             );
                             return;
                         }
@@ -1667,6 +1702,7 @@ impl SyncManager {
                             client_id,
                             payload,
                             AuthoritativeFateRecording::Skip,
+                            ApplySource::ClientFrame,
                         );
                     }
                     ClientRole::Admin => {
@@ -1675,6 +1711,7 @@ impl SyncManager {
                             client_id,
                             payload,
                             AuthoritativeFateRecording::Skip,
+                            ApplySource::ClientFrame,
                         );
                     }
                     ClientRole::Backend => {
@@ -1693,6 +1730,7 @@ impl SyncManager {
                             client_id,
                             payload,
                             AuthoritativeFateRecording::Skip,
+                            ApplySource::ClientFrame,
                         );
                     }
                     ClientRole::User => {
@@ -1715,6 +1753,7 @@ impl SyncManager {
                                     client_id,
                                     payload,
                                     AuthoritativeFateRecording::Skip,
+                                    ApplySource::ClientFrame,
                                 );
                                 return;
                             }
@@ -1809,6 +1848,7 @@ impl SyncManager {
                     client_id,
                     payload,
                     AuthoritativeFateRecording::Skip,
+                    ApplySource::ClientFrame,
                 );
             }
             // Handle query subscription with full Query struct
@@ -1957,6 +1997,7 @@ impl SyncManager {
         client_id: ClientId,
         payload: SyncPayload,
         fate_recording: AuthoritativeFateRecording,
+        source: ApplySource,
     ) {
         match payload {
             SyncPayload::CatalogueEntryUpdated { entry } => {
@@ -1977,7 +2018,7 @@ impl SyncManager {
                     .insert(client_id);
 
                 if let Some(applied) =
-                    self.apply_row_updated(storage, metadata, row.clone(), fate_recording)
+                    self.apply_row_updated(storage, metadata, row.clone(), fate_recording, source)
                 {
                     self.forward_row_batch_to_servers(
                         storage,

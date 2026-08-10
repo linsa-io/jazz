@@ -270,6 +270,30 @@ fn main() {
         println!("users rows in store: {users_rows}");
     }
 
+    // History length per row: the multiplier on every parentless write.
+    if let Ok(locators) = store.scan_row_locators() {
+        let mut lengths: Vec<(usize, String, String)> = Vec::new();
+        for (row_id, locator) in &locators {
+            if let Ok(history) = store.scan_history_row_batches(locator.table.as_str(), *row_id) {
+                lengths.push((
+                    history.len(),
+                    locator.table.to_string(),
+                    format!("{row_id}"),
+                ));
+            }
+        }
+        lengths.sort_by_key(|(n, _, _)| std::cmp::Reverse(*n));
+        let total: usize = lengths.iter().map(|(n, _, _)| n).sum();
+        println!(
+            "\nhistory entries total: {total} across {} rows",
+            lengths.len()
+        );
+        println!("longest histories:");
+        for (n, table, row) in lengths.iter().take(6) {
+            println!("  {n:>6}  {table}  {}", &row[..8]);
+        }
+    }
+
     println!("\nsample unsettled fates:");
     for fate in fates
         .iter()
