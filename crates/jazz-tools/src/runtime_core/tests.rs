@@ -2558,8 +2558,7 @@ fn a_seal_without_rows_must_not_loop_full_store_scans() {
     // The cost contract, driver-agnostic: ANY path deriving the pending set
     // over the persisted orphan pays local_batch_rows; with the orphan seeded,
     // repeated derivations must answer from the first scan's result.
-    let scans_p0 =
-        crate::runtime_core::LOCAL_BATCH_FULL_SCANS.load(std::sync::atomic::Ordering::Relaxed);
+    let scans_p0 = s.b.local_batch_full_scan_count();
     let pending_first = s.b.pending_batch_ids_needing_reconciliation_for_test();
     let pending_second = s.b.pending_batch_ids_needing_reconciliation_for_test();
     let derivation_scans = crate::runtime_core::LOCAL_BATCH_FULL_SCANS
@@ -2743,8 +2742,7 @@ fn a_policy_rejected_write_costs_no_full_store_scan() {
     client.sync_sender().take();
     server.sync_sender().take();
 
-    let scans_before =
-        crate::runtime_core::LOCAL_BATCH_FULL_SCANS.load(std::sync::atomic::Ordering::Relaxed);
+    let scans_before = server.local_batch_full_scan_count();
     let mut rejected_fates = 0usize;
 
     // Six denied writes, the cadence of a client that keeps coming back.

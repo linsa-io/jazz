@@ -394,6 +394,12 @@ pub struct RuntimeCore<S: Storage, Sch: Scheduler> {
     /// pays one scan and re-learns.
     known_empty_batch_scans: std::cell::RefCell<HashSet<BatchId>>,
 
+    /// Full-store batch scans this runtime has paid. The process-wide
+    /// `LOCAL_BATCH_FULL_SCANS` counts every node in the process, which makes
+    /// it useless both for a per-node metric and for a test asserting its own
+    /// runtime's cost while the suite runs in parallel.
+    local_batch_full_scans: std::cell::Cell<u64>,
+
     /// Label for tracing (e.g. "local", "edge", "client").
     tier_label: &'static str,
 
@@ -505,6 +511,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             acknowledged_rejected_batches,
             local_batch_record_cache: HashMap::new(),
             known_empty_batch_scans: std::cell::RefCell::new(HashSet::new()),
+            local_batch_full_scans: std::cell::Cell::new(0),
             batch_contexts: HashMap::new(),
             tier_label: "unknown",
             synthesize_direct_write_fate: true,

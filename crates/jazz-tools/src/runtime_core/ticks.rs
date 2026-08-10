@@ -261,6 +261,11 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         })
     }
 
+    /// Full-store batch scans this runtime has paid.
+    pub fn local_batch_full_scan_count(&self) -> u64 {
+        self.local_batch_full_scans.get()
+    }
+
     /// The four point-lookup member sources — everything this node already
     /// tracks about a batch. No scan, no fallback.
     fn local_batch_rows_from_tracked_sources(&self, batch_id: BatchId) -> Vec<LocalBatchRow> {
@@ -309,6 +314,8 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             // bare "index missed" warn cost this team hours in the 2026-08-09
             // incident — it named neither who asked nor what the answer cost.
             LOCAL_BATCH_FULL_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.local_batch_full_scans
+                .set(self.local_batch_full_scans.get() + 1);
             let started = web_time::Instant::now();
             let (scanned, cost) = self.scan_local_batch_rows_measured(batch_id);
             rows = scanned;
