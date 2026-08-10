@@ -2691,3 +2691,95 @@ fn settled_history_must_not_cost_full_store_scans_on_reconciliation() {
          the production restart conveyor"
     );
 }
+
+/// RED GATE (prod 2026-08-10, the v16.1 follow-up): a POLICY-REJECTED write
+/// must not cost a full-store history scan.
+///
+/// Named by the production store's own fates, not by inference: 934
+/// `Insert denied by policy on table users` and 114 `Update denied by USING
+/// policy on table users - no old content`. A diverged client — one whose
+/// chains predate this store — writes presence heartbeats onto a `users` row
+/// whose old content is absent here, so policy denies every one. Each denial
+/// records a Rejected fate, and `apply_received_batch_fate` then calls
+/// `mark_local_batch_rows_rejected`, which walks `local_batch_rows`: all four
+/// point-lookup member sources miss (the rejected row never landed), and the
+/// "last-resort" full-store history scan runs. Marking rows rejected is
+/// best-effort bookkeeping over rows we already track; with no bookkeeping
+/// there is nothing to mark, and rediscovering that by scanning every table's
+/// history is unbounded work bought with peer input.
+///
+/// Measured in production: 264 distinct such batches in 26 minutes, the core
+/// pinned at 100%. v16.1's negative cache capped REPEATS only (680 warns over
+/// those 264 ids) and could not help the first scan of each new id.
+#[test]
+fn a_policy_rejected_write_costs_no_full_store_scan() {
+    let schema = protected_documents_schema();
+    let mut client = create_runtime_with_schema(schema.clone(), "policy-reject-scan-test");
+    let mut server = create_runtime_with_schema(schema, "policy-reject-scan-test");
+
+    let client_id = ClientId::new();
+    let server_id = ServerId::new();
+    // The server knows this connection as mallory; the client writes alice's
+    // rows. Locally the write satisfies alice's own policy, and on the server
+    // it is denied — the shape the field client hits, where its writes pass at
+    // home and are refused here.
+    server.add_client(client_id, Some(Session::new("mallory")));
+    client.add_server(server_id);
+    let alice_session = Session::new("alice");
+
+    // Ordinary history on the server, so a full scan has something to walk.
+    for index in 0..12 {
+        server
+            .insert(
+                "documents",
+                document_insert_values("resident", &format!("doc-{index}")),
+                None,
+            )
+            .expect("seed history");
+    }
+    client.batched_tick();
+    server.batched_tick();
+    server.immediate_tick();
+    client.sync_sender().take();
+    server.sync_sender().take();
+
+    let scans_before =
+        crate::runtime_core::LOCAL_BATCH_FULL_SCANS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut rejected_fates = 0usize;
+
+    // Six denied writes, the cadence of a client that keeps coming back.
+    for round in 0..6 {
+        client
+            .insert(
+                "documents",
+                document_insert_values("alice", &format!("denied-{round}")),
+                Some(&WriteContext::from_session(alice_session.clone())),
+            )
+            .expect("the write satisfies the client's own policy");
+        pump_client_messages_to_server(&mut client, &mut server, server_id, client_id);
+        server.batched_tick();
+        server.immediate_tick();
+        server.batched_tick();
+        for entry in server.sync_sender().take() {
+            if let SyncPayload::BatchFate { fate } = &entry.payload
+                && matches!(fate, crate::batch_fate::BatchFate::Rejected { .. })
+            {
+                rejected_fates += 1;
+            }
+        }
+    }
+
+    let scans = crate::runtime_core::LOCAL_BATCH_FULL_SCANS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - scans_before;
+    eprintln!("policy-denied writes: rejected_fates={rejected_fates} full_store_scans={scans}");
+    assert!(
+        rejected_fates > 0,
+        "the scenario must actually produce rejected fates, else it gates nothing"
+    );
+    assert_eq!(
+        scans, 0,
+        "six policy-denied writes cost {scans} full-store history scans — a denial must not \
+         buy O(store) work"
+    );
+}

@@ -10,6 +10,63 @@ type LocalBatchRow = (LocalBatchMember, crate::storage::RowLocator, StoredRowBat
 /// degrades to scanning the history of every row in every table. That walk is
 /// O(total rows x history depth) and must stay cold: production telemetry and
 /// the linsa_schema_profile harness both watch this counter.
+/// What a full-store batch scan cost, for the warn that reports it.
+#[derive(Default)]
+struct ScanCost {
+    objects: usize,
+    history_entries: usize,
+}
+
+/// Who asked `local_batch_rows` for a batch's rows. Named in the fallback warn
+/// so a production scan storm identifies its own driver instead of requiring a
+/// stack dump on a live server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalBatchLookup {
+    /// A confirmed fate refreshing the subscriptions that hold its rows.
+    ConfirmedFate,
+    /// Retransmitting a local batch upstream (a `Missing` fate, a reconnect).
+    Retransmit,
+    /// Deriving the set of batches still needing settlement (reconnect, boot).
+    PendingReconciliation,
+    /// Rebuilding local batch records for worker sync.
+    WorkerSync,
+}
+
+impl LocalBatchLookup {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfirmedFate => "confirmed_fate",
+            Self::Retransmit => "retransmit",
+            Self::PendingReconciliation => "pending_reconciliation",
+            Self::WorkerSync => "worker_sync",
+        }
+    }
+
+    /// One line on what the caller was trying to do and what a miss means for
+    /// it — the context a responder needs at 3am.
+    fn detail(self) -> &'static str {
+        match self {
+            Self::ConfirmedFate => {
+                "a batch was confirmed durable and its rows are being marked for \
+                 subscription recompute; a miss means the confirmation cannot refresh \
+                 any subscriber"
+            }
+            Self::Retransmit => {
+                "re-offering a local batch to a server; a miss means there is nothing \
+                 left to send and the peer will keep asking"
+            }
+            Self::PendingReconciliation => {
+                "deriving which local batches still need settlement, on reconnect or \
+                 boot; a miss here is one scan per unsettled batch on record"
+            }
+            Self::WorkerSync => {
+                "rebuilding local batch records for a worker runtime; a miss drops that \
+                 batch from the replay"
+            }
+        }
+    }
+}
+
 pub static LOCAL_BATCH_FULL_SCANS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -117,19 +174,25 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .collect()
     }
 
-    fn scan_local_batch_rows(&self, batch_id: BatchId) -> Vec<LocalBatchRow> {
+    /// The full-store scan, plus what it cost. The counts are what makes a
+    /// production warn actionable: they say how much of the store this one
+    /// lookup walked.
+    fn scan_local_batch_rows_measured(&self, batch_id: BatchId) -> (Vec<LocalBatchRow>, ScanCost) {
+        let mut cost = ScanCost::default();
         let Ok(row_locators) = self.storage.scan_row_locators() else {
-            return Vec::new();
+            return (Vec::new(), cost);
         };
 
         let mut rows = Vec::new();
         for (object_id, row_locator) in row_locators {
+            cost.objects += 1;
             let Ok(history_rows) = self
                 .storage
                 .scan_history_row_batches(row_locator.table.as_str(), object_id)
             else {
                 continue;
             };
+            cost.history_entries += history_rows.len();
             for row in history_rows
                 .into_iter()
                 .filter(|row| row.batch_id == batch_id)
@@ -150,7 +213,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                 rows.push((member, row_locator.clone(), row));
             }
         }
-        rows
+        (rows, cost)
     }
 
     fn sort_local_batch_rows(rows: &mut [LocalBatchRow]) {
@@ -198,7 +261,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         })
     }
 
-    pub(crate) fn local_batch_rows(&self, batch_id: BatchId) -> Vec<LocalBatchRow> {
+    /// The four point-lookup member sources — everything this node already
+    /// tracks about a batch. No scan, no fallback.
+    fn local_batch_rows_from_tracked_sources(&self, batch_id: BatchId) -> Vec<LocalBatchRow> {
         let member_sources: [fn(&Self, BatchId) -> Vec<LocalBatchMember>; 4] = [
             Self::sealed_submission_batch_members,
             Self::cached_local_batch_members,
@@ -213,6 +278,25 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                 break;
             }
         }
+        rows
+    }
+
+    /// Rows of a batch that this node already tracks, never paying the
+    /// full-store fallback. For callers whose work is bookkeeping over rows we
+    /// hold: with no bookkeeping there is nothing for them to do, and
+    /// rediscovering that by walking every table's history is unbounded work.
+    pub(crate) fn local_batch_rows_tracked_only(&self, batch_id: BatchId) -> Vec<LocalBatchRow> {
+        let mut rows = self.local_batch_rows_from_tracked_sources(batch_id);
+        Self::sort_local_batch_rows(&mut rows);
+        rows
+    }
+
+    pub(crate) fn local_batch_rows(
+        &self,
+        batch_id: BatchId,
+        caller: LocalBatchLookup,
+    ) -> Vec<LocalBatchRow> {
+        let mut rows = self.local_batch_rows_from_tracked_sources(batch_id);
         if rows.is_empty() {
             // A scan that already answered "no rows" stays valid until a row
             // batch with this id arrives (see `known_empty_batch_scans`) —
@@ -220,14 +304,43 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             if self.known_empty_batch_scans.borrow().contains(&batch_id) {
                 return Vec::new();
             }
-            // Last-resort fallback if the batchId->rows index is not found.
-            // This is extremely inefficient, as we're scanning across all tables' rows.
+            // Last-resort fallback if the batchId->rows index is not found: a
+            // walk of every table's history. The fields below exist because a
+            // bare "index missed" warn cost this team hours in the 2026-08-09
+            // incident — it named neither who asked nor what the answer cost.
             LOCAL_BATCH_FULL_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let started = web_time::Instant::now();
+            let (scanned, cost) = self.scan_local_batch_rows_measured(batch_id);
+            rows = scanned;
             tracing::warn!(
                 ?batch_id,
+                caller = caller.as_str(),
+                caller_detail = caller.detail(),
+                rows_found = rows.len(),
+                objects_scanned = cost.objects,
+                history_entries_scanned = cost.history_entries,
+                scan_millis = started.elapsed().as_millis() as u64,
+                has_sealed_submission = self
+                    .storage
+                    .load_sealed_batch_submission(batch_id)
+                    .ok()
+                    .flatten()
+                    .is_some(),
+                has_local_record = self
+                    .storage
+                    .load_local_batch_record(batch_id)
+                    .ok()
+                    .flatten()
+                    .is_some(),
+                has_row_index = self
+                    .storage
+                    .load_local_batch_row_index(batch_id)
+                    .ok()
+                    .flatten()
+                    .is_some(),
+                cached_record = self.local_batch_record_cache.contains_key(&batch_id),
                 "batchId->rows index missed; falling back to full-store history scan"
             );
-            rows = self.scan_local_batch_rows(batch_id);
             if rows.is_empty() {
                 self.known_empty_batch_scans.borrow_mut().insert(batch_id);
             }
@@ -324,7 +437,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             self.schema_manager
                 .query_manager_mut()
                 .mark_subscriptions_visibility_recompute_for_tier(acked_tier);
-            for (member, row_locator, _) in self.local_batch_rows(batch_id) {
+            for (member, row_locator, _) in
+                self.local_batch_rows(batch_id, LocalBatchLookup::ConfirmedFate)
+            {
                 self.schema_manager
                     .query_manager_mut()
                     .mark_local_row_updated_in_subscriptions(
@@ -349,7 +464,16 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         let mut cleared_rows = Vec::new();
         let mut batch_patch_succeeded_by_table = std::collections::HashMap::new();
 
-        for (member, row_locator, row) in self.local_batch_rows(batch_id) {
+        // Tracked rows only, never the full-store fallback. Marking a batch's
+        // rows rejected is bookkeeping over rows this node holds; when it holds
+        // none there is nothing to mark. Rejections arrive with peer input
+        // (a policy denial per write), so paying a walk of every table's
+        // history per rejection is unbounded work bought by a peer — measured
+        // in production 2026-08-10: 264 denied writes, 264 full scans, one core
+        // pinned. A rejected write also never lands, so the scan it used to pay
+        // for could not have found anything: zero of the incident store's 1049
+        // rejected batches existed anywhere in its history.
+        for (member, row_locator, row) in self.local_batch_rows_tracked_only(batch_id) {
             let was_visible = matches!(row.state, RowState::VisibleDirect)
                 || (matches!(row.state, RowState::Rejected)
                     && self
@@ -489,7 +613,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .ok()
             .flatten();
 
-        let local_rows = self.local_batch_rows(batch_id);
+        let local_rows = self.local_batch_rows(batch_id, LocalBatchLookup::Retransmit);
         let rows_to_retransmit = local_rows
             .iter()
             .map(|(member, row_locator, row)| {
@@ -1262,7 +1386,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         &self,
         batch_id: crate::row_histories::BatchId,
     ) -> Vec<SyncPayload> {
-        let local_rows = self.local_batch_rows(batch_id);
+        let local_rows = self.local_batch_rows(batch_id, LocalBatchLookup::Retransmit);
         let mut payloads = local_rows
             .iter()
             .map(|(member, row_locator, row)| SyncPayload::RowBatchCreated {

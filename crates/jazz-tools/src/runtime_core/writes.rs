@@ -805,7 +805,10 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             if !self.batch_needs_settlement(Some(&fate)) {
                 continue;
             }
-            let local_rows = self.local_batch_rows(fate.batch_id());
+            let local_rows = self.local_batch_rows(
+                fate.batch_id(),
+                crate::runtime_core::ticks::LocalBatchLookup::WorkerSync,
+            );
             if let Some(submission) =
                 Self::direct_sealed_submission_from_local_batch_rows(fate.batch_id(), &local_rows)
                 && let Some(record) =

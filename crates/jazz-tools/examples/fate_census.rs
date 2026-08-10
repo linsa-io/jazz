@@ -142,6 +142,61 @@ fn main() {
     }
 
     // A couple of raw samples of unsettled fates for shape inspection.
+    // Which rejection SOURCE produced them: code/reason name the call site.
+    let mut by_reason: BTreeMap<String, usize> = BTreeMap::new();
+    for fate in &fates {
+        if let jazz_tools::batch_fate::BatchFate::Rejected { code, reason, .. } = fate {
+            let short: String = reason.chars().take(70).collect();
+            *by_reason.entry(format!("{code} | {short}")).or_default() += 1;
+        }
+    }
+    println!("\nrejected fates by code|reason:");
+    for (k, v) in &by_reason {
+        println!("  {v:>6}  {k}");
+    }
+
+    // Attribute rejected batches to actual rows: walk the users table's
+    // history and match batch ids against the rejected fates.
+    let rejected_ids: std::collections::HashSet<_> = fates
+        .iter()
+        .filter(|f| matches!(f, jazz_tools::batch_fate::BatchFate::Rejected { .. }))
+        .map(|f| f.batch_id())
+        .collect();
+    let mut per_table: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_row: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_branch: BTreeMap<String, usize> = BTreeMap::new();
+    let mut inserts = 0usize;
+    let mut updates = 0usize;
+    if let Ok(locators) = store.scan_row_locators() {
+        println!("\nrow locators: {}", locators.len());
+        for (row_id, locator) in locators {
+            let table = locator.table.to_string();
+            let Ok(history) = store.scan_history_row_batches(&table, row_id) else {
+                continue;
+            };
+            for h in &history {
+                if rejected_ids.contains(&h.batch_id) {
+                    *per_table.entry(table.clone()).or_default() += 1;
+                    *per_row.entry(format!("{table}/{row_id}")).or_default() += 1;
+                    *per_branch.entry(h.branch.to_string()).or_default() += 1;
+                    if h.parents.is_empty() {
+                        inserts += 1;
+                    } else {
+                        updates += 1;
+                    }
+                }
+            }
+        }
+    }
+    println!("rejected batches found in history: per-table {per_table:?}");
+    println!("  parentless (row-creating): {inserts}, with parents (updates): {updates}");
+    println!("  branches: {per_branch:?}");
+    let mut rows: Vec<_> = per_row.into_iter().collect();
+    rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (row, n) in rows.iter().take(6) {
+        println!("  {row}: {n}");
+    }
+
     println!("\nsample unsettled fates:");
     for fate in fates
         .iter()

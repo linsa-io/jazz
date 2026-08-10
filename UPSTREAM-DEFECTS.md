@@ -337,6 +337,45 @@ boundary is asked the identical question.
 
 ---
 
+## 12. A policy denial buys a walk of every table's history
+
+`mark_local_batch_rows_rejected` resolves a rejected batch's rows through
+`local_batch_rows`, whose four point-lookup member sources all miss for a row
+that never landed — so it pays the "last-resort" full-store history scan. A
+rejected write is precisely the case where nothing landed: **zero** of the
+1049 rejected batches in the incident store existed anywhere in its history
+(checked against all 1998 row locators). The scan can therefore never find
+anything, and its cost is bought with peer input: one walk of every table's
+history per denied write, under the `RuntimeCore` mutex, so nothing else in
+the runtime proceeds meanwhile.
+
+Measured in production 2026-08-10: a client whose chains predate this store
+wrote presence heartbeats onto a `users` row the server cannot see. The server
+classifies such a write by
+`if old_content.is_some() || !row.parents.is_empty() { Update } else { Insert }`
+(`sync_manager/inbox.rs`), so the same condition — no visible old content —
+produced 934 `Insert denied by policy on table users` and 114 `Update denied
+by USING policy on table users - no old content`. Each denial cost one scan:
+264 distinct batches in 26 minutes, one core pinned at 100%, sync stalled.
+
+Fix: the rejection path uses `local_batch_rows_tracked_only`, which consults
+only what this node already tracks. Marking rows rejected is bookkeeping over
+rows we hold; with no bookkeeping there is nothing to mark.
+
+Gate: `a_policy_rejected_write_costs_no_full_store_scan` — six policy-denied
+writes, six rejected fates, zero full-store scans (6/6 before the fix).
+
+Also shipped with it: the fallback warn now names its caller
+(`confirmed_fate` / `retransmit` / `pending_reconciliation` / `worker_sync`),
+what that caller was doing, what the scan walked (`objects_scanned`,
+`history_entries_scanned`, `scan_millis`) and which bookkeeping was present
+(`has_sealed_submission`, `has_local_record`, `has_row_index`,
+`cached_record`). The bare warn it replaces cost this team hours during the
+incident: it named neither the driver nor the price, and a gdb stack dump on
+the live server was the only way to find both.
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed

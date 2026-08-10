@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::batch_fate::BatchFate;
+use crate::runtime_core::ticks::LocalBatchLookup;
 use crate::sync_manager::SyncManager;
 
 impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
@@ -69,7 +70,11 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         }));
         batch_ids.sort();
         batch_ids.dedup();
-        batch_ids.retain(|batch_id| !self.local_batch_rows(*batch_id).is_empty());
+        batch_ids.retain(|batch_id| {
+            !self
+                .local_batch_rows(*batch_id, LocalBatchLookup::PendingReconciliation)
+                .is_empty()
+        });
         batch_ids
     }
 
