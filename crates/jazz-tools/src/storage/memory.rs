@@ -48,6 +48,10 @@ pub struct MemoryStorage {
     flush_wal_failures: std::cell::RefCell<Option<(StorageError, Option<usize>)>>,
     #[cfg(test)]
     flush_wal_call_count: std::cell::RefCell<usize>,
+    /// Whole-history reads for one row, so a gate can pin which paths pay for
+    /// one. A row that accumulates thousands of versions makes each expensive.
+    #[cfg(test)]
+    history_scans: std::cell::Cell<usize>,
     /// Ordered raw-table storage.
     raw_tables: HashMap<String, RawTableEntries>,
     authoritative_batch_fates: std::cell::RefCell<HashMap<BatchId, BatchFate>>,
@@ -65,6 +69,17 @@ impl MemoryStorage {
     /// Create a new empty MemoryStorage.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whole-history reads served since the last reset.
+    #[cfg(test)]
+    pub(crate) fn history_scans(&self) -> usize {
+        self.history_scans.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_history_scans(&self) {
+        self.history_scans.set(0);
     }
 
     #[cfg(test)]
@@ -135,6 +150,8 @@ impl Default for MemoryStorage {
             flush_wal_failures: std::cell::RefCell::new(None),
             #[cfg(test)]
             flush_wal_call_count: std::cell::RefCell::new(0),
+            #[cfg(test)]
+            history_scans: std::cell::Cell::new(0),
             raw_tables: HashMap::new(),
             authoritative_batch_fates: std::cell::RefCell::new(HashMap::new()),
             ensured_raw_table_headers: HashSet::new(),
@@ -1000,6 +1017,8 @@ impl Storage for MemoryStorage {
         table: &str,
         row_id: ObjectId,
     ) -> Result<Vec<StoredRowBatch>, StorageError> {
+        #[cfg(test)]
+        self.history_scans.set(self.history_scans.get() + 1);
         let Some(regions) = self.row_histories.get(table) else {
             return Ok(Vec::new());
         };

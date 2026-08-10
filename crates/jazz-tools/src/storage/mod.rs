@@ -962,6 +962,21 @@ fn decode_branch_ord_meta(bytes: &[u8]) -> Result<BranchOrd, StorageError> {
     }
 }
 
+/// The store's ONE branch, when it has exactly one.
+///
+/// Two point lookups against the branch registry — cheap enough to ask on a
+/// write path, unlike enumerating a row's history to find out which branches
+/// it spans. Ords are allocated from 1, so a next-ord of 2 means a single
+/// branch was ever registered.
+pub(crate) fn sole_branch_name<H: Storage + ?Sized>(
+    storage: &H,
+) -> Result<Option<BranchName>, StorageError> {
+    if load_next_branch_ord(storage)? != 2 {
+        return Ok(None);
+    }
+    storage.load_branch_name_by_ord(1)
+}
+
 fn load_next_branch_ord<H: Storage + ?Sized>(storage: &H) -> Result<BranchOrd, StorageError> {
     match storage.raw_table_get(BRANCH_ORD_META_TABLE, BRANCH_ORD_NEXT_ORD_KEY)? {
         Some(bytes) => {

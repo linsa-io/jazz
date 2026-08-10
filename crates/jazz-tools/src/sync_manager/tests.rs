@@ -137,6 +137,10 @@ fn persist_visible_row_settlement(
 
 struct FailingHistoryPatchStorage {
     inner: MemoryStorage,
+    /// Whole-history reads for one row. A row that has accumulated thousands
+    /// of versions makes each of these expensive, so a gate can pin which
+    /// paths are allowed to pay for one.
+    history_scans: std::cell::Cell<usize>,
     fail_history_load: bool,
     fail_authoritative_fate_scan: bool,
     fail_authoritative_settlement_upsert: bool,
@@ -147,6 +151,7 @@ impl FailingHistoryPatchStorage {
     fn new() -> Self {
         Self {
             inner: MemoryStorage::new(),
+            history_scans: std::cell::Cell::new(0),
             fail_history_load: false,
             fail_authoritative_fate_scan: false,
             fail_authoritative_settlement_upsert: false,
@@ -156,6 +161,14 @@ impl FailingHistoryPatchStorage {
 
     fn inner_mut(&mut self) -> &mut MemoryStorage {
         &mut self.inner
+    }
+
+    fn history_scans(&self) -> usize {
+        self.history_scans.get()
+    }
+
+    fn reset_history_scans(&self) {
+        self.history_scans.set(0);
     }
 }
 
@@ -171,6 +184,7 @@ impl Storage for FailingHistoryPatchStorage {
         table: &str,
         row_id: ObjectId,
     ) -> Result<Vec<StoredRowBatch>, crate::storage::StorageError> {
+        self.history_scans.set(self.history_scans.get() + 1);
         self.inner.scan_history_row_batches(table, row_id)
     }
 

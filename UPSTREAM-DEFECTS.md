@@ -416,6 +416,41 @@ against the upstream shape and green with the fix.
 
 ---
 
+## 14. A parentless write reads the row's entire history to prove nothing
+
+`pre_batch_visible_row` prepares the pre-batch content every incoming write is
+policy-checked against. A batch with ONE parent takes a point-lookup fast path
+there. A batch with NO parents does not: it falls through to
+`scan_history_row_batches`, reading every version the row has.
+
+A parentless batch has no ancestry to resolve, so that read decides exactly one
+thing — whether every visible version sits on the incoming batch's branch. When
+it does, `history_rows_visible_before_batch` disables its fallback and answers
+`None`, and the read was spent proving that. The branch registry answers the
+same question in two point lookups.
+
+Not a corner case: the server classifies a write with no parents and no visible
+old content as an insert (`sync_manager/inbox.rs`), so every write from a
+client whose chain this store does not share arrives this way. Production
+2026-08-10 collected 1442 `Insert denied by policy on table users`; the row
+they landed on had grown to 2541 versions on presence heartbeats, so each
+attempt read all 2541 with the runtime mutex held, in bursts of hundreds a
+minute.
+
+Fix: when the store has exactly one branch and it is the incoming batch's
+branch, a parentless batch returns `None` without the read.
+
+Gate: `a_parentless_write_does_not_read_the_whole_row_history` — a 40-version
+row, one parentless write, asserts zero whole-history reads (one before the
+fix, verified by removing it).
+
+**Scope of the fix, stated plainly.** It covers the single-branch store. A
+store with several branches still pays the read for parentless writes;
+answering "which branches does THIS row span" cheaply needs a storage
+primitive that does not exist yet.
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed

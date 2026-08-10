@@ -2792,3 +2792,101 @@ fn a_policy_rejected_write_costs_no_full_store_scan() {
          a denial must not buy O(store) work"
     );
 }
+
+/// A parentless write must not read the row's whole history.
+///
+/// `pre_batch_visible_row` prepares the pre-batch content every incoming write
+/// is policy-checked against. A batch with ONE parent takes a point-lookup
+/// fast path there. A PARENTLESS batch does not: it falls through to
+/// `scan_history_row_batches`, which reads every version the row has.
+///
+/// That is the shape a diverged client sends — the server classifies a write
+/// with no parents and no visible old content as an insert — and production
+/// 2026-08-10 collected 1442 `Insert denied by policy on table users` from it.
+/// The row those landed on had grown to 2541 versions on presence heartbeats,
+/// so each attempt read all 2541, with the runtime mutex held; a stack dump
+/// caught the server there repeatedly.
+///
+/// A parentless batch has no ancestry to resolve. The read only decides
+/// whether every visible version sits on the incoming branch, and when it does
+/// — the single-branch case, which is what production is — the answer is
+/// always `None`, so the whole read was spent proving that.
+#[test]
+fn a_parentless_write_does_not_read_the_whole_row_history() {
+    let schema = test_schema();
+    let mut client = create_runtime_with_schema(schema.clone(), "parentless-history-cost");
+    let mut server = create_runtime_with_schema(schema, "parentless-history-cost");
+
+    let client_id = ClientId::new();
+    let server_id = ServerId::new();
+    server.add_client(client_id, Some(Session::new("writer")));
+    client.add_server(server_id);
+
+    // One row, many versions — a presence row's shape.
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut server,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("v0".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row");
+    for version in 1..40 {
+        server
+            .update(
+                server_row_id,
+                vec![("name".to_string(), Value::Text(format!("v{version}")))],
+                None,
+            )
+            .expect("grow the history");
+    }
+    server.batched_tick();
+    server.immediate_tick();
+    client.batched_tick();
+    client.sync_sender().take();
+    server.sync_sender().take();
+
+    // The diverged shape: a write for that row carrying no parents, on the
+    // branch rows actually live on (env + scope + user branch, composed).
+    let live_branch = crate::storage::sole_branch_name(server.storage())
+        .expect("branch registry readable")
+        .expect("the seeded rows registered a branch");
+    let parentless = crate::row_histories::StoredRowBatch::new(
+        server_row_id,
+        live_branch.as_str(),
+        Vec::<crate::row_histories::BatchId>::new(),
+        encode_row(
+            &test_schema()[&TableName::new("users")].columns,
+            &user_row_values(server_row_id, "from a diverged client"),
+        )
+        .expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 9_999),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+
+    server.storage().reset_history_scans();
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: None,
+            row: parentless,
+        },
+    });
+    server.batched_tick();
+    server.immediate_tick();
+    let history_reads = server.storage().history_scans();
+
+    eprintln!("whole-history reads for one parentless write: {history_reads}");
+    assert_eq!(
+        history_reads, 0,
+        "one parentless write cost {history_reads} reads of the row's entire history — a \
+         batch with no ancestry has nothing to resolve, and a client can send these as fast \
+         as it likes"
+    );
+}

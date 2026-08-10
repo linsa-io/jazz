@@ -340,6 +340,29 @@ impl SyncManager {
                 .then_some(parent_row);
         }
 
+        // A batch with NO parents has no ancestry to resolve. The walk below
+        // would return every visible version or nothing at all, decided purely
+        // by whether they all sit on this batch's branch — and reading the
+        // whole history is a costly way to ask that. Ask the branch question
+        // directly: the history rows on the OTHER branches. When there are
+        // none (the single-branch case) the walk's answer is `None`, and the
+        // read is skipped entirely.
+        //
+        // This is not a corner: the server classifies a write with no parents
+        // and no visible old content as an insert, so a diverged client's
+        // writes all take this path. Production 2026-08-10 — a `users` row
+        // grown to 2541 versions by presence heartbeats — paid a 2541-row read
+        // per attempt, with the runtime mutex held, in bursts of hundreds a
+        // minute.
+        if row.parents.is_empty()
+            && let Ok(Some(sole_branch)) = crate::storage::sole_branch_name(storage)
+            && sole_branch.as_str() == row.branch.as_str()
+        {
+            // Every version this row has is on the incoming batch's branch, so
+            // the walk below would disable its fallback and answer `None`.
+            return None;
+        }
+
         let history_table = row_locator
             .as_ref()
             .map(|locator| locator.table.to_string())
