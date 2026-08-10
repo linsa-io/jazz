@@ -150,6 +150,24 @@ fn main() {
             *by_reason.entry(format!("{code} | {short}")).or_default() += 1;
         }
     }
+    // When were the rejected batches born (uuid7 ms prefix)? Answers whether a
+    // denial wave predates or follows a given deploy.
+    let mut rejected_by_hour: BTreeMap<u64, usize> = BTreeMap::new();
+    for fate in &fates {
+        if matches!(fate, jazz_tools::batch_fate::BatchFate::Rejected { .. }) {
+            let bytes = fate.batch_id().0;
+            let mut ms: u64 = 0;
+            for x in &bytes[..6] {
+                ms = (ms << 8) | *x as u64;
+            }
+            *rejected_by_hour.entry(ms / 3_600_000).or_default() += 1;
+        }
+    }
+    println!("\nrejected batches by birth hour (unix-hour, UTC hour-of-day, count):");
+    for (h, n) in &rejected_by_hour {
+        println!("  {h}  {:02}:00 UTC  {n}", h % 24);
+    }
+
     println!("\nrejected fates by code|reason:");
     for (k, v) in &by_reason {
         println!("  {v:>6}  {k}");
@@ -195,6 +213,61 @@ fn main() {
     rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     for (row, n) in rows.iter().take(6) {
         println!("  {row}: {n}");
+    }
+
+    // Does this store hold the diverged user's row at all, and on which
+    // branches? Discriminates "row never accepted here" from "row exists but
+    // the writer cannot see it".
+    if let Ok(locators) = store.scan_row_locators() {
+        let needle = "6d7a605e";
+        let mut found = false;
+        for (row_id, locator) in &locators {
+            if !format!("{row_id}").starts_with(needle) {
+                continue;
+            }
+            found = true;
+            println!("\nROW {row_id} table={} ", locator.table.as_str());
+            if let Ok(history) = store.scan_history_row_batches(locator.table.as_str(), *row_id) {
+                let mut per_branch: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+                for h in &history {
+                    let e = per_branch.entry(h.branch.to_string()).or_default();
+                    e.0 += 1;
+                    if h.parents.is_empty() {
+                        e.1 += 1;
+                    }
+                }
+                println!("  history entries per branch (total, parentless): {per_branch:?}");
+                let rejected_here = history
+                    .iter()
+                    .filter(|h| rejected_ids.contains(&h.batch_id))
+                    .count();
+                println!("  of those, rejected-fate batches present: {rejected_here}");
+            }
+        }
+        if !found {
+            println!("\nROW {needle}...: NOT PRESENT in this store at all");
+        }
+        // Branch histogram across the whole store: is that device-looking
+        // branch the norm here or an outlier?
+        let mut branches: BTreeMap<String, usize> = BTreeMap::new();
+        for (row_id, locator) in &locators {
+            if let Ok(history) = store.scan_history_row_batches(locator.table.as_str(), *row_id) {
+                for h in &history {
+                    *branches.entry(h.branch.to_string()).or_default() += 1;
+                }
+            }
+        }
+        println!("\nbranches across the store (history entries each):");
+        for (b, n) in branches.iter().take(10) {
+            println!("  {b}: {n}");
+        }
+
+        // How many users rows exist here in total?
+        let users_rows = locators
+            .iter()
+            .filter(|(_, l)| l.table.as_str() == "users")
+            .count();
+        println!("users rows in store: {users_rows}");
     }
 
     println!("\nsample unsettled fates:");

@@ -376,9 +376,15 @@ impl SyncManager {
             return allow_unresolved_fallback.then_some(visible_rows);
         }
 
+        // Index by REFERENCE. The walk below needs each candidate's parents,
+        // nothing else — cloning every visible row to build this map cost one
+        // full copy of a row's history per incoming batch. On a presence row
+        // with 2541 history entries taking ~52 writes a second (production
+        // 2026-08-10), that was ~132k row clones a second, each with its own
+        // payload and parent allocations, and the runtime pinned a core doing
+        // it. Only the selected ancestors are cloned, at the end.
         let visible_rows_by_batch = visible_rows
             .iter()
-            .cloned()
             .map(|candidate| (candidate.batch_id(), candidate))
             .collect::<HashMap<_, _>>();
 

@@ -2742,11 +2742,21 @@ fn a_policy_rejected_write_costs_no_full_store_scan() {
     client.sync_sender().take();
     server.sync_sender().take();
 
-    let scans_before = server.local_batch_full_scan_count();
+    // Per-runtime scans, measured as a DELTA between two identical halves: the
+    // absolute count is not the contract (an unrelated caller may legitimately
+    // scan once), but denials themselves must buy none — before the fix this
+    // delta was one scan per denial.
+    let mut scans_before = server.local_batch_full_scan_count();
+    let mut first_half_scans = 0u64;
     let mut rejected_fates = 0usize;
 
-    // Six denied writes, the cadence of a client that keeps coming back.
-    for round in 0..6 {
+    // Twelve denied writes in two identical halves — the cadence of a client
+    // that keeps coming back.
+    for round in 0..12 {
+        if round == 6 {
+            first_half_scans = server.local_batch_full_scan_count() - scans_before;
+            scans_before = server.local_batch_full_scan_count();
+        }
         client
             .insert(
                 "documents",
@@ -2767,17 +2777,18 @@ fn a_policy_rejected_write_costs_no_full_store_scan() {
         }
     }
 
-    let scans = crate::runtime_core::LOCAL_BATCH_FULL_SCANS
-        .load(std::sync::atomic::Ordering::Relaxed)
-        - scans_before;
-    eprintln!("policy-denied writes: rejected_fates={rejected_fates} full_store_scans={scans}");
+    let second_half_scans = server.local_batch_full_scan_count() - scans_before;
+    eprintln!(
+        "policy-denied writes: rejected_fates={rejected_fates} \
+         scans_first_half={first_half_scans} scans_second_half={second_half_scans}"
+    );
     assert!(
-        rejected_fates > 0,
-        "the scenario must actually produce rejected fates, else it gates nothing"
+        rejected_fates >= 12,
+        "the scenario must produce a rejected fate per write, else it gates nothing"
     );
     assert_eq!(
-        scans, 0,
-        "six policy-denied writes cost {scans} full-store history scans — a denial must not \
-         buy O(store) work"
+        second_half_scans, 0,
+        "six more policy-denied writes cost {second_half_scans} full-store history scans — \
+         a denial must not buy O(store) work"
     );
 }
