@@ -4496,3 +4496,86 @@ fn a_local_update_onto_an_old_shelf_row_survives_its_using_policy() {
         "a non-owner's local update was approved; the decode must not loosen the decision"
     );
 }
+
+/// A SELECT policy must still see the owner's row after the schema moves on.
+///
+/// The write-side decode fix (defect 17) covered the UPDATE/DELETE arms; the
+/// SELECT arm evaluates each candidate row's content through the same
+/// authorization request, whose schema is derived from the branch when no
+/// authored hash is supplied. If that decode misreads a v1 row under the v2
+/// descriptor, the select policy quietly evaluates to invisible and the row
+/// vanishes from the owner's own query — the "empty world" through the policy
+/// door rather than the serving door.
+///
+/// Same discipline: the pre-migration half is the positive control proving
+/// the sessioned subscription channel, so the post-migration assertion can
+/// only fail for crossing reasons.
+#[test]
+fn a_select_policy_still_sees_the_owners_row_after_the_migration() {
+    let mut core = create_runtime_with_schema(owned_documents_schema_v1(), "cross-shelf-select");
+    let alice = Session::new("alice");
+    let ((row_id, _), _) = core
+        .insert(
+            "documents",
+            document_insert_values("alice", "draft"),
+            Some(&WriteContext::from_session(alice.clone())),
+        )
+        .expect("the owner's insert satisfies her own policy");
+    core.batched_tick();
+    core.immediate_tick();
+
+    // Positive control: the sessioned subscription sees the row pre-migration.
+    let sub = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .subscribe_with_session(Query::new("documents"), Some(alice.clone()), None)
+        .expect("subscription registers");
+    core.immediate_tick();
+    let pre: Vec<_> = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .get_subscription_results(sub)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        pre,
+        vec![row_id],
+        "the sessioned subscription must see the row before the migration, or the channel \
+         proves nothing"
+    );
+
+    // The deployment.
+    let storage = core.into_storage();
+    let mut core =
+        recreate_runtime_rehydrated(owned_documents_schema_v2(), "cross-shelf-select", storage);
+    let lens = crate::schema_manager::auto_lens::generate_lens(
+        &owned_documents_schema_v1(),
+        &owned_documents_schema_v2(),
+    );
+    core.publish_lens(&lens).expect("lens publishes");
+    core.immediate_tick();
+
+    // The owner's own query after the crossing.
+    let sub = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .subscribe_with_session(Query::new("documents"), Some(alice), None)
+        .expect("subscription registers");
+    core.immediate_tick();
+    core.batched_tick();
+    core.immediate_tick();
+    let post: Vec<_> = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .get_subscription_results(sub)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        post,
+        vec![row_id],
+        "the owner's row vanished from her own query after the schema moved on — the \
+         select policy cannot see the old-shelf row"
+    );
+}
