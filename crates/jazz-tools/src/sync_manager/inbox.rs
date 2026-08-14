@@ -394,17 +394,89 @@ impl SyncManager {
             .unwrap_or_else(|| table.to_string());
         let context =
             crate::storage::resolve_history_row_write_context(storage, &history_table, row).ok()?;
-        let visible_rows = storage
-            .scan_history_row_batches(&history_table, row.row_id)
+
+        // The ancestors this batch declares, fetched one by one rather than
+        // sieved out of the row's whole history. The walk below only ever
+        // reaches versions linked from `row.parents`, so the history read was
+        // fetching thousands of rows to answer a question about a handful — and
+        // when the parents are absent it fetched them to find nothing at all.
+        //
+        // Production 2026-08-14: a diverged client's writes against a `users`
+        // row that presence heartbeats had grown to thousands of versions,
+        // 23,661 refusals over 803 batches, every multi-parent one reading the
+        // whole history under the runtime mutex before being refused for absent
+        // parents. One core at 98%, the log silent for an hour.
+        let mut ancestors = Vec::new();
+        let mut seen = HashSet::new();
+        let mut frontier = row.parents.clone();
+        while let Some(batch_id) = frontier.pop() {
+            if !seen.insert(batch_id) {
+                continue;
+            }
+            let Some(candidate) = storage
+                .load_history_row_batch(&history_table, row.branch.as_str(), row.row_id, batch_id)
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            if candidate.batch_id != row.batch_id && candidate.state.is_visible() {
+                frontier.extend(candidate.parents.iter().copied());
+                ancestors.push(candidate);
+            }
+        }
+
+        // The sieve handed its rows over sorted; a depth-first pop order is not
+        // obviously equivalent for a consumer that turns out to care, and the
+        // sort costs nothing on a set this size.
+        ancestors.sort_by(|a, b| {
+            (a.branch.as_str(), a.updated_at, a.batch_id()).cmp(&(
+                b.branch.as_str(),
+                b.updated_at,
+                b.batch_id(),
+            ))
+        });
+
+        let pre_batch_rows = if ancestors.is_empty() {
+            // No declared ancestor resolves to a visible version — either the
+            // batch has no parents, or it names parents this authority does not
+            // hold, or a migrated branch dropped the link. The walk answers that
+            // case from one fact: does this row exist on another branch at all.
+            // If not, its answer is `None`, and asking directly costs a probe
+            // per branch instead of the read it used to cost.
+            if !crate::storage::row_has_history_on_another_branch(
+                storage,
+                &history_table,
+                row.row_id,
+                row.branch.as_str(),
+            )
             .ok()?
-            .into_iter()
-            .filter(|candidate| candidate.batch_id != row.batch_id && candidate.state.is_visible())
-            .collect::<Vec<_>>();
-        let only_incoming_branch = visible_rows
-            .iter()
-            .all(|candidate| candidate.branch.as_str() == row.branch.as_str());
-        let pre_batch_rows =
-            Self::history_rows_visible_before_batch(row, visible_rows, !only_incoming_branch)?;
+            {
+                return None;
+            }
+            let visible_rows = storage
+                .scan_history_row_batches(&history_table, row.row_id)
+                .ok()?
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.batch_id != row.batch_id && candidate.state.is_visible()
+                })
+                .collect::<Vec<_>>();
+            // Recomputed, not assumed. The probe above asks whether ANY history
+            // row sits on another branch; this asks whether any VISIBLE one
+            // does, which is the question the answer actually turns on. They
+            // differ exactly when another branch holds only rejected,
+            // superseded or staged versions — and passing `true` there would
+            // hand the policy check an `old_content` of `Some(...)` where this
+            // function used to answer `None`, turning an insert into an update.
+            // The probe is a cost optimisation; it must not become an input.
+            let only_incoming_branch = visible_rows
+                .iter()
+                .all(|candidate| candidate.branch.as_str() == row.branch.as_str());
+            Self::history_rows_visible_before_batch(row, visible_rows, !only_incoming_branch)?
+        } else {
+            ancestors
+        };
 
         crate::row_histories::visible_row_preview_from_history_rows(
             context.user_descriptor().as_ref(),

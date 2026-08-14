@@ -977,6 +977,22 @@ pub(crate) fn sole_branch_name<H: Storage + ?Sized>(
     storage.load_branch_name_by_ord(1)
 }
 
+/// Does this row have history on a branch other than `incoming_branch`?
+///
+/// A thin pass-through to `Storage::row_has_history_outside_branch`, kept as a
+/// named function because the caller reads better for it and because an earlier
+/// version answered this from the branch-ord registry — which is written by seal
+/// persistence, not by history application, so it missed branches that only ever
+/// had rows written on them.
+pub(crate) fn row_has_history_on_another_branch<H: Storage + ?Sized>(
+    storage: &H,
+    history_table: &str,
+    row_id: ObjectId,
+    incoming_branch: &str,
+) -> Result<bool, StorageError> {
+    storage.row_has_history_outside_branch(history_table, row_id, incoming_branch)
+}
+
 fn load_next_branch_ord<H: Storage + ?Sized>(storage: &H) -> Result<BranchOrd, StorageError> {
     match storage.raw_table_get(BRANCH_ORD_META_TABLE, BRANCH_ORD_NEXT_ORD_KEY)? {
         Some(bytes) => {

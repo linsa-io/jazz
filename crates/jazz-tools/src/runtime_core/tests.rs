@@ -3053,3 +3053,319 @@ fn the_registration_a_handshake_uses_re_arms_the_missing_answers() {
          place; silence that survives a reconnect is not a deferral, it is a loss"
     );
 }
+
+/// A second branch in the store must not put every parentless write back on the
+/// whole-history read.
+///
+/// The parentless fast path asks `sole_branch_name`, which answers only when the
+/// registry holds exactly one branch. That was written as the cheap way to ask
+/// "does this row live anywhere but here", and it is exact — for a store that
+/// never grew a second branch. Production 2026-08-14: a second branch appeared,
+/// `sole_branch_name` went quiet for the whole store, and a diverged client's
+/// writes went back to reading a `users` row's entire history — 21,960 refused
+/// attempts against one row, one core pinned, the log silent for an hour.
+///
+/// The question the walk actually answers for a parentless row is per-ROW, not
+/// per-store: does THIS row have a version on some other branch? History keys
+/// are `<row_id>:<branch>:<batch_id>`, so that is an existence probe per
+/// registered branch — a handful of point reads — not a walk of one row's
+/// thousands of versions.
+#[test]
+fn a_parentless_write_does_not_read_the_whole_row_history_when_the_store_has_two_branches() {
+    let schema = test_schema();
+    let mut server = create_runtime_with_schema(schema, "parentless-two-branch-cost");
+    let client_id = ClientId::new();
+    server.add_client(client_id, Some(Session::new("writer")));
+
+    // One row, many versions — a presence row's shape.
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut server,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("v0".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row");
+    for version in 1..40 {
+        server
+            .update(
+                server_row_id,
+                vec![("name".to_string(), Value::Text(format!("v{version}")))],
+                None,
+            )
+            .expect("grow the history");
+    }
+    server.batched_tick();
+    server.immediate_tick();
+
+    let live_branch = crate::storage::sole_branch_name(server.storage())
+        .expect("branch registry readable")
+        .expect("the seeded rows registered a branch");
+
+    // A second branch enters the store — another app scope, an environment, a
+    // branch someone opened once. It has nothing to do with the row above.
+    let other_branch = BranchName::new("dev-ffffffffffff-main");
+    assert_ne!(other_branch.as_str(), live_branch.as_str());
+    server
+        .storage_mut()
+        .resolve_or_alloc_branch_ord(other_branch)
+        .expect("register a second branch, as sealing a batch on one does");
+
+    // The precondition, asserted rather than assumed: with two branches
+    // registered the store-wide question can no longer be answered, which is
+    // exactly the state production was in.
+    assert!(
+        crate::storage::sole_branch_name(server.storage())
+            .expect("branch registry readable")
+            .is_none(),
+        "the store must hold more than one branch, or this gate measures the single-branch \
+         path that is already fast"
+    );
+
+    // The diverged shape: a write for the long-history row carrying no parents.
+    let parentless = crate::row_histories::StoredRowBatch::new(
+        server_row_id,
+        live_branch.as_str(),
+        Vec::<crate::row_histories::BatchId>::new(),
+        encode_row(
+            &test_schema()[&TableName::new("users")].columns,
+            &user_row_values(server_row_id, "from a diverged client"),
+        )
+        .expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 9_999),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+
+    server.storage().reset_history_scans();
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: None,
+            row: parentless,
+        },
+    });
+    server.batched_tick();
+    server.immediate_tick();
+    let history_reads = server.storage().history_scans();
+
+    eprintln!("whole-history reads with a second branch present: {history_reads}");
+    assert_eq!(
+        history_reads, 0,
+        "one parentless write cost {history_reads} reads of the row's entire history because \
+         some unrelated branch exists; the row itself lives on one branch, and a client can \
+         send these as fast as it likes"
+    );
+}
+
+/// The cheap answer must stay the true answer.
+///
+/// The gate above would also pass if the parentless path simply returned `None`
+/// and stopped asking. It must not: when the row genuinely has versions on
+/// another branch, the walk is what resolves what was visible before the batch,
+/// and skipping it would hand the permission check a wrong `old_content`.
+#[test]
+fn a_parentless_write_still_resolves_a_row_that_spans_branches() {
+    let schema = test_schema();
+    let mut server = create_runtime_with_schema(schema, "parentless-spanning-row");
+    let client_id = ClientId::new();
+    server.add_client(client_id, Some(Session::new("writer")));
+
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut server,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("v0".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row");
+    server.batched_tick();
+    server.immediate_tick();
+
+    let live_branch = crate::storage::sole_branch_name(server.storage())
+        .expect("branch registry readable")
+        .expect("the seeded row registered a branch");
+
+    // THIS row also exists on another branch.
+    let other_branch = BranchName::new("dev-ffffffffffff-main");
+    server
+        .storage_mut()
+        .resolve_or_alloc_branch_ord(other_branch)
+        .expect("register the other branch");
+    server
+        .storage_mut()
+        .append_history_region_rows(
+            "users",
+            std::slice::from_ref(&crate::row_histories::StoredRowBatch::new(
+                server_row_id,
+                other_branch.as_str(),
+                Vec::<crate::row_histories::BatchId>::new(),
+                encode_row(
+                    &test_schema()[&TableName::new("users")].columns,
+                    &user_row_values(server_row_id, "the same row, elsewhere"),
+                )
+                .expect("row encodes"),
+                crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 2_000),
+                HashMap::new(),
+                crate::row_histories::RowState::VisibleDirect,
+                None,
+            )),
+        )
+        .expect("the row also has a version on the other branch");
+
+    let parentless = crate::row_histories::StoredRowBatch::new(
+        server_row_id,
+        live_branch.as_str(),
+        Vec::<crate::row_histories::BatchId>::new(),
+        encode_row(
+            &test_schema()[&TableName::new("users")].columns,
+            &user_row_values(server_row_id, "from a diverged client"),
+        )
+        .expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 9_999),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+
+    server.storage().reset_history_scans();
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: None,
+            row: parentless,
+        },
+    });
+    server.batched_tick();
+    server.immediate_tick();
+
+    assert!(
+        server.storage().history_scans() > 0,
+        "a row that really does span branches must still be resolved by the walk; answering \
+         `None` without asking would feed the permission check a wrong previous value"
+    );
+}
+
+/// A batch whose parents this authority does not hold must cost nothing to refuse.
+///
+/// `apply_row_batch` refuses such a batch with `ParentNotFound` — it checks every
+/// declared parent by point lookup and the sync path always checks (the
+/// known-new escape asserts an empty parent list). Nothing the policy decides
+/// can change that outcome. Yet the inbox pays for the policy check's inputs
+/// first: `pre_batch_visible_row`, which for a row with two or more parents has
+/// no fast path at all and reads the row's ENTIRE history, and then the policy
+/// check itself.
+///
+/// Production 2026-08-14: one diverged client, 21,960 refusals against a single
+/// `users` row grown to thousands of versions by presence heartbeats, its
+/// declared parent count climbing with every retry (1337 at `parents=1`, then
+/// 805, 697, 574, 477, 394 at two through six). Every one of the multi-parent
+/// attempts read the whole history, under the runtime mutex, before being
+/// refused for a reason two point lookups would have given. One core pinned at
+/// 98%, the log silent for an hour.
+#[test]
+fn a_write_whose_parents_are_missing_costs_no_history_read() {
+    let schema = test_schema();
+    let mut server = create_runtime_with_schema(schema, "missing-parent-cost");
+    let client_id = ClientId::new();
+    server.add_client(client_id, Some(Session::new("writer")));
+
+    // One row, many versions — a presence row's shape.
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut server,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("v0".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row");
+    for version in 1..40 {
+        server
+            .update(
+                server_row_id,
+                vec![("name".to_string(), Value::Text(format!("v{version}")))],
+                None,
+            )
+            .expect("grow the history");
+    }
+    server.batched_tick();
+    server.immediate_tick();
+    let live_branch = crate::storage::sole_branch_name(server.storage())
+        .expect("branch registry readable")
+        .expect("the seeded rows registered a branch");
+    let last_seeded_batch_id = server
+        .storage()
+        .load_visible_region_row("users", live_branch.as_str(), server_row_id)
+        .expect("visible row readable")
+        .expect("the seeded row is visible")
+        .batch_id();
+    server.sync_sender().take();
+
+    // The diverged shape: two parents, neither of which this authority holds.
+    // Two rather than one because a single parent already takes a point lookup;
+    // the population that hurt production declared two and more.
+    let orphaned = crate::row_histories::StoredRowBatch::new(
+        server_row_id,
+        live_branch.as_str(),
+        vec![
+            crate::row_histories::BatchId::new(),
+            crate::row_histories::BatchId::new(),
+        ],
+        encode_row(
+            &test_schema()[&TableName::new("users")].columns,
+            &user_row_values(server_row_id, "from a diverged client"),
+        )
+        .expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 9_999),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+
+    server.storage().reset_history_scans();
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: None,
+            row: orphaned,
+        },
+    });
+    server.batched_tick();
+    server.immediate_tick();
+    let history_reads = server.storage().history_scans();
+
+    eprintln!("whole-history reads for one unappliable write: {history_reads}");
+    assert_eq!(
+        history_reads, 0,
+        "one write with absent parents cost {history_reads} reads of the row's entire \
+         history before refusing it; the refusal was decided by the parents alone, and a \
+         client can send these as fast as it likes"
+    );
+
+    // The refusal itself must not change: same outcome, reached cheaper. The
+    // seeded row's last version is what stays visible — an unappliable write
+    // must not have been applied along the way.
+    let visible = server
+        .storage()
+        .load_visible_region_row("users", live_branch.as_str(), server_row_id)
+        .expect("visible row readable")
+        .expect("the seeded row stays visible");
+    assert_eq!(
+        visible.batch_id(),
+        last_seeded_batch_id,
+        "the refused write must not have become the visible row"
+    );
+}

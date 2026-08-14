@@ -242,6 +242,58 @@ pub trait Storage {
             .map(|rows| rows.into_iter().map(|(key, _)| key).collect())
     }
 
+    /// Does this row have history on any branch other than `branch`?
+    ///
+    /// The question a write asks instead of reading the row's whole history: the
+    /// walk it replaces keeps its candidates only when some version sits
+    /// elsewhere. Asked of the row, not of a branch list — the branch-ord
+    /// registry is written by seal and local-batch-record persistence, not by
+    /// history application, so a branch can carry a row's versions without ever
+    /// being registered, and enumerating the registry answers "nowhere else" for
+    /// a row that does live elsewhere.
+    ///
+    /// The default is correct on every backend and no cheaper than the walk; a
+    /// backend that can seek should override it, since history keys are
+    /// `<row_id>:<branch>:<batch_id>` and a row's keys are contiguous, grouped by
+    /// branch — two seeks, not a walk.
+    ///
+    /// It lives on the trait rather than being assembled from `raw_table_*` at
+    /// the call site because history rows are raw-table keys in some backends and
+    /// a separate structure in others, and a raw-key probe answers "nowhere else"
+    /// wherever the rows are kept elsewhere.
+    fn row_has_history_outside_branch(
+        &self,
+        table: &str,
+        row_id: ObjectId,
+        branch: &str,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .scan_history_row_batches(table, row_id)?
+            .into_iter()
+            .any(|candidate| candidate.branch.as_str() != branch))
+    }
+
+    /// The first key under `prefix`, or `None` when the prefix is empty.
+    ///
+    /// An existence question, asked without materialising the answer set. The
+    /// default is correct on every backend and no faster than a keys scan; a
+    /// backend that can seek should override it, because the callers are the
+    /// ones replacing whole-history reads and would otherwise trade one
+    /// unbounded read for another.
+    ///
+    /// Returns the key rather than a bool: it costs nothing and the callers
+    /// that want to log what they found do not have to ask twice.
+    fn raw_table_first_key_with_prefix(
+        &self,
+        table: &str,
+        prefix: &str,
+    ) -> Result<Option<String>, StorageError> {
+        Ok(self
+            .raw_table_scan_prefix_keys(table, prefix)?
+            .into_iter()
+            .next())
+    }
+
     fn raw_table_scan_range_keys(
         &self,
         table: &str,
@@ -1868,6 +1920,23 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         prefix: &str,
     ) -> Result<RawTableKeys, StorageError> {
         (**self).raw_table_scan_prefix_keys(table, prefix)
+    }
+
+    fn raw_table_first_key_with_prefix(
+        &self,
+        table: &str,
+        prefix: &str,
+    ) -> Result<Option<String>, StorageError> {
+        (**self).raw_table_first_key_with_prefix(table, prefix)
+    }
+
+    fn row_has_history_outside_branch(
+        &self,
+        table: &str,
+        row_id: ObjectId,
+        branch: &str,
+    ) -> Result<bool, StorageError> {
+        (**self).row_has_history_outside_branch(table, row_id, branch)
     }
 
     fn raw_table_scan_range(

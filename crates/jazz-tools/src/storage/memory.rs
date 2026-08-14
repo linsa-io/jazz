@@ -1069,6 +1069,23 @@ impl Storage for MemoryStorage {
         Ok(rows)
     }
 
+    fn row_has_history_outside_branch(
+        &self,
+        table: &str,
+        row_id: ObjectId,
+        branch: &str,
+    ) -> Result<bool, StorageError> {
+        let Some(regions) = self.row_histories.get(table) else {
+            return Ok(false);
+        };
+        Ok(regions
+            .history
+            .get(&row_id)
+            .into_iter()
+            .flat_map(|inner| inner.values())
+            .any(|candidate| candidate.branch.as_str() != branch))
+    }
+
     fn load_history_row_batch_bytes(
         &self,
         table: &str,

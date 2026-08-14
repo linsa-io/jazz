@@ -36,6 +36,11 @@ struct RocksDBInner {
 pub struct RocksDBStorage {
     cache_namespace: usize,
     inner: RefCell<Option<RocksDBInner>>,
+    /// Prefix scans issued against the store. A whole-history read is one of
+    /// these; the existence probe that replaced it is a seek. A gate can pin
+    /// that the probe's cost does not track how deep the history is.
+    #[cfg(test)]
+    prefix_scans: std::cell::Cell<usize>,
 }
 
 impl RocksDBStorage {
@@ -95,6 +100,8 @@ impl RocksDBStorage {
 
         Ok(Self {
             cache_namespace: super::next_storage_cache_namespace(),
+            #[cfg(test)]
+            prefix_scans: std::cell::Cell::new(0),
             inner: RefCell::new(Some(RocksDBInner {
                 db,
                 ensured_raw_table_headers: HashSet::new(),
@@ -169,6 +176,66 @@ impl RocksDBStorage {
             out.push((key_str, value.to_vec()));
         }
         Ok(out)
+    }
+
+    /// The first key under `prefix`, without reading the rest.
+    ///
+    /// Same seek as the prefix scan, stopped after one step. The callers use it
+    /// to ask whether anything exists, and they are the ones replacing reads of
+    /// a row's whole history — materialising the answer set instead would trade
+    /// one unbounded read for another.
+    /// Is there a key for this row past the end of `branch_prefix`?
+    ///
+    /// One seek to the successor of the branch range, bounded by the end of the
+    /// row's range, so it stops at the first key rather than reading the rest.
+    fn first_row_key_after_branch(
+        &self,
+        table: &str,
+        row_prefix: &str,
+        branch_prefix: &str,
+    ) -> Result<bool, StorageError> {
+        let Some(after_branch) = Self::prefix_upper_bound(branch_prefix.as_bytes()) else {
+            return Ok(false);
+        };
+        let Ok(after_branch) = String::from_utf8(after_branch) else {
+            // The successor is not valid utf8, so it cannot be compared against
+            // the string keys this store uses. Fall back to the honest answer.
+            return Ok(self
+                .raw_table_scan_prefix_keys(table, row_prefix)?
+                .into_iter()
+                .any(|key| !key.starts_with(branch_prefix)));
+        };
+        let end = Self::prefix_upper_bound(row_prefix.as_bytes())
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        Ok(self
+            .raw_table_scan_range_keys(table, Some(&after_branch), end.as_deref())?
+            .into_iter()
+            .any(|key| key.starts_with(row_prefix)))
+    }
+
+    fn first_key_with_prefix_from_db(
+        db: &TransactionDB,
+        prefix: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        if let Some(ub) = Self::prefix_upper_bound(prefix_bytes) {
+            read_opts.set_iterate_upper_bound(ub);
+        }
+        let mut iter = db.iterator_opt(
+            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
+        match iter.next() {
+            None => Ok(None),
+            Some(item) => {
+                let (key, _) =
+                    item.map_err(|e| StorageError::IoError(format!("rocksdb iter: {e}")))?;
+                let key_str = String::from_utf8(key.to_vec())
+                    .map_err(|e| StorageError::IoError(format!("rocksdb key is not utf8: {e}")))?;
+                Ok(key_str.starts_with(prefix).then_some(key_str))
+            }
+        }
     }
 
     fn scan_prefix_keys_from_db(
@@ -398,6 +465,8 @@ impl Storage for RocksDBStorage {
         table: &str,
         prefix: &str,
     ) -> Result<super::RawTableRows, StorageError> {
+        #[cfg(test)]
+        self.prefix_scans.set(self.prefix_scans.get() + 1);
         self.with_inner(|inner| {
             raw_table_scan_prefix_core(table, prefix, |storage_prefix| {
                 Self::scan_prefix_from_db(&inner.db, storage_prefix)
@@ -410,11 +479,66 @@ impl Storage for RocksDBStorage {
         table: &str,
         prefix: &str,
     ) -> Result<super::RawTableKeys, StorageError> {
+        #[cfg(test)]
+        self.prefix_scans.set(self.prefix_scans.get() + 1);
         self.with_inner(|inner| {
             raw_table_scan_prefix_keys_core(table, prefix, |storage_prefix| {
                 Self::scan_prefix_keys_from_db(&inner.db, storage_prefix)
             })
         })
+    }
+
+    fn raw_table_first_key_with_prefix(
+        &self,
+        table: &str,
+        prefix: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.with_inner(|inner| {
+            raw_table_scan_prefix_keys_core(table, prefix, |storage_prefix| {
+                Ok(
+                    Self::first_key_with_prefix_from_db(&inner.db, storage_prefix)?
+                        .into_iter()
+                        .collect(),
+                )
+            })
+        })
+        .map(|keys| keys.into_iter().next())
+    }
+
+    /// Answered by two seeks, never a walk.
+    ///
+    /// History keys are `<row_id>:<branch>:<batch_id>`, so a row's versions are
+    /// contiguous and grouped by branch. The first key under `<row_id>:` settles
+    /// it when it belongs to another branch; otherwise one seek past the end of
+    /// this branch's range says whether anything of this row remains. Walking
+    /// forward from the first key instead would step through every version on the
+    /// incoming branch — thousands, for the row this exists to stop reading.
+    ///
+    /// Every schema-hash table of the logical table is asked: a row's versions
+    /// from before a schema deployment live under the older one.
+    fn row_has_history_outside_branch(
+        &self,
+        table: &str,
+        row_id: ObjectId,
+        branch: &str,
+    ) -> Result<bool, StorageError> {
+        let row_prefix = super::key_codec::history_row_raw_table_prefix(Some(row_id));
+        let branch_prefix = super::key_codec::history_row_raw_table_branch_prefix(row_id, branch);
+        for resolved in
+            super::resolved_row_tables_for_table(self, super::RowRawTableKind::History, table)?
+        {
+            let raw_table = resolved.row_raw_table.as_str();
+            let Some(first) = self.raw_table_first_key_with_prefix(raw_table, &row_prefix)? else {
+                continue;
+            };
+            if !first.starts_with(&branch_prefix) {
+                return Ok(true);
+            }
+            if self.first_row_key_after_branch(raw_table, &row_prefix, &branch_prefix)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn raw_table_scan_range(

@@ -1479,6 +1479,21 @@ macro_rules! storage_conformance_tests {
             }
 
             #[test]
+            fn raw_table_first_key_with_prefix() {
+                conformance::test_raw_table_first_key_with_prefix(&$factory);
+            }
+
+            #[test]
+            fn row_has_history_outside_branch() {
+                conformance::test_history_row_exists_on_branch(&$factory);
+            }
+
+            #[test]
+            fn history_row_exists_on_an_unregistered_branch() {
+                conformance::test_history_row_exists_on_an_unregistered_branch(&$factory);
+            }
+
+            #[test]
             fn raw_table_scan_range() {
                 conformance::test_raw_table_scan_range(&$factory);
             }
@@ -1672,4 +1687,134 @@ macro_rules! storage_conformance_tests_persistent {
             }
         }
     };
+}
+
+/// A backend that seeks must find exactly what a backend that scans finds.
+///
+/// `raw_table_first_key_with_prefix` has a correct-everywhere default and a seek
+/// override where the backend can do better. The two disagreeing is the failure
+/// mode that only production notices, because the callers use it to decide
+/// whether to read a row's whole history at all.
+pub fn test_raw_table_first_key_with_prefix(factory: &dyn Fn() -> Box<dyn Storage>) {
+    let mut storage = factory();
+    storage.raw_table_put("users", "alice/1", b"a").unwrap();
+    storage.raw_table_put("users", "alice/2", b"b").unwrap();
+    storage.raw_table_put("users", "bob/1", b"c").unwrap();
+
+    for prefix in ["alice/", "bob/", "carol/", "alice/1", ""] {
+        let sought = storage
+            .raw_table_first_key_with_prefix("users", prefix)
+            .unwrap();
+        let scanned = storage
+            .raw_table_scan_prefix_keys("users", prefix)
+            .unwrap()
+            .into_iter()
+            .next();
+        assert_eq!(
+            sought, scanned,
+            "seeking and scanning disagree on the first key under {prefix:?}"
+        );
+    }
+}
+
+/// The branch question must have one answer, whatever the backend.
+///
+/// `history_row_exists_on_branch` is what a write asks instead of reading a
+/// row's whole history, and backends answer it differently — from their own
+/// index, or by seeking history keys, or by the scanning default. A backend that
+/// answers "no" where the rows are kept somewhere it did not look sends the
+/// caller down the cheap path with the wrong answer, and only production
+/// notices.
+pub fn test_history_row_exists_on_branch(factory: &dyn Fn() -> Box<dyn Storage>) {
+    let mut storage = factory();
+    let schema_hash = seed_row_history_table(storage.as_mut(), "users");
+    let row_id = ObjectId::new();
+    seed_row_history_locator(storage.as_mut(), "users", row_id, schema_hash);
+
+    let main = make_row_batch(row_id, "dev/main", 10, "alice");
+    storage
+        .append_history_region_rows("users", std::slice::from_ref(&main))
+        .unwrap();
+
+    assert!(
+        storage
+            .row_has_history_outside_branch("users", row_id, "dev/draft")
+            .unwrap(),
+        "the branch the row was written on must be seen from another one"
+    );
+    assert!(
+        !storage
+            .row_has_history_outside_branch("users", row_id, "dev/main")
+            .unwrap(),
+        "with every version on this branch there is nothing outside it"
+    );
+    assert!(
+        !storage
+            .row_has_history_outside_branch("users", ObjectId::new(), "dev/main")
+            .unwrap(),
+        "another row's versions must not answer for this one"
+    );
+
+    let draft = make_row_batch(row_id, "dev/draft", 20, "alice draft");
+    storage
+        .append_history_region_rows("users", std::slice::from_ref(&draft))
+        .unwrap();
+    assert!(
+        storage
+            .row_has_history_outside_branch("users", row_id, "dev/main")
+            .unwrap(),
+        "a version added on another branch must be found from this one"
+    );
+
+    // The answer must match the one the scanning default would give.
+    for branch in ["dev/main", "dev/draft", "dev/nowhere"] {
+        let scanned = storage
+            .scan_history_row_batches("users", row_id)
+            .unwrap()
+            .into_iter()
+            .any(|candidate| candidate.branch.as_str() != branch);
+        assert_eq!(
+            storage
+                .row_has_history_outside_branch("users", row_id, branch)
+                .unwrap(),
+            scanned,
+            "the fast answer and the scan disagree about what lies outside {branch}"
+        );
+    }
+}
+
+/// A branch that only ever had history written on it must still be found.
+///
+/// The probe enumerates the branch-ord registry, and the registry is written by
+/// seal and local-batch-record persistence — not by history application. If a
+/// branch can carry a row's versions without ever being registered, the probe
+/// answers "nowhere else" for a row that does live elsewhere, and its caller
+/// takes the cheap path with the wrong answer. That is the one direction that
+/// changes an answer rather than a cost, so it is pinned here rather than
+/// assumed.
+pub fn test_history_row_exists_on_an_unregistered_branch(factory: &dyn Fn() -> Box<dyn Storage>) {
+    let mut storage = factory();
+    let schema_hash = seed_row_history_table(storage.as_mut(), "users");
+    let row_id = ObjectId::new();
+    seed_row_history_locator(storage.as_mut(), "users", row_id, schema_hash);
+
+    // Written straight into history: no seal, no local batch record, so nothing
+    // has taken a branch ord for it.
+    let stray = make_row_batch(row_id, "dev/never-sealed", 30, "alice elsewhere");
+    storage
+        .append_history_region_rows("users", std::slice::from_ref(&stray))
+        .unwrap();
+
+    assert!(
+        storage
+            .row_has_history_outside_branch("users", row_id, "dev/main")
+            .unwrap(),
+        "a branch that only ever had history written on it must still be seen from another"
+    );
+    assert!(
+        crate::storage::row_has_history_on_another_branch(&storage, "users", row_id, "dev/main",)
+            .unwrap(),
+        "the row does live on another branch; answering otherwise sends the caller down the \
+         cheap path with the wrong answer"
+    );
 }
