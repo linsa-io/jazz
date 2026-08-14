@@ -4247,3 +4247,100 @@ fn a_client_write_racing_delivery_recovers_once_the_delivery_lands() {
              leave the object unusable",
         );
 }
+
+/// The cold-store race on the backend the field actually runs.
+///
+/// The engine-level race gate is green on the memory backend; the simulator's
+/// poisoning — a failed racing write leaving the row unusable — was observed on
+/// SQLITE, through the jazz-rn pipeline. This is the same scenario over
+/// `SqliteStorage`: if it stays green, the backend is exonerated too and the
+/// remaining suspects are the jazz-rn actor pipeline and the binding's error
+/// propagation; if it goes red, the backend is the address.
+#[test]
+#[cfg(feature = "sqlite")]
+fn a_client_write_racing_delivery_recovers_on_sqlite_too() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let schema = test_schema();
+    let mut server = create_runtime_with_schema(schema.clone(), "cold-store-race-sqlite");
+    let client_storage: Box<dyn Storage> = Box::new(
+        crate::storage::SqliteStorage::open(&temp_dir.path().join("client.sqlite"))
+            .expect("open sqlite client store"),
+    );
+    let app_id = AppId::from_name("cold-store-race-sqlite");
+    let client_manager =
+        SchemaManager::new(SyncManager::new(), test_schema(), app_id, "dev", "main").unwrap();
+    let mut client = new_test_core(client_manager, client_storage, NoopScheduler);
+    client.immediate_tick();
+
+    let client_id = ClientId::new();
+    let server_id = ServerId::new();
+    server.add_client(client_id, Some(Session::new("writer")));
+    client.add_server(server_id);
+
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut server,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("v0".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row");
+    server.batched_tick();
+    server.immediate_tick();
+
+    let delivered = server
+        .storage()
+        .load_visible_region_row(
+            "users",
+            crate::storage::sole_branch_name(server.storage())
+                .expect("registry readable")
+                .expect("branch registered")
+                .as_str(),
+            server_row_id,
+        )
+        .expect("visible row readable")
+        .expect("the seeded row is visible");
+    client.park_sync_message(InboxEntry {
+        source: Source::Server(server_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: Some(crate::sync_manager::RowMetadata {
+                id: server_row_id,
+                metadata: HashMap::from([(
+                    crate::metadata::MetadataKey::Table.as_str().to_string(),
+                    "users".to_string(),
+                )]),
+            }),
+            row: delivered,
+        },
+    });
+
+    let raced = client.update(
+        server_row_id,
+        vec![("name".to_string(), Value::Text("raced".to_string()))],
+        None,
+    );
+    eprintln!("racing write on sqlite: {:?}", raced.as_ref().map(|_| ()));
+
+    client.batched_tick();
+    client.immediate_tick();
+    client.batched_tick();
+    client.immediate_tick();
+
+    client
+        .update(
+            server_row_id,
+            vec![(
+                "name".to_string(),
+                Value::Text("after delivery".to_string()),
+            )],
+            None,
+        )
+        .expect(
+            "the retry after the delivery landed must apply on sqlite; a failed racing \
+             write must not leave the object unusable",
+        );
+}
