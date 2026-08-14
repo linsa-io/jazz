@@ -623,12 +623,13 @@ The sqlite twin of the gate
 the backend the field actually runs fails the race cleanly and recovers. The
 suspects are down to two — the jazz-rn actor pipeline and the binding's error
 propagation — and the next gate has to live in `crates/jazz-rn/rust`, where
-the actor harness already is. The client-side twin of defect 17 is also on
-this list as a config-gated hypothesis: the local write path evaluates its
-USING policy over old content with `content_schema_hash: None`
-(`query_manager/writes.rs`, the update USING arm), but only when a DISTINCT
-authorization schema is set (`set_authorization_schema`); the harness recipe
-for reaching it is in `runtime_core/tests/authz_cache_runtime.rs`.
+the actor harness already is. The client-side twin of defect 17 was
+hypothesised here and is now TESTED AND BURIED: with a presence gate proving
+the explicit-auth USING arm is reached (an impossible policy denies even the
+owner), the cross-shelf local update survives — the local path hands the
+evaluation already-projected bytes, or the discriminating fixture would have
+denied it. Gates: `the_explicit_auth_using_arm_is_reachable`,
+`a_local_update_onto_an_old_shelf_row_survives_its_using_policy`.
 
 ---
 

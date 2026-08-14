@@ -3816,6 +3816,52 @@ fn serving_agrees_with_the_local_query_for_a_filtered_cross_shelf_query() {
     );
 }
 
+/// Policy-free structural twins of the owned-documents schemas: the explicit
+/// authorization path runs only when the AUTH schema differs from the runtime
+/// schema, so the runtime carries these and the policy-bearing pair rides as
+/// the authorization schema.
+fn owned_documents_structural_v1() -> Schema {
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("documents")
+                .column("owner_id", ColumnType::Text)
+                .column("title", ColumnType::Text),
+        )
+        .build()
+}
+
+fn owned_documents_structural_v2() -> Schema {
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("documents")
+                .column("owner_id", ColumnType::Text)
+                .column("title", ColumnType::Text)
+                .column("note", ColumnType::Text),
+        )
+        .build()
+}
+
+/// A USING policy nobody satisfies, for proving the arm actually runs.
+fn owned_documents_auth_denying_everyone() -> Schema {
+    let policies = TablePolicies::new()
+        .with_insert(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]))
+        .with_update(
+            Some(PolicyExpr::eq_session(
+                "owner_id",
+                vec!["nonexistent_claim".into()],
+            )),
+            PolicyExpr::eq_session("owner_id", vec!["nonexistent_claim".into()]),
+        );
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("documents")
+                .column("owner_id", ColumnType::Text)
+                .column("title", ColumnType::Text)
+                .policies(policies),
+        )
+        .build()
+}
+
 /// v1 of the update-policy world: documents owned via session, with an
 /// explicit UPDATE policy whose USING half reads the OLD row.
 fn owned_documents_schema_v1() -> Schema {
@@ -4343,4 +4389,110 @@ fn a_client_write_racing_delivery_recovers_on_sqlite_too() {
             "the retry after the delivery landed must apply on sqlite; a failed racing \
              write must not leave the object unusable",
         );
+}
+
+/// Presence proof for the explicit-auth USING arm: with a policy nobody
+/// satisfies, even the owner's same-shelf update must be denied. Without this,
+/// the twin gate below could go green with the arm never running — which is
+/// exactly what its first version did (the auth schema equalled the runtime
+/// schema, and the explicit path requires them to DIFFER).
+#[test]
+fn the_explicit_auth_using_arm_is_reachable() {
+    let mut core =
+        create_runtime_with_schema(owned_documents_structural_v1(), "local-using-presence");
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(owned_documents_auth_denying_everyone());
+    let alice = Session::new("alice");
+    let ((row_id, _), _) = core
+        .insert(
+            "documents",
+            document_insert_values("alice", "draft"),
+            Some(&WriteContext::from_session(alice.clone())),
+        )
+        .expect("the permissive insert policy admits the owner");
+    core.batched_tick();
+    core.immediate_tick();
+    let denied = core.update(
+        row_id,
+        vec![("title".to_string(), Value::Text("nope".to_string()))],
+        Some(&WriteContext::from_session(alice)),
+    );
+    assert!(
+        denied.is_err(),
+        "a USING policy nobody satisfies approved an update; the explicit-auth arm is not \
+         being reached and nothing downstream of it can be tested"
+    );
+}
+
+/// The client-side twin of the USING decode: the LOCAL write path, explicit
+/// authorization schema set, old content on the previous schema's shelf.
+///
+/// The local update path evaluates `update_using_policy` over the OLD row via
+/// an `AuthorizationPolicyRequest` that passes `content_schema_hash: None` —
+/// the same branch-keyed decode the server-side fix removed. It runs only when
+/// the authorization schema DIFFERS from the runtime schema; the presence gate
+/// above proves this harness reaches it.
+#[test]
+fn a_local_update_onto_an_old_shelf_row_survives_its_using_policy() {
+    let mut core =
+        create_runtime_with_schema(owned_documents_structural_v1(), "local-cross-shelf-using");
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(owned_documents_schema_v1());
+    let alice = Session::new("alice");
+
+    let ((row_id, _), _) = core
+        .insert(
+            "documents",
+            document_insert_values("alice", "draft"),
+            Some(&WriteContext::from_session(alice.clone())),
+        )
+        .expect("the owner's insert satisfies her own policy");
+    core.batched_tick();
+    core.immediate_tick();
+
+    // Positive control: same shelf, through the explicit-auth path.
+    core.update(
+        row_id,
+        vec![("title".to_string(), Value::Text("same-shelf".to_string()))],
+        Some(&WriteContext::from_session(alice.clone())),
+    )
+    .expect("the same-shelf control update must pass, or the channel proves nothing");
+
+    // The deployment.
+    let storage = core.into_storage();
+    let mut core = recreate_runtime_rehydrated(
+        owned_documents_structural_v2(),
+        "local-cross-shelf-using",
+        storage,
+    );
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(owned_documents_schema_v2());
+    let lens = crate::schema_manager::auto_lens::generate_lens(
+        &owned_documents_structural_v1(),
+        &owned_documents_structural_v2(),
+    );
+    core.publish_lens(&lens).expect("lens publishes");
+    core.immediate_tick();
+
+    // The crossing, locally.
+    core.update(
+        row_id,
+        vec![("title".to_string(), Value::Text("cross-shelf".to_string()))],
+        Some(&WriteContext::from_session(alice.clone())),
+    )
+    .expect("the owner's LOCAL update after the schema moved on must survive its own policy");
+
+    // Negative control: a non-owner's local update must stay denied.
+    let denied = core.update(
+        row_id,
+        vec![("title".to_string(), Value::Text("stolen".to_string()))],
+        Some(&WriteContext::from_session(Session::new("mallory"))),
+    );
+    assert!(
+        denied.is_err(),
+        "a non-owner's local update was approved; the decode must not loosen the decision"
+    );
 }
