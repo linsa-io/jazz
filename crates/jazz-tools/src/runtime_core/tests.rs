@@ -3369,3 +3369,449 @@ fn a_write_whose_parents_are_missing_costs_no_history_read() {
         "the refused write must not have become the visible row"
     );
 }
+
+/// Rebuild a runtime over an existing store the way every production
+/// construction does: rehydrate the schema manager from the persisted
+/// catalogue, so the new runtime knows every schema the store has lived under.
+/// Mirrors `server/builder.rs` (and the client + jazz-rn constructions).
+fn recreate_runtime_rehydrated(schema: Schema, app_name: &str, storage: MemoryStorage) -> TestCore {
+    let app_id = AppId::from_name(app_name);
+    let mut schema_manager =
+        SchemaManager::new(SyncManager::new(), schema, app_id, "dev", "main").unwrap();
+    crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+        &mut schema_manager,
+        &storage,
+        app_id,
+    )
+    .expect("rehydrate from the persisted catalogue");
+    let mut core = new_test_core(schema_manager, storage, NoopScheduler);
+    core.immediate_tick();
+    core
+}
+
+/// A row written under the old schema must survive the migration — visible to
+/// the new schema's queries and writable from the new schema's runtime.
+///
+/// Production shape, 2026-08-14: every schema deployment mints a new composed
+/// branch (`dev-<hash>-main`), old rows keep their history under the old one,
+/// and every client that upgrades queries under the new one. The unit-level
+/// lens machinery is well covered; NOTHING covered the crossing itself — the
+/// helpers `schema_evolution_v1/v2` below this suite were defined and never
+/// used. Meanwhile production spent a week rediscovering the seam one incident
+/// at a time.
+#[test]
+fn a_row_written_under_the_old_schema_is_served_after_the_migration() {
+    // Life under the old schema: a server, one row, a little history.
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        schema_evolution_v1(),
+        "schema-crossing",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("born under v1".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row under v1");
+    for version in 1..4 {
+        core.update(
+            server_row_id,
+            vec![(
+                "name".to_string(),
+                Value::Text(format!("v1 edit {version}")),
+            )],
+            None,
+        )
+        .expect("grow v1 history");
+    }
+    core.batched_tick();
+    core.immediate_tick();
+    let old_branch = crate::storage::sole_branch_name(core.storage())
+        .expect("branch registry readable")
+        .expect("v1 registered its branch");
+
+    // The redeploy: same store, new schema, the migration lens published — the
+    // engine-level mirror of `migrations push` + restarting the server.
+    let storage = core.into_storage();
+    // The v1 runtime must have persisted its catalogue, or the rehydrate below
+    // has nothing to read and this gate would fail for a reason that is not
+    // the defect.
+    assert!(
+        !storage
+            .scan_catalogue_entries()
+            .expect("catalogue readable")
+            .is_empty(),
+        "the v1 runtime persisted no catalogue entries; the crossing cannot even begin"
+    );
+    let mut core = recreate_runtime_rehydrated(schema_evolution_v2(), "schema-crossing", storage);
+    let lens = crate::schema_manager::auto_lens::generate_lens(
+        &schema_evolution_v1(),
+        &schema_evolution_v2(),
+    );
+    core.publish_lens(&lens).expect("publish the v1->v2 lens");
+    core.immediate_tick();
+
+    // The new runtime's world is a different composed branch than the row's.
+    // No branch precondition here on purpose: branches are registered by the
+    // first WRITE (seal), and this scenario never writes. The crossing under
+    // test is logical — the v2 runtime queries under its own composed branch
+    // while the row's history sits under `old_branch` — and the assertion that
+    // matters is the served result below. (An earlier precondition here was
+    // vacuous in one direction and wrong in the other.)
+
+    // Axis check: the LOCAL query path first — the passing evolution tests read
+    // this way. If this sees the row while the subscription below serves
+    // nothing, the defect is in serving, not in schema resolution.
+    // Both faces of the same store: the local path is the positive control
+    // proving the row is resolvable at all, so the serving assertion below can
+    // only fail for serving reasons.
+    let local = execute_runtime_query(&mut core, Query::new("users"), None);
+    assert_eq!(
+        local.len(),
+        1,
+        "the local query path must resolve the v1 row"
+    );
+    let _ = old_branch;
+
+    // A v2 client subscribes to the table, exactly as an upgraded app does.
+    let client_id = ClientId::new();
+    core.add_client(client_id, Some(Session::new("reader")));
+    core.sync_sender().take();
+    let query = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .query("users")
+        .build();
+    core.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QuerySubscription {
+            query_id: crate::sync_manager::QueryId(1),
+            query: Box::new(query),
+            session: Some(Session::new("reader")),
+            required_tier: None,
+            propagation: crate::sync_manager::QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    core.batched_tick();
+    core.immediate_tick();
+
+    // Both variants carry the row: `RowBatchCreated` is the direct push,
+    // `RowBatchNeeded` the confirm-me delivery every real client answers.
+    let served: Vec<_> =
+        core.sync_sender()
+            .take()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                OutboxEntry {
+                    destination: Destination::Client(id),
+                    payload:
+                        SyncPayload::RowBatchCreated { row, .. }
+                        | SyncPayload::RowBatchNeeded { row, .. },
+                } if id == client_id && row.row_id == server_row_id => Some(row),
+                _ => None,
+            })
+            .collect();
+    assert!(
+        !served.is_empty(),
+        "a row written under the old schema was not served to the new schema's \
+         subscription; every upgraded client sees an empty world"
+    );
+}
+
+/// A write from the new schema's runtime onto a row whose history lives under
+/// the old branch must apply — this is what every upgraded client does within
+/// seconds of connecting (presence, tokens, read markers).
+#[test]
+fn a_write_after_the_migration_applies_onto_old_schema_history() {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        schema_evolution_v1(),
+        "schema-crossing-write",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("born under v1".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row under v1");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let storage = core.into_storage();
+    // The v1 runtime must have persisted its catalogue, or the rehydrate below
+    // has nothing to read and this gate would fail for a reason that is not
+    // the defect.
+    assert!(
+        !storage
+            .scan_catalogue_entries()
+            .expect("catalogue readable")
+            .is_empty(),
+        "the v1 runtime persisted no catalogue entries; the crossing cannot even begin"
+    );
+    let mut core =
+        recreate_runtime_rehydrated(schema_evolution_v2(), "schema-crossing-write", storage);
+    let lens = crate::schema_manager::auto_lens::generate_lens(
+        &schema_evolution_v1(),
+        &schema_evolution_v2(),
+    );
+    core.publish_lens(&lens).expect("publish the v1->v2 lens");
+    core.immediate_tick();
+
+    core.update(
+        server_row_id,
+        vec![(
+            "name".to_string(),
+            Value::Text("edited under v2".to_string()),
+        )],
+        None,
+    )
+    .expect("a write from the upgraded runtime must apply onto the old history");
+    core.batched_tick();
+    core.immediate_tick();
+}
+
+/// Shared scaffold for the migration-family gates: a store whose row was
+/// written under schema v1, rebuilt the way production rebuilds (rehydrated),
+/// with the v1→v2 lens published.
+fn two_shelf_world(app: &str) -> (TestCore, ObjectId, crate::object::BranchName) {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        schema_evolution_v1(),
+        app,
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("Alice".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the v1 row");
+    core.batched_tick();
+    core.immediate_tick();
+    let old_branch = crate::storage::sole_branch_name(core.storage())
+        .expect("branch registry readable")
+        .expect("the v1 write registered its branch");
+    let storage = core.into_storage();
+    let mut core = recreate_runtime_rehydrated(schema_evolution_v2(), app, storage);
+    let lens = crate::schema_manager::auto_lens::generate_lens(
+        &schema_evolution_v1(),
+        &schema_evolution_v2(),
+    );
+    core.publish_lens(&lens).expect("lens publishes");
+    core.immediate_tick();
+    (core, server_row_id, old_branch)
+}
+
+fn served_rows_for(core: &mut TestCore, client_id: ClientId, row_id: ObjectId) -> usize {
+    core.sync_sender()
+        .take()
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                OutboxEntry {
+                    destination: Destination::Client(id),
+                    payload: SyncPayload::RowBatchCreated { row, .. }
+                        | SyncPayload::RowBatchNeeded { row, .. },
+                } if *id == client_id && row.row_id == row_id
+            )
+        })
+        .count()
+}
+
+/// An old-schema subscriber must not silently freeze when the row moves shelves.
+///
+/// Production 2026-08-14: the backend moved to the new schema and its presence
+/// writes land under the new branch; the TestFlight app still subscribes under
+/// the old one. The user watched last-online freeze on his phone — the write
+/// crossed shelves and the old-branch subscription was never told anything.
+#[test]
+fn an_old_branch_subscriber_hears_about_a_write_that_moves_the_row() {
+    let (mut core, server_row_id, old_branch) = two_shelf_world("stale-subscriber");
+
+    // The old-schema client: subscribed under the row's own (old) branch.
+    let client_id = ClientId::new();
+    core.add_client(client_id, Some(Session::new("reader")));
+    core.sync_sender().take();
+    let query = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .query("users")
+        .branch(old_branch.as_str())
+        .build();
+    core.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QuerySubscription {
+            query_id: crate::sync_manager::QueryId(7),
+            query: Box::new(query),
+            session: Some(Session::new("reader")),
+            required_tier: None,
+            propagation: crate::sync_manager::QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    core.batched_tick();
+    core.immediate_tick();
+    assert!(
+        served_rows_for(&mut core, client_id, server_row_id) > 0,
+        "the old-branch subscription must serve the old-shelf row at all, or this gates \
+         nothing"
+    );
+
+    // A new-schema write moves the row's current to the new shelf.
+    core.update(
+        server_row_id,
+        vec![("name".to_string(), Value::Text("Alice moved".to_string()))],
+        None,
+    )
+    .expect("the v2 write applies");
+    core.batched_tick();
+    core.immediate_tick();
+
+    assert!(
+        served_rows_for(&mut core, client_id, server_row_id) > 0,
+        "the row moved shelves and the old-branch subscriber was told nothing; every \
+         old-schema client silently freezes on stale data"
+    );
+}
+
+/// A client write onto an old-shelf row must be classified as the UPDATE it is.
+///
+/// The policy check's inputs come from `pre_batch_visible_row`. If the previous
+/// content cannot be resolved across shelves, the check runs as an INSERT with
+/// no old content — evaluating the wrong policy against the wrong shape.
+#[test]
+#[ignore = "harness gap: the evolution schemas carry no policy bundle, so client writes \
+bypass the permission queue entirely; needs a policy-bearing v1/v2 schema pair before \
+this can assert anything"]
+fn a_write_onto_an_old_shelf_row_is_permission_checked_as_an_update() {
+    let (mut core, server_row_id, old_branch) = two_shelf_world("cross-shelf-permission");
+    let v2_branch = core.schema_manager().branch_name();
+    assert_ne!(v2_branch.as_str(), old_branch.as_str());
+
+    let client_id = ClientId::new();
+    core.add_client(client_id, Some(Session::new("writer")));
+    core.sync_sender().take();
+
+    // The upgraded client's write: its branch, no resolvable parents — the
+    // diverged-but-legitimate shape every reconnect produces.
+    let incoming = crate::row_histories::StoredRowBatch::new(
+        server_row_id,
+        v2_branch.as_str(),
+        Vec::<crate::row_histories::BatchId>::new(),
+        encode_row(
+            &schema_evolution_v2()[&TableName::new("users")].columns,
+            &vec![
+                Value::Uuid(server_row_id),
+                Value::Text("renamed".to_string()),
+                Value::Text(String::new()),
+            ],
+        )
+        .expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 9_999),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+    core.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: None,
+            row: incoming,
+        },
+    });
+    core.batched_tick();
+    core.immediate_tick();
+
+    let checks = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .take_pending_permission_checks();
+    let Some(check) = checks.iter().find(|check| check.client_id == client_id) else {
+        panic!("the write must reach the permission queue, or this gates nothing");
+    };
+    assert_eq!(
+        check.operation,
+        crate::query_manager::policy::Operation::Update,
+        "a write onto a row that exists on the old shelf was classified as {:?}; the \
+         wrong policy evaluates and old content is invisible to it",
+        check.operation
+    );
+    assert!(
+        check.old_content.is_some(),
+        "the permission check sees no previous content for a row that has 1 visible \
+         version on the old shelf"
+    );
+}
+
+/// Differential gate: whatever the local query path answers, serving must
+/// answer the same — for every query shape.
+///
+/// The incident's defect was exactly a divergence between these two faces, and
+/// a bare-table subscription was the shape that caught it. This pins the next
+/// shapes before they catch us: a filtered query (which may take the indexed
+/// path) must serve the same rows it answers locally.
+#[test]
+fn serving_agrees_with_the_local_query_for_a_filtered_cross_shelf_query() {
+    let (mut core, server_row_id, _old_branch) = two_shelf_world("differential-filtered");
+
+    let local_query = crate::query_manager::query::QueryBuilder::new("users")
+        .filter_eq("name", Value::Text("Alice".to_string()))
+        .build();
+    let local = execute_runtime_query(&mut core, local_query, None);
+
+    let client_id = ClientId::new();
+    core.add_client(client_id, Some(Session::new("reader")));
+    core.sync_sender().take();
+    let query = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .query("users")
+        .filter_eq("name", Value::Text("Alice".to_string()))
+        .build();
+    core.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QuerySubscription {
+            query_id: crate::sync_manager::QueryId(9),
+            query: Box::new(query),
+            session: Some(Session::new("reader")),
+            required_tier: None,
+            propagation: crate::sync_manager::QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    core.batched_tick();
+    core.immediate_tick();
+    let served = served_rows_for(&mut core, client_id, server_row_id);
+
+    assert_eq!(
+        (local.len(), served > 0),
+        (1, true),
+        "local sees {} row(s), serving delivered {}; the two faces of the same query \
+         must not disagree",
+        local.len(),
+        served
+    );
+}
