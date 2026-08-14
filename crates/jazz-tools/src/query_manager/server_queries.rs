@@ -66,6 +66,15 @@ pub(crate) struct AuthorizationPolicyRequest<'a> {
     pub(crate) source_branch_schema_map: &'a std::collections::HashMap<String, SchemaHash>,
     pub(crate) operation: Operation,
     pub(crate) settlement_eval_cache: Option<&'a mut SettlementEvalCache>,
+    /// The schema the content was AUTHORED under, when the caller knows it.
+    ///
+    /// `None` keeps the historical derivation: the source schema is inferred
+    /// from `branch_name`. That inference names the WRITER's schema, which
+    /// for old content on a pre-deployment row is the wrong one — the bytes
+    /// then decode under the wrong descriptor and every comparison in the
+    /// policy reads garbage. Callers evaluating OLD content must pass the
+    /// hash the row's locator names.
+    pub(crate) content_schema_hash: Option<SchemaHash>,
 }
 
 struct UpdatePermissionRequest<'a> {
@@ -346,6 +355,7 @@ impl QueryManager {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn transform_content_to_authorization_schema(
         &self,
         table: &str,
@@ -354,7 +364,21 @@ impl QueryManager {
         branch_name: BranchName,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
         auth_context: &crate::schema_manager::SchemaContext,
+        authored_schema_hash: Option<SchemaHash>,
     ) -> Option<crate::query_manager::types::RowBytes> {
+        // The bytes' own shape outranks any branch inference: the branch names
+        // the writer's schema, and old content predates the writer.
+        if let Some(source_hash) = authored_schema_hash {
+            if source_hash == auth_context.current_hash {
+                return Some(content.clone());
+            }
+            let transformer = LensTransformer::new(auth_context, table);
+            return transformer
+                .transform(content, batch_id, source_hash)
+                .ok()
+                .map(|result| crate::query_manager::types::RowBytes::from(result.data));
+        }
+
         let source_hash = match self.source_schema_hash_for_authorization(
             branch_name,
             source_branch_schema_map,
@@ -462,6 +486,7 @@ impl QueryManager {
             branch_name,
             source_branch_schema_map,
             auth_context,
+            None,
         )?;
 
         Some(LoadedRow::new(
@@ -490,6 +515,7 @@ impl QueryManager {
             source_branch_schema_map,
             operation,
             settlement_eval_cache,
+            content_schema_hash,
         } = request;
 
         let Some(table_schema) = auth_schema.get(&table_name) else {
@@ -503,6 +529,7 @@ impl QueryManager {
             branch_name,
             source_branch_schema_map,
             auth_context,
+            content_schema_hash,
         ) else {
             return false;
         };
@@ -682,6 +709,7 @@ impl QueryManager {
                 source_branch_schema_map,
                 operation: Operation::Select,
                 settlement_eval_cache: Some(settlement_eval_cache),
+                content_schema_hash: None,
             },
         );
         (verdict, Some(table_name))
@@ -1969,6 +1997,14 @@ impl QueryManager {
                 source_branch_schema_map: &source_branch_schema_map,
                 operation: check.operation,
                 settlement_eval_cache: None,
+                // Delete evaluates the OLD content — the row as authored —
+                // so it needs the authored shape exactly as the update USING
+                // arm does. Insert evaluates the incoming write's own bytes,
+                // for which the branch derivation is already correct.
+                content_schema_hash: match check.operation {
+                    Operation::Delete => check.old_content_schema_hash,
+                    _ => None,
+                },
             },
         ) {
             let reason = format!(
@@ -2026,6 +2062,16 @@ impl QueryManager {
             )
         {
             check.old_content = Some(previous_row.data.to_vec());
+            // The bytes were just REPLACED, so the shape stamped at queue time
+            // no longer describes them. A stamped-but-stale hash is worse than
+            // no hash: the transform trusts it over the branch derivation and
+            // lenses bytes that never needed lensing. Re-stamp from the same
+            // source the queue-time fill uses.
+            check.old_content_schema_hash = storage
+                .load_row_locator(object_id)
+                .ok()
+                .flatten()
+                .and_then(|locator| locator.origin_schema_hash);
         }
 
         let Some(table_schema) = auth_schema.get(&auth_table_name) else {
@@ -2100,6 +2146,7 @@ impl QueryManager {
                     source_branch_schema_map: &source_branch_schema_map,
                     operation: Operation::Update,
                     settlement_eval_cache: None,
+                    content_schema_hash: check.old_content_schema_hash,
                 },
             ) {
                 let reason = format!(
@@ -2152,6 +2199,7 @@ impl QueryManager {
                     source_branch_schema_map: &source_branch_schema_map,
                     operation: Operation::Update,
                     settlement_eval_cache: None,
+                    content_schema_hash: None,
                 },
             ) {
                 let reason = format!(

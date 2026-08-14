@@ -2103,12 +2103,22 @@ impl SyncManager {
                         } else {
                             Operation::Insert
                         };
+                        // The shape rides with the bytes: the old content was
+                        // authored under the schema the LOCATOR names, which
+                        // after a schema deployment is not the schema the
+                        // incoming write's branch names.
+                        let old_content_schema_hash = storage
+                            .load_row_locator(row.row_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|locator| locator.origin_schema_hash);
                         self.queue_for_permission_check(
                             client_id,
                             payload,
                             session.clone(),
                             metadata,
                             old_content.map(|content| content.to_vec()),
+                            old_content_schema_hash,
                             new_content.map(|content| content.to_vec()),
                             operation,
                         );

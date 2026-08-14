@@ -552,6 +552,74 @@ seal, client-driven, no amplification. And `an_exact_replay_costs_one_history_re
 `load_history_row_batch` only; the sealed path's `load_history_row_batch_for_schema_hash`
 is not instrumented, so that gate proves the reorder rather than the whole replay cost.
 
+## 17. The USING policy decodes old content under the writer's schema, not the row's
+
+An owner's UPDATE onto a row authored before a schema deployment is rejected by
+their own USING policy. The old content is resolved correctly — the bytes are
+found — and then decoded with the wrong descriptor: the source schema for the
+authorization transform is inferred from the INCOMING WRITE's branch
+(`source_schema_hash_for_authorization`, all three fallbacks branch-keyed), and
+that branch names the writer's schema, which post-deployment is not the schema
+the row was authored under. Identity transform, v1 bytes read as v2 columns,
+`owner_id` compares against garbage, and the policy denies the legitimate owner:
+`Update denied by USING policy … - cannot see old row`. Production fingerprint:
+114 of the sibling arm's rejection (`… - no old content`) on 2026-08-10.
+
+The class defect is bytes travelling without their shape. `PendingPermissionCheck`
+carried `old_content: Option<Vec<u8>>` and nothing saying what schema encoded it,
+so every consumer re-derives the shape from the only key at hand — the branch.
+The same latent trap as a digest covering a field the transport mutates.
+
+**Fix shipped in this fork.** The check now carries `old_content_schema_hash`,
+stamped at queue time from the row's locator (`origin_schema_hash`), and the
+authorization transform prefers the authored hash over any branch inference.
+All other evaluation sites pass `None` and keep the historical derivation.
+
+Three edges found by review and closed with the fix: the late fill that
+replaces the bytes now re-stamps the hash (a stamped-but-stale hash would have
+been worse than the bug — the transform trusts it over the branch derivation);
+the DELETE arm evaluates old content through its own construction site and now
+passes the authored hash the same way (gated by the owner's cross-shelf delete
+in the same test); and the gate asserts as a precondition that the schema pair
+actually misreads `owner_id` under the wrong descriptor, so an edited fixture
+cannot quietly stop discriminating. Still untested: the late-fill re-stamp
+itself has no isolated harness (the empty-but-stamped shape is not reachable
+from the public surface without heavy plumbing); it is five lines mirroring the
+queue-time stamp, and it is named here so it is not mistaken for covered.
+
+Gate: `an_update_onto_an_old_shelf_row_survives_its_using_policy` — a v1→v2
+schema pair with an explicit update policy, both runtimes rebuilt the way
+production rebuilds (rehydrated, lens delivered to the client through the
+catalogue pump). Falsified in all four required directions: fix in place →
+green; fix disabled → red with the exact reason string; the same-shelf positive
+control green throughout (proving the observation channel before the crossing is
+asserted); and a non-owner's cross-shelf update — sent as a raw batch past the
+client-side policy engine — still denied, so the decode fix demonstrably did not
+loosen the decision.
+
+---
+
+## 18. A client write racing delivery: clean at this level, poisonous somewhere below
+
+Reproduced live (simulator, 2026-08-14): an app on a freshly wiped store wrote
+within the first seconds while hydration was in flight, and threw uncaught
+`missing row-history parent`, then `object not found` for the same object —
+after which the row was gone locally and the account query settled empty. The
+store inspected a minute later held the delivered batch: the write had raced
+the persistence, and something kept the row broken afterwards.
+
+The engine-level gate (`a_client_write_racing_delivery_recovers_once_the_delivery_lands`)
+is GREEN, and its green is a boundary marker: with the memory backend and
+synchronous ticks the racing write fails with a clean `object not found`, the
+retry after delivery applies, and unrelated writes are untouched. Whatever
+poisons the row in the field therefore lives below this level — the sqlite
+backend, the jazz-rn actor pipeline, or the binding's error propagation. The
+next gate belongs there, and the app-side mitigation (catch + one deferred
+retry on the two token writers that raced in the field) is already in the
+mobile tree.
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed

@@ -1440,6 +1440,7 @@ fn remove_client_cleans_active_policy_checks() {
         schema_wait_started_at: None,
         metadata: Default::default(),
         old_content: None,
+        old_content_schema_hash: None,
         new_content: None,
         operation: Operation::Insert,
     };

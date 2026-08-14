@@ -125,6 +125,7 @@ impl SyncManager {
         session: Session,
         metadata: HashMap<String, String>,
         old_content: Option<Vec<u8>>,
+        old_content_schema_hash: Option<crate::query_manager::types::branch::SchemaHash>,
         new_content: Option<Vec<u8>>,
         operation: Operation,
     ) -> PendingUpdateId {
@@ -138,6 +139,7 @@ impl SyncManager {
             schema_wait_started_at: None,
             metadata,
             old_content,
+            old_content_schema_hash,
             new_content,
             operation,
         });

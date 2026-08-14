@@ -105,6 +105,7 @@ fn memory_size_separates_sync_state_buckets() {
         schema_wait_started_at: None,
         metadata: row_metadata("users"),
         old_content: None,
+        old_content_schema_hash: None,
         new_content: Some(b"alice".to_vec()),
         operation: crate::query_manager::policy::Operation::Insert,
     });

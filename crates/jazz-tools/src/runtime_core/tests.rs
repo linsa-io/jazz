@@ -3815,3 +3815,435 @@ fn serving_agrees_with_the_local_query_for_a_filtered_cross_shelf_query() {
         served
     );
 }
+
+/// v1 of the update-policy world: documents owned via session, with an
+/// explicit UPDATE policy whose USING half reads the OLD row.
+fn owned_documents_schema_v1() -> Schema {
+    let policies = TablePolicies::new()
+        .with_select(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]))
+        .with_insert(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]))
+        .with_update(
+            Some(PolicyExpr::eq_session("owner_id", vec!["user_id".into()])),
+            PolicyExpr::eq_session("owner_id", vec!["user_id".into()]),
+        )
+        .with_delete(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]));
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("documents")
+                .column("owner_id", ColumnType::Text)
+                .column("title", ColumnType::Text)
+                .policies(policies),
+        )
+        .build()
+}
+
+/// v2 adds one column, which is all a schema needs to mint a new shelf.
+fn owned_documents_schema_v2() -> Schema {
+    let policies = TablePolicies::new()
+        .with_select(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]))
+        .with_insert(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]))
+        .with_update(
+            Some(PolicyExpr::eq_session("owner_id", vec!["user_id".into()])),
+            PolicyExpr::eq_session("owner_id", vec!["user_id".into()]),
+        )
+        .with_delete(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]));
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("documents")
+                .column("owner_id", ColumnType::Text)
+                .column("title", ColumnType::Text)
+                .column("note", ColumnType::Text)
+                .policies(policies),
+        )
+        .build()
+}
+
+/// An owner's UPDATE must survive its USING policy after the schema moves on.
+///
+/// The USING half of an update policy evaluates against the row's OLD content.
+/// That old content is resolved for the permission check by reads that carry a
+/// branch — and after a schema deployment the row's only versions sit under
+/// the previous schema's branch. If that resolution cannot cross shelves, the
+/// check either misclassifies the write as an INSERT or rejects it with
+/// "no old content" — production 2026-08-10 recorded 114 of exactly that
+/// rejection string. Either way the owner loses the write for reasons that
+/// have nothing to do with policy.
+///
+/// The same-shelf half runs first as the positive control: it proves the whole
+/// observation channel — client write, permission queue, policy evaluation,
+/// fate, server state — before the crossing is asserted, so the second half
+/// can only fail for crossing reasons.
+#[test]
+fn an_update_onto_an_old_shelf_row_survives_its_using_policy() {
+    // Precondition on the fixture, not the system: the v1/v2 pair must
+    // actually MISREAD owner_id when v1 bytes are decoded with the v2
+    // descriptor — otherwise "a wrong-shape decode denies the owner" is
+    // vacuously satisfied, the transform never has to run, and this gate
+    // stops discriminating the moment someone edits the schema pair.
+    {
+        let v1_bytes = encode_row(
+            &owned_documents_schema_v1()[&TableName::new("documents")].columns,
+            &vec![
+                Value::Text("alice".to_string()),
+                Value::Text("draft".to_string()),
+            ],
+        )
+        .expect("v1 row encodes");
+        let misread = crate::row_format::decode_row(
+            &owned_documents_schema_v2()[&TableName::new("documents")].columns,
+            &v1_bytes,
+        );
+        let still_alice = matches!(
+            misread.as_ref().map(|values| values.first()),
+            Ok(Some(Value::Text(owner))) if owner == "alice"
+        );
+        assert!(
+            !still_alice,
+            "the schema pair no longer discriminates: v1 bytes decode to the right owner \
+             under the v2 descriptor, so nothing here would catch a missing transform"
+        );
+    }
+
+    let v1 = owned_documents_schema_v1();
+    let mut client = create_runtime_with_schema(v1.clone(), "cross-shelf-using-policy");
+    let mut server = create_runtime_with_schema(v1, "cross-shelf-using-policy");
+
+    let client_id = ClientId::new();
+    let server_id = ServerId::new();
+    let alice = Session::new("alice");
+    server.add_client(client_id, Some(alice.clone()));
+    client.add_server(server_id);
+
+    let ((row_id, _), _) = client
+        .insert(
+            "documents",
+            document_insert_values("alice", "draft"),
+            Some(&WriteContext::from_session(alice.clone())),
+        )
+        .expect("the owner's insert satisfies her own policy");
+    let ((untouched_row, _), _) = client
+        .insert(
+            "documents",
+            document_insert_values("alice", "second-draft"),
+            Some(&WriteContext::from_session(alice.clone())),
+        )
+        .expect("the second insert satisfies the policy too");
+    pump_client_messages_to_server(&mut client, &mut server, server_id, client_id);
+    server.batched_tick();
+    server.immediate_tick();
+    client.batched_tick();
+    server.sync_sender().take();
+    client.sync_sender().take();
+
+    let rejected_reasons = |server: &mut TestCore| -> Vec<String> {
+        server
+            .sync_sender()
+            .take()
+            .into_iter()
+            .filter_map(|entry| match entry.payload {
+                SyncPayload::BatchFate {
+                    fate: crate::batch_fate::BatchFate::Rejected { reason, .. },
+                } => Some(reason),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Positive control: the same-shelf update is approved and lands.
+    client
+        .update(
+            row_id,
+            vec![("title".to_string(), Value::Text("same-shelf".to_string()))],
+            Some(&WriteContext::from_session(alice.clone())),
+        )
+        .expect("the local update applies");
+    pump_client_messages_to_server(&mut client, &mut server, server_id, client_id);
+    server.batched_tick();
+    server.immediate_tick();
+    let rejections = rejected_reasons(&mut server);
+    assert!(
+        rejections.is_empty(),
+        "the same-shelf control update was rejected ({rejections:?}); the observation \
+         channel itself is broken and the crossing half below would prove nothing"
+    );
+
+    // The deployment: both sides move to v2, rebuilt the way production
+    // rebuilds, with the lens published server-side.
+    let server_storage = server.into_storage();
+    let mut server = recreate_runtime_rehydrated(
+        owned_documents_schema_v2(),
+        "cross-shelf-using-policy",
+        server_storage,
+    );
+    let lens = crate::schema_manager::auto_lens::generate_lens(
+        &owned_documents_schema_v1(),
+        &owned_documents_schema_v2(),
+    );
+    server.publish_lens(&lens).expect("lens publishes");
+    let client_storage = client.into_storage();
+    let mut client = recreate_runtime_rehydrated(
+        owned_documents_schema_v2(),
+        "cross-shelf-using-policy",
+        client_storage,
+    );
+    server.add_client(client_id, Some(alice.clone()));
+    client.add_server(server_id);
+    server.immediate_tick();
+    client.immediate_tick();
+    // The reconnect handshake in both directions: the client re-uploads its
+    // world, and the server's catalogue — including the freshly published
+    // lens — reaches the client. Dropping the server outbox here would leave
+    // the client without the lens and fail the write for harness reasons.
+    pump_client_messages_to_server(&mut client, &mut server, server_id, client_id);
+    server.batched_tick();
+    server.immediate_tick();
+    let mut server_outputs = Vec::new();
+    pump_server_messages_to_clients(
+        &mut server,
+        &mut [ClientForServer {
+            core: &mut client,
+            server_id,
+            client_id,
+        }],
+        &mut server_outputs,
+    );
+    client.batched_tick();
+    client.immediate_tick();
+    server.sync_sender().take();
+    client.sync_sender().take();
+
+    // The crossing: the same owner updates the same row from the new schema.
+    client
+        .update(
+            row_id,
+            vec![("title".to_string(), Value::Text("cross-shelf".to_string()))],
+            Some(&WriteContext::from_session(alice.clone())),
+        )
+        .expect("the upgraded client's local update applies");
+    pump_client_messages_to_server(&mut client, &mut server, server_id, client_id);
+    server.batched_tick();
+    server.immediate_tick();
+    server.batched_tick();
+    let rejections = rejected_reasons(&mut server);
+    assert!(
+        rejections.is_empty(),
+        "the owner's update was rejected after the schema moved on: {rejections:?}"
+    );
+
+    // Negative control: the fix loosens how old content is DECODED, and must
+    // not loosen what the policy DECIDES. A non-owner's cross-shelf update has
+    // to stay denied — "always approve" passes every assertion above. Sent
+    // straight to the server as a raw batch, the way a client whose local
+    // policy engine cannot be trusted would send it.
+    let mallory = Session::new("mallory");
+    let mallory_client_id = ClientId::new();
+    server.add_client(mallory_client_id, Some(mallory));
+    server.sync_sender().take();
+    let current = server
+        .storage()
+        .load_visible_region_row(
+            "documents",
+            server.schema_manager().branch_name().as_str(),
+            row_id,
+        )
+        .expect("visible row readable")
+        .expect("the row is visible after the owner's update");
+    let stolen = crate::row_histories::StoredRowBatch::new(
+        row_id,
+        current.branch.as_str(),
+        vec![current.batch_id()],
+        encode_row(
+            &owned_documents_schema_v2()[&TableName::new("documents")].columns,
+            &vec![
+                Value::Text("alice".to_string()),
+                Value::Text("stolen".to_string()),
+                Value::Text(String::new()),
+            ],
+        )
+        .expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(row_id.to_string(), 9_999),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(mallory_client_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: Some(crate::sync_manager::RowMetadata {
+                id: row_id,
+                metadata: HashMap::from([(
+                    crate::metadata::MetadataKey::Table.as_str().to_string(),
+                    "documents".to_string(),
+                )]),
+            }),
+            row: stolen,
+        },
+    });
+    server.batched_tick();
+    server.immediate_tick();
+    server.batched_tick();
+    let rejections = rejected_reasons(&mut server);
+    assert!(
+        !rejections.is_empty(),
+        "a non-owner's cross-shelf update was APPROVED; the decode fix must not have \
+         loosened the decision"
+    );
+
+    // The Delete arm evaluates OLD content through a different construction
+    // site than the update USING arm — the same defect wears a different
+    // `None` there. The second row was never touched after the migration, so
+    // its only content is v1-shaped: the owner's delete must survive.
+    client
+        .delete(
+            untouched_row,
+            Some(&WriteContext::from_session(alice.clone())),
+        )
+        .expect("the owner's local delete applies");
+    pump_client_messages_to_server(&mut client, &mut server, server_id, client_id);
+    server.batched_tick();
+    server.immediate_tick();
+    server.batched_tick();
+    let rejections = rejected_reasons(&mut server);
+    assert!(
+        rejections.is_empty(),
+        "the owner's cross-shelf DELETE was rejected: {rejections:?}"
+    );
+}
+
+/// A client write racing delivery fails cleanly and recovers — at THIS level.
+///
+/// GREEN, and its green is a boundary marker, not an all-clear: with the
+/// memory backend and synchronous ticks the racing write fails with a clean
+/// `object not found`, the retry after delivery applies, and unrelated writes
+/// are untouched. The simulator reproduction of 2026-08-14 showed MORE than
+/// this — an uncaught `missing row-history parent`, then `object not found`
+/// persisting, then the account query settling empty — which this harness
+/// does not reproduce. Whatever poisons the row in the field therefore lives
+/// below this level: the sqlite backend, the jazz-rn actor pipeline, or the
+/// binding's error propagation. That is where the next gate belongs.
+///
+/// Reproduced live on the simulator, 2026-08-14: an app on a freshly wiped
+/// store entered the main screen, delivery of its rows was still in flight,
+/// and its first writes threw uncaught `missing row-history parent` followed
+/// by `object not found` for the SAME object — after which the row was gone
+/// locally and the account query settled empty. The store inspected a minute
+/// later held the delivered batch; the write had simply raced the persistence.
+///
+/// Two halves:
+/// - positive control: delivery applied, then the write — must succeed (the
+///   channel works when nothing races);
+/// - the race: the write issued before the delivery is processed — the write
+///   itself may fail (the row is genuinely not there yet), but a RETRY after
+///   the delivery lands must succeed, and the failed attempt must not have
+///   left the object unusable.
+#[test]
+fn a_client_write_racing_delivery_recovers_once_the_delivery_lands() {
+    let schema = test_schema();
+    let mut server = create_runtime_with_schema(schema.clone(), "cold-store-race");
+    let mut client = create_runtime_with_schema(schema, "cold-store-race");
+    let client_id = ClientId::new();
+    let server_id = ServerId::new();
+    server.add_client(client_id, Some(Session::new("writer")));
+    client.add_server(server_id);
+
+    // The server-side row the cold client is about to receive.
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut server,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("v0".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row");
+    server.batched_tick();
+    server.immediate_tick();
+
+    // Deliver it to the cold client, but do NOT process it yet: the message
+    // sits in the inbox the way in-flight hydration sits in a real app.
+    let delivered = server
+        .storage()
+        .load_visible_region_row(
+            "users",
+            crate::storage::sole_branch_name(server.storage())
+                .expect("registry readable")
+                .expect("branch registered")
+                .as_str(),
+            server_row_id,
+        )
+        .expect("visible row readable")
+        .expect("the seeded row is visible");
+    client.park_sync_message(InboxEntry {
+        source: Source::Server(server_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: Some(crate::sync_manager::RowMetadata {
+                id: server_row_id,
+                metadata: HashMap::from([(
+                    crate::metadata::MetadataKey::Table.as_str().to_string(),
+                    "users".to_string(),
+                )]),
+            }),
+            row: delivered,
+        },
+    });
+
+    // The race: the app writes before the delivery is processed. Today this
+    // fails — the row is genuinely not applied yet — and that failure is
+    // tolerable ONLY if it is clean.
+    let raced = client.update(
+        server_row_id,
+        vec![("name".to_string(), Value::Text("raced".to_string()))],
+        None,
+    );
+    eprintln!("racing write: {:?}", raced.as_ref().map(|_| ()));
+
+    // The delivery lands.
+    client.batched_tick();
+    client.immediate_tick();
+
+    // Quiescence first: "not yet flushed" and "lost" look identical at the
+    // wrong moment.
+    client.batched_tick();
+    client.immediate_tick();
+
+    // Inverse control: a write to a DIFFERENT, locally-authored row must be
+    // fine — separating "cold-store writes are broken" from "this race is
+    // broken".
+    let ((other_row, _), _) = insert_and_wait_for_batch(
+        &mut client,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(ObjectId::new())),
+            ("name".to_string(), Value::Text("local".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("a local insert on the cold store applies");
+    client
+        .update(
+            other_row,
+            vec![("name".to_string(), Value::Text("local2".to_string()))],
+            None,
+        )
+        .expect("an unrelated write must be unaffected by the race");
+
+    // The retry must succeed, and the row must not have been poisoned by the
+    // failed attempt.
+    client
+        .update(
+            server_row_id,
+            vec![(
+                "name".to_string(),
+                Value::Text("after delivery".to_string()),
+            )],
+            None,
+        )
+        .expect(
+            "the retry after the delivery landed must apply; a failed racing write must not \
+             leave the object unusable",
+        );
+}

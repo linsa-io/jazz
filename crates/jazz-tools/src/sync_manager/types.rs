@@ -812,6 +812,16 @@ pub struct PendingPermissionCheck {
     pub metadata: HashMap<String, String>,
     /// Old content for UPDATE/DELETE (None for INSERT).
     pub old_content: Option<Vec<u8>>,
+    /// The schema the old content was AUTHORED under, from the row's locator.
+    ///
+    /// Bytes without their shape are the trap this codebase keeps paying for:
+    /// every consumer has to re-derive the shape, and the only key at hand is
+    /// the incoming write's branch — which names the WRITER's schema, not the
+    /// row's. A row authored before a schema deployment then gets decoded with
+    /// the wrong descriptor and its policy comparisons read garbage
+    /// ("Update denied by USING policy … cannot see old row" for a legitimate
+    /// owner). Carrying the hash with the bytes fixes the class.
+    pub old_content_schema_hash: Option<crate::query_manager::types::branch::SchemaHash>,
     /// New content for INSERT/UPDATE (None for DELETE).
     pub new_content: Option<Vec<u8>>,
     /// Inferred operation type.
