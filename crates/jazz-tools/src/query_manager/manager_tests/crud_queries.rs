@@ -598,3 +598,89 @@ fn permissive_local_runtime_without_loaded_policies_returns_all_rows() {
         "policy-less local runtimes should keep returning rows until a compiled bundle is loaded"
     );
 }
+
+/// A row from a branch whose schema differs ONLY IN OTHER TABLES must be
+/// served without any lens.
+///
+/// Production 2026-08-15: the deployed migration removed one table
+/// (`chat_activities`). Branch identity is whole-schema identity, so every
+/// untouched table's rows — users, chats, messages — landed behind a crossing
+/// whose only correct projection is identity. Clients whose stores lack a
+/// registered lens (fresh store, catalogue synced without one) dropped every
+/// pre-migration row at materialization: the sign-in account query settled
+/// empty for an identity whose row was delivered and confirmed, and the
+/// rpc-server hydrated identity tables at zero. The neighbouring drop test
+/// pins the OPPOSITE case (genuinely differing descriptors, no lens — drop);
+/// this one pins the identity case: identical descriptors need no lens.
+#[test]
+fn a_row_from_an_identical_table_on_another_schema_branch_is_served_without_a_lens() {
+    use crate::query_manager::encoding::encode_row;
+    use std::collections::HashMap;
+
+    let sync_manager = SyncManager::new();
+    let schema = test_schema();
+    let (mut qm, mut storage) = create_query_manager(sync_manager, schema);
+
+    // The old world: `users` IDENTICAL to the current schema; the hash differs
+    // only because another table exists there (the one the migration removed).
+    let mut old_schema = Schema::new();
+    old_schema.insert(
+        TableName::new("users"),
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("name", ColumnType::Text),
+            ColumnDescriptor::new("score", ColumnType::Integer),
+        ])
+        .into(),
+    );
+    old_schema.insert(
+        TableName::new("chat_activities"),
+        RowDescriptor::new(vec![ColumnDescriptor::new("kind", ColumnType::Text)]).into(),
+    );
+    let old_descriptor = old_schema
+        .get(&TableName::new("users"))
+        .expect("old schema users table exists")
+        .columns
+        .clone();
+    qm.add_live_schema(old_schema);
+
+    let current_branch = get_branch(&qm);
+    let old_branch = qm
+        .all_query_branches()
+        .into_iter()
+        .find(|b| b != &current_branch)
+        .expect("old schema branch should exist");
+
+    let row_id = ObjectId::new();
+    let mut metadata = HashMap::new();
+    metadata.insert(MetadataKey::Table.to_string(), "users".to_string());
+    put_test_row_metadata(&mut storage, row_id, metadata);
+
+    let old_data = encode_row(
+        &old_descriptor,
+        &[Value::Text("Alice".into()), Value::Integer(100)],
+    )
+    .unwrap();
+    let commit = stored_row_commit(smallvec![], old_data, 1000, row_id.to_string());
+    receive_row_commit(&mut qm, &mut storage, row_id, &old_branch, commit);
+    qm.process(&mut storage);
+
+    assert!(
+        qm.row_is_indexed_on_branch(&storage, "users", &old_branch, row_id),
+        "row should be indexed on the old branch, or this gates nothing"
+    );
+
+    let sub_id = qm.subscribe(qm.query("users").build()).unwrap();
+    qm.process(&mut storage);
+
+    let results = qm.get_subscription_results(sub_id);
+    assert_eq!(
+        results.len(),
+        1,
+        "a row from an identical table on another schema branch was dropped — an \
+         untouched table must not need a lens to cross a schema change"
+    );
+    // Content, not just presence: identity must serve the exact bytes, or a
+    // misdecoding fallback would pass this gate silently.
+    assert_eq!(results[0].1[0], Value::Text("Alice".into()));
+    assert_eq!(results[0].1[1], Value::Integer(100));
+}

@@ -5019,3 +5019,108 @@ fn a_policied_include_subscription_survives_the_crossing() {
         );
     }
 }
+
+/// Schema pair for the lensless crossing: the migration only removes an
+/// unrelated table; `users` is byte-identical in both versions.
+fn users_with_doomed_table_schema() -> Schema {
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("users")
+                .column("id", ColumnType::Uuid)
+                .column("name", ColumnType::Text),
+        )
+        .table(TableSchema::builder("chat_activities").column("kind", ColumnType::Text))
+        .build()
+}
+
+fn users_survivor_schema() -> Schema {
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("users")
+                .column("id", ColumnType::Uuid)
+                .column("name", ColumnType::Text),
+        )
+        .build()
+}
+
+/// A row of an untouched table must be served across a migration that has NO
+/// published lens.
+///
+/// Production 2026-08-15: the deployed migration removed one table; nobody
+/// pushed a lens covering the crossing for the 40 untouched tables (the only
+/// pushed edge covered the removed table, in the other direction). Every
+/// crossing gate above publishes a lens first, so none of them could see this
+/// starvation. This gate is that missing world: same store, new schema, no
+/// `publish_lens` at all — the untouched table's rows must still be resolvable
+/// locally and served to a subscriber.
+#[test]
+fn a_row_of_an_untouched_table_is_served_across_a_lensless_migration() {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        users_with_doomed_table_schema(),
+        "lensless-crossing",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("born before".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row under the old schema");
+    core.batched_tick();
+    core.immediate_tick();
+
+    // The redeploy: same store, new schema, NO lens published.
+    let storage = core.into_storage();
+    assert!(
+        !storage
+            .scan_catalogue_entries()
+            .expect("catalogue readable")
+            .is_empty(),
+        "the old runtime persisted no catalogue entries; the crossing cannot even begin"
+    );
+    let mut core =
+        recreate_runtime_rehydrated(users_survivor_schema(), "lensless-crossing", storage);
+    core.immediate_tick();
+
+    // Axis check: the local query path resolves the row without any lens.
+    let local = execute_runtime_query(&mut core, Query::new("users"), None);
+    assert_eq!(
+        local.len(),
+        1,
+        "the local query path must resolve the untouched table's row without a lens"
+    );
+
+    // A subscriber on the new schema hears about it too.
+    let client_id = ClientId::new();
+    core.add_client(client_id, Some(Session::new("reader")));
+    core.sync_sender().take();
+    let query = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .query("users")
+        .build();
+    core.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QuerySubscription {
+            query_id: crate::sync_manager::QueryId(41),
+            query: Box::new(query),
+            session: Some(Session::new("reader")),
+            required_tier: None,
+            propagation: crate::sync_manager::QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    core.batched_tick();
+    core.immediate_tick();
+    assert!(
+        served_rows_for(&mut core, client_id, server_row_id) > 0,
+        "the untouched table's row vanished from serving across a lensless migration"
+    );
+}

@@ -111,80 +111,132 @@ impl<'a> LensTransformer<'a> {
                     target: self.context.current_hash,
                 })?;
 
-        let source_table_name =
-            translate_table_name_to_schema(self.context, &self.table, &source_hash)
+        let attempt = || -> Result<TransformResult, TransformError> {
+            let source_table_name =
+                translate_table_name_to_schema(self.context, &self.table, &source_hash)
+                    .ok_or_else(|| TransformError::TableNotFound(self.table.clone()))?;
+
+            let source_table = source_schema
+                .get(&crate::query_manager::types::TableName::new(
+                    &source_table_name,
+                ))
+                .ok_or_else(|| TransformError::TableNotFound(source_table_name.clone()))?;
+
+            let target_table = self
+                .context
+                .current_schema
+                .get(&crate::query_manager::types::TableName::new(&self.table))
                 .ok_or_else(|| TransformError::TableNotFound(self.table.clone()))?;
 
-        let source_table = source_schema
-            .get(&crate::query_manager::types::TableName::new(
-                &source_table_name,
-            ))
-            .ok_or_else(|| TransformError::TableNotFound(source_table_name.clone()))?;
+            let source_desc = &source_table.columns;
+            let target_desc = &target_table.columns;
 
-        let target_table = self
-            .context
-            .current_schema
-            .get(&crate::query_manager::types::TableName::new(&self.table))
-            .ok_or_else(|| TransformError::TableNotFound(self.table.clone()))?;
+            // Get lens path and apply transforms
+            let lens_path =
+                self.context
+                    .lens_path(&source_hash)
+                    .map_err(|_| TransformError::NoLensPath {
+                        source: source_hash,
+                        target: self.context.current_hash,
+                    })?;
 
-        let source_desc = &source_table.columns;
-        let target_desc = &target_table.columns;
+            // Decode row with source schema
+            let mut values = decode_row(source_desc, data)
+                .map_err(|e| TransformError::DecodeError(format!("{:?}", e)))?;
 
-        // Get lens path and apply transforms
-        let lens_path =
-            self.context
-                .lens_path(&source_hash)
-                .map_err(|_| TransformError::NoLensPath {
-                    source: source_hash,
-                    target: self.context.current_hash,
+            // Apply each lens in the path with the appropriate direction
+            let mut current_desc = source_desc.clone();
+            let mut current_table_name = source_table_name;
+            for (lens, direction) in lens_path {
+                // Get the next schema based on direction
+                // Forward: source -> target, Backward: target -> source
+                let next_hash = match direction {
+                    Direction::Forward => lens.target_hash,
+                    Direction::Backward => lens.source_hash,
+                };
+
+                let next_schema = self.context.get_schema(&next_hash).ok_or({
+                    TransformError::NoLensPath {
+                        source: lens.source_hash,
+                        target: lens.target_hash,
+                    }
                 })?;
+                let next_table_name = lens
+                    .translate_table(&current_table_name, direction)
+                    .ok_or_else(|| TransformError::TableNotFound(current_table_name.clone()))?;
+                let next_table = next_schema
+                    .get(&crate::query_manager::types::TableName::new(
+                        &next_table_name,
+                    ))
+                    .ok_or_else(|| TransformError::TableNotFound(next_table_name.clone()))?;
+                let next_desc = &next_table.columns;
 
-        // Decode row with source schema
-        let mut values = decode_row(source_desc, data)
-            .map_err(|e| TransformError::DecodeError(format!("{:?}", e)))?;
+                // Apply lens with the appropriate direction
+                values = lens.apply(&values, &current_desc, next_desc, direction);
+                current_desc = next_desc.clone();
+                current_table_name = next_table_name;
+            }
 
-        // Apply each lens in the path with the appropriate direction
-        let mut current_desc = source_desc.clone();
-        let mut current_table_name = source_table_name;
-        for (lens, direction) in lens_path {
-            // Get the next schema based on direction
-            // Forward: source -> target, Backward: target -> source
-            let next_hash = match direction {
-                Direction::Forward => lens.target_hash,
-                Direction::Backward => lens.source_hash,
-            };
+            // Encode with target schema
+            let transformed_data = encode_row(target_desc, &values)
+                .map_err(|e| TransformError::EncodeError(format!("{:?}", e)))?;
 
-            let next_schema = self.context.get_schema(&next_hash).ok_or({
-                TransformError::NoLensPath {
-                    source: lens.source_hash,
-                    target: lens.target_hash,
+            Ok(TransformResult {
+                data: transformed_data,
+                batch_id,
+                was_transformed: true,
+            })
+        };
+
+        match attempt() {
+            Ok(result) => Ok(result),
+            // NoLensPath only, deliberately: a TableNotFound produced by an
+            // EXISTING lens path is an explicit decline (an Add/Remove-table
+            // boundary) and stays declined. TableNotFound from a missing path
+            // never reaches here — the translate helpers already fall back to
+            // identity when no path exists, so the walk proceeds and fails as
+            // NoLensPath instead.
+            Err(err @ TransformError::NoLensPath { .. }) => {
+                // Identity recovery. Branch identity is whole-schema identity, so
+                // ANY schema change — even removing an unrelated table — puts
+                // every untouched table behind a crossing. For a table whose
+                // descriptor is identical in the source and current schemas the
+                // bytes decode identically under both, and the only correct
+                // projection is identity; requiring a registered lens here starved
+                // clients of every pre-migration row after a table-removal
+                // deployment (production 2026-08-15: sign-in settled empty, rpc
+                // hydration read zero). Runs only after the lens machinery
+                // declined, so a registered lens between the hashes keeps its
+                // semantics (e.g. a value-rewriting lens over an unchanged
+                // descriptor).
+                let same_named_identical = source_schema
+                    .get(&crate::query_manager::types::TableName::new(&self.table))
+                    .zip(
+                        self.context
+                            .current_schema
+                            .get(&crate::query_manager::types::TableName::new(&self.table)),
+                    )
+                    .is_some_and(|(source_table, target_table)| {
+                        source_table.columns.columns == target_table.columns.columns
+                    });
+                if same_named_identical {
+                    tracing::info!(
+                        table = %self.table,
+                        source_schema = %source_hash.short(),
+                        target_schema = %self.context.current_hash.short(),
+                        "identity crossing: served an untouched table's row without a lens"
+                    );
+                    Ok(TransformResult {
+                        data: data.to_vec(),
+                        batch_id,
+                        was_transformed: false,
+                    })
+                } else {
+                    Err(err)
                 }
-            })?;
-            let next_table_name = lens
-                .translate_table(&current_table_name, direction)
-                .ok_or_else(|| TransformError::TableNotFound(current_table_name.clone()))?;
-            let next_table = next_schema
-                .get(&crate::query_manager::types::TableName::new(
-                    &next_table_name,
-                ))
-                .ok_or_else(|| TransformError::TableNotFound(next_table_name.clone()))?;
-            let next_desc = &next_table.columns;
-
-            // Apply lens with the appropriate direction
-            values = lens.apply(&values, &current_desc, next_desc, direction);
-            current_desc = next_desc.clone();
-            current_table_name = next_table_name;
+            }
+            Err(err) => Err(err),
         }
-
-        // Encode with target schema
-        let transformed_data = encode_row(target_desc, &values)
-            .map_err(|e| TransformError::EncodeError(format!("{:?}", e)))?;
-
-        Ok(TransformResult {
-            data: transformed_data,
-            batch_id,
-            was_transformed: true,
-        })
     }
 }
 
@@ -201,7 +253,14 @@ pub fn translate_table_name_to_schema(
         return Some(table.to_string());
     }
 
-    let lens_path = context.lens_path(target_hash).ok()?;
+    let Ok(lens_path) = context.lens_path(target_hash) else {
+        // No path at all — identity is the only candidate.
+        return identity_table_translation(context, table, target_hash);
+    };
+
+    // A path exists: its verdict is final. A decline mid-walk is an explicit
+    // Add/Remove-table boundary, not missing knowledge, and must stay a
+    // decline — the identity fallback never overrides it.
     let mut current_table = table.to_string();
     for (lens, direction) in lens_path.iter().rev() {
         let translate_direction = direction.reverse();
@@ -220,6 +279,31 @@ pub fn translate_table_name_to_schema(
     Some(current_table)
 }
 
+/// Identity fallback for table-name translation: a table whose descriptor is
+/// identical in both schemas translates to itself, lens or no lens.
+///
+/// Branch identity is whole-schema identity, so ANY schema change — even
+/// removing an unrelated table — puts every untouched table behind a crossing.
+/// Requiring a lens to merely NAME such a table silently excluded old branches
+/// from index-scan compilation, which starved clients of every pre-migration
+/// row after a table-removal deployment (production 2026-08-15). Runs only
+/// after the lens walk declined, so registered renames keep their semantics;
+/// a genuinely renamed table without a lens still fails to translate.
+fn identity_table_translation(
+    context: &SchemaContext,
+    table: &str,
+    other_hash: &SchemaHash,
+) -> Option<String> {
+    let other_schema = context.get_schema(other_hash)?;
+    let identical = other_schema
+        .get(&TableName::new(table))
+        .zip(context.current_schema.get(&TableName::new(table)))
+        .is_some_and(|(other_table, current_table)| {
+            other_table.columns.columns == current_table.columns.columns
+        });
+    identical.then(|| table.to_string())
+}
+
 /// Translate a table name from a source schema forward into the current schema.
 pub fn translate_table_name_from_schema(
     context: &SchemaContext,
@@ -230,7 +314,13 @@ pub fn translate_table_name_from_schema(
         return Some(table.to_string());
     }
 
-    let lens_path = context.lens_path(source_hash).ok()?;
+    let Ok(lens_path) = context.lens_path(source_hash) else {
+        // No path at all — identity is the only candidate. Same tightened
+        // semantics as the backward direction: an existing path's decline is
+        // final (see `translate_table_name_to_schema`).
+        return identity_table_translation(context, table, source_hash);
+    };
+
     let mut current_table = table.to_string();
     for (lens, direction) in lens_path {
         current_table = lens.translate_table(&current_table, direction)?;

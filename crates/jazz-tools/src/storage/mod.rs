@@ -3245,3 +3245,153 @@ pub(crate) fn encode_value(value: &Value) -> Vec<u8> {
         }
     }
 }
+
+// Throwaway diagnostic probe for a copied production/local RocksDB store.
+// Run:
+//   JAZZ_PROBE_PATH=/path/to/jazz.rocksdb.copy cargo test -p jazz-tools \
+//     --features "rocksdb test-utils" --lib -- storage::store_probe --ignored --nocapture
+#[cfg(all(test, feature = "rocksdb"))]
+mod store_probe {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn dump_branches_and_visible_row_counts() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+        let next_ord = load_next_branch_ord(&storage).expect("branch ord meta readable");
+        println!("next_branch_ord = {next_ord}");
+        let mut branches = Vec::new();
+        for ord in 1..next_ord {
+            match storage.load_branch_name_by_ord(ord) {
+                Ok(Some(name)) => {
+                    println!("branch[{ord}] = {name}");
+                    branches.push(name);
+                }
+                Ok(None) => println!("branch[{ord}] = <none>"),
+                Err(e) => println!("branch[{ord}] = error: {e}"),
+            }
+        }
+        let tables = [
+            "users",
+            "apple_identities",
+            "user_emails",
+            "unique_names",
+            "auth_pending_state",
+            "chats",
+            "chat_members",
+            "messages",
+        ];
+        for branch in &branches {
+            for table in tables {
+                match scan_visible_row_bytes_with_storage(&storage, table, branch.as_str()) {
+                    Ok(rows) if !rows.is_empty() => {
+                        println!("visible {table} @ {branch} = {}", rows.len());
+                    }
+                    Ok(_) => {}
+                    Err(e) => println!("visible {table} @ {branch} = error: {e}"),
+                }
+            }
+        }
+        println!("probe done");
+    }
+
+    /// End-to-end incident verification against a COPY of a real store:
+    /// rehydrate a runtime from its catalogue and require the pre-migration
+    /// `users` row to be visible — both to a bare subscription and to a
+    /// session-scoped one (the app's shape).
+    fn probe_incident_store<S: Storage>(mut storage: S) {
+        use crate::query_manager::session::Session as PolicySession;
+        use crate::query_manager::types::Schema;
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let current_hash_hex =
+            std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+        let user_row_id = crate::object::ObjectId::from_uuid(
+            uuid::Uuid::parse_str(
+                &std::env::var("JAZZ_PROBE_ROW_ID").expect("set JAZZ_PROBE_ROW_ID"),
+            )
+            .expect("valid row id"),
+        );
+
+        // Phase 1: extract the app's current schema from the catalogue. With
+        // an empty current schema every catalogue schema is identity-activated
+        // (no shared tables), so both land in live_schemas.
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target_hash = crate::query_manager::types::SchemaHash::from_hex(&current_hash_hex)
+            .expect("valid schema hash");
+        let current_schema = extractor
+            .context()
+            .live_schemas
+            .get(&target_hash)
+            .or_else(|| extractor.context().pending_schemas.get(&target_hash))
+            .cloned()
+            .expect("the app's schema must be in the catalogue");
+
+        // Phase 2: the app's world — current schema + full catalogue.
+        let mut sm = SchemaManager::new(SyncManager::new(), current_schema, app_id, "dev", "main")
+            .expect("phase-2 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(&mut sm, &storage, app_id)
+            .expect("phase-2 rehydrate");
+        let qm = sm.query_manager_mut();
+        println!("branches queried: {:?}", qm.all_query_branches());
+
+        let sub = qm
+            .subscribe(qm.query("users").build())
+            .expect("subscribe to users");
+        qm.process(&mut storage);
+        let results = qm.get_subscription_results(sub);
+        println!("no-session users rows visible: {}", results.len());
+        let ids: Vec<String> = results.iter().map(|(id, _)| id.to_string()).collect();
+        assert!(
+            ids.iter().any(|id| id == &user_row_id.to_string()),
+            "no-session: the incident user's row is invisible (visible ids: {ids:?})"
+        );
+
+        // The app's shape: the owner's session.
+        let session = PolicySession::new(&user_row_id.to_string());
+        let query = qm.query("users").build();
+        let sub2 = qm
+            .subscribe_with_session(query, Some(session), None)
+            .expect("session subscribe to users");
+        qm.process(&mut storage);
+        let with_session = qm.get_subscription_results(sub2);
+        println!("with-session users rows visible: {}", with_session.len());
+        let session_ids: Vec<String> = with_session.iter().map(|(id, _)| id.to_string()).collect();
+        assert!(
+            session_ids.iter().any(|id| id == &user_row_id.to_string()),
+            "with-session: the incident user's own row is invisible (visible ids: {session_ids:?})"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn incident_store_serves_the_users_row_after_rehydrate() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+        probe_incident_store(storage);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn incident_app_store_serves_the_users_row_after_rehydrate() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage = SqliteStorage::open(&path).expect("open copied app sqlite store");
+        probe_incident_store(storage);
+    }
+}

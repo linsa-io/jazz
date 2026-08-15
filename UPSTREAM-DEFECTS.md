@@ -633,6 +633,53 @@ denied it. Gates: `the_explicit_auth_using_arm_is_reachable`,
 
 ---
 
+## 19. An untouched table needs a lens to cross a schema change, or its rows vanish
+
+Branch identity is whole-schema identity: any schema change renames the
+composed branch for every table at once. The production 2026-08 migration
+removed exactly one table (`chat_activities`); the other 40 tables were
+byte-identical between the two hashes — and every pre-migration row of every
+one of them became unreachable on clients. Three layers each independently
+required a registered lens where the identity projection was the only correct
+answer:
+
+1. **Activation** (`schema_manager/context.rs try_activate_pending`): a
+   catalogue schema without a lens path to current stays `pending` forever, so
+   the old branch is never registered and queries never scan it. This is the
+   layer the mobile app died on: its catalogue carried both schemas and one
+   narrow lens (new→old, covering only the removed table), which does not
+   satisfy `non_draft_lens_path`.
+2. **Scan compilation** (`query_manager/graph/compile.rs`): per-branch
+   IndexScan nodes are skipped with a bare `continue` when
+   `translate_table_name_to_schema` fails — which it does without a lens, even
+   for a table whose name and descriptor are identical on both sides.
+3. **Materialization** (`schema_manager/transformer.rs LensTransformer`):
+   `NoLensPath`/`TableNotFound` drops the row with a debug-level log
+   (documented behaviour: `lens_transform_failure_drops_row_instead_of_fallback`).
+
+Measured end to end on the live lab: the server delivered the user's `users`
+row (confirm-me protocol, receiver confirmed), the row sat in the client's
+sqlite under `dev-<oldhash>-main`, and the account query under
+`dev-<newhash>-main` stayed empty forever — sign-in kicked to welcome with a
+restored identity in hand. The rpc-server (memory driver, fresh store each
+boot) hydrated identity tables at zero for the same reason.
+
+Fix, one invariant in three places: **identical descriptors are their own lens
+path.** `try_activate_pending` also activates when every shared-by-name table
+has an identical descriptor; both translate helpers fall back to identity for
+a same-named identical table after the lens walk declines; the transformer
+returns the bytes unchanged in the same case. Registered lenses keep priority
+everywhere — the fallbacks run only after the lens machinery declines, and a
+genuinely changed or renamed table without a lens still refuses to cross
+(`lens_transform_failure_drops_row_instead_of_fallback` stays green).
+
+Gates: `a_row_of_an_untouched_table_is_served_across_a_lensless_migration`
+(runtime_core, rehydrated, no lens published — red before the fix at the local
+axis check), `a_row_from_an_identical_table_on_another_schema_branch_is_served_without_a_lens`
+(manager level — red before the fix at 0 rows). Suite: 1515 passed / 0 failed.
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed

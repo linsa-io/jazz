@@ -398,8 +398,17 @@ impl SchemaContext {
         let pending_hashes: Vec<_> = self.pending_schemas.keys().copied().collect();
 
         for hash in pending_hashes {
-            // Check if we can now reach current from this pending schema
-            if self.non_draft_lens_path(&hash).is_ok() {
+            // A pending schema activates when current is reachable — through a
+            // registered lens path, or trivially when the identity projection
+            // is a complete path (see `identity_compatible_with_current`).
+            let lens_reachable = self.non_draft_lens_path(&hash).is_ok();
+            if lens_reachable || self.identity_compatible_with_current(&hash) {
+                if !lens_reachable {
+                    tracing::info!(
+                        schema = %hash.short(),
+                        "identity crossing: activated a pending schema without a lens"
+                    );
+                }
                 // Move from pending to live
                 if let Some(schema) = self.pending_schemas.remove(&hash) {
                     self.live_schemas.insert(hash, schema);
@@ -409,6 +418,28 @@ impl SchemaContext {
         }
 
         activated
+    }
+
+    /// True when every table the pending schema shares BY NAME with the current
+    /// schema has an identical descriptor — the identity lens is then a
+    /// complete, valid path between the two schemas.
+    ///
+    /// This is exactly an add/remove-table migration. Branch identity is
+    /// whole-schema identity, so removing one table renames the branch for all
+    /// the untouched ones; gating their activation on a registered lens left
+    /// every pre-migration row unreachable on clients whose catalogue carried
+    /// both schemas but no lens (production 2026-08-15: sign-in settled empty,
+    /// rpc hydration read zero). Tables present in only one of the two schemas
+    /// need no projection — no queryable rows can cross for them.
+    fn identity_compatible_with_current(&self, hash: &SchemaHash) -> bool {
+        let Some(pending) = self.pending_schemas.get(hash) else {
+            return false;
+        };
+        pending.iter().all(|(name, table)| {
+            self.current_schema
+                .get(name)
+                .is_none_or(|current| current.columns.columns == table.columns.columns)
+        })
     }
 
     /// Get pending schema by hash.
