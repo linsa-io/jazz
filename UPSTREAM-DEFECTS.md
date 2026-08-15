@@ -1065,6 +1065,157 @@ asserted either way.
 
 ---
 
+## 25. NOT A DEFECT (falsified): "v16.13 broke client-local updates to a split-family row" — the store file was detached, not the write path
+
+**Severity: none in the engine — the suspected mechanism is disproven.** Investigated
+2026-08-15: the incident device's `users`-row updates (a 10s presence heartbeat plus a
+manual profile edit) appeared to stop applying after the v16.13 engine, while writes to
+a migration-added table kept propagating. The suspected mechanism — the v16.13/v16.14
+authorization changes breaking the `whereOld` old-content read for a family split
+across the schema crossing — was probed and does NOT reproduce at ANY level against a
+copy of the incident store:
+
+- `SchemaManager::update` under the owner's session with the deployed permissions head:
+  APPLIES, lands on the writer's branch (probe
+  `incident_app_store_applies_the_owner_heartbeat`).
+- The device's exact entry point — jazz-rn's construction order (bundle schema,
+  catalogue rehydrate, `RuntimeCore::new`, `persist_schema`) then `RuntimeCore::update`,
+  with and without prior session subscriptions and ticks: APPLIES
+  (`incident_app_store_applies_the_owner_heartbeat_through_the_runtime`).
+- Negative control in both probes: the same session updating ANOTHER user's row is
+  DENIED — `whereOld` bites.
+
+The write path's old-content read was verified in code: `SchemaManager::update` loads
+the row via `load_row_for_schema_update_in_context` over `all_branch_names()` — the
+same cross-generation family reads serve — and the write still lands on the target
+branch. The v16.12→v16.14 diff contains no jazz-rn/TS-runtime/expo changes at all.
+
+What the store itself proved (`incident_app_store_stuck_heartbeat_forensics`): the
+newest write of ANY kind in the file is 12:26:46Z — the tail of the last healthy
+v16.12 session (1377 healthy heartbeat batches, 08:15→12:26Z, all `VisibleDirect`
+with `DurableDirect`/GlobalServer fates). The v16.13/v16.14 sessions left NOTHING:
+no heartbeats, no chat_activities (the "working" control!), no inbound sync rows, an
+empty WAL, main-file mtime frozen at 12:26Z. Sessions that demonstrably synced through
+the server wrote zero bytes here — they were not running on this file.
+
+The app's own code names the mechanism (`Linsa.Mobile.RN` `shared/lib/jazz/client.ts`):
+`dataPath` is unset, so jazz-rn defaults to `<app-container>/tmp/<appId>.sqlite`, and
+iOS purges/relocates `tmp/` on app update — and every engine version arrives AS an app
+update. The correlation "broke after installing v16.13" is install-shaped, not
+engine-shaped: each new build detached the app from this store file. Fix belongs in the
+app (move the store out of `tmp/` via `DbConfig.dataPath`), exactly as that comment
+already says.
+
+Engine-side outcome: the suspected invariant is pinned by a hermetic gate,
+`an_owner_updates_their_split_family_row_under_the_permissions_head`
+(runtime_core/tests.rs) — a session update to the owner's own row across the crossing
+and again once the family is split, under a permissions head with `whereOld`+`whereNew`,
+must apply and land on the writer's branch; controls: foreign row denied (`whereOld`),
+owner-rewrite denied (`whereNew`), same-world update applies. Falsified on both axes:
+scoping the update's old-content load to the write's own branch reddens the crossing
+assertion; allowing every update reddens the foreign-row control. Suite: 1529 passed /
+0 failed. Probes: write probes apply; entry-23/24 read probe numbers unchanged
+(12/12 with session, app-shaped 5, full shape 5 of 5).
+
+Attribution: NOT-A-DEFECT (engine); app-configuration defect in the consumer
+(store under purgeable `tmp/`). Groove (codex/jazz-core-engine-swap): not applicable —
+no engine change; the gate travels with the main line as a regression pin.
+
+---
+
+## 26. One failed storage commit wedges a row's sync forever — no retry, no parent backfill, no parking
+
+**Severity: permanent sync loss for the row, self-sustaining.** Measured live
+(2026-08-15, sync server on v16.14): one transient ENOSPC on a rocksdb txn commit —
+`failed to apply synced row batch … source="permission_approval"
+err=StorageError(IoError("rocksdb txn commit: … No space left on device …"))` — and every
+subsequent batch of that row, each parenting the previous, then died with
+`ParentNotFound(<the batch that failed to commit>)` at the app's ~10 s heartbeat cadence:
+548 failures and counting across two wedged `users` rows, hours after the disk was freed.
+Presence and profile-name edits stopped propagating for every device; a different,
+unwedged table kept working, which is what made it look like anything but storage.
+
+Three mechanisms, each verified in code, that together make one transient failure
+permanent:
+
+1. **A failed apply is terminal.** `apply_row_updated` (`sync_manager/inbox.rs`) handled
+   `Err` from `apply_row_batch_with_context` / `apply_row_batch` with one warn and
+   `return None` — identical at merge-base `e84d84a6`. No retry, no parking, no fate
+   recorded, and for the permission path the check was already consumed
+   (`approve_permission_check` takes it off the queue before applying).
+2. **The sender believes it delivered.** The client records
+   `record_delivery` into `sent_batch_ids` at QUEUE time for the server direction
+   (`queue_row_to_server_with_metadata`, `sync_logic.rs`) — there is no server→client
+   apply-ack; `DeliveryConfirmed` travels client→server only (`process_from_server`
+   warns and ignores it in the other direction). So the ancestor DFS in
+   `queue_row_to_server_with_missing_parents` terminates on its first membership probe
+   and the client only ever sends the newest batch. The fork's own fix-D1 comment
+   (`SentBatchIds::record_delivery`, `types.rs`) states the premise this defect breaks:
+   an over-claim "would make the receiver drop rows on `ParentNotFound` with **no repair
+   protocol**". The failed commit manufactures exactly that over-claim without any
+   pruning bug.
+3. **`ParentNotFound` asks no one for anything.** The confirm-me machinery
+   (`BatchFate::Missing` → client `retransmit_local_batch_to_servers` →
+   `force_row_batch_to_servers`, which busts the dedup claim) exists and is exactly the
+   needed instruction, but the only emitter was the seal path
+   (`try_accept_completed_sealed_batch_from_client`) — which names the SEALED batch, i.e.
+   the newest one, whose retransmission dies on the same missing ancestor. Zero
+   backfill requests for the missing parent appeared in the live logs, matching the code.
+
+Fix, in `sync_manager/inbox.rs`: a recoverable apply failure is now **parked, requested,
+and drained** instead of dropped. `try_apply_row_updated` reports
+Applied/Dropped/Failed; the `apply_row_updated` wrapper parks a `Failed` batch per
+`(row, branch)` (`ParkedRowBatch` — payload, fate recording, source, origin), and for
+`ParentNotFound` asks the sending client for the missing ancestor with
+`BatchFate::Missing { parent }` under the SAME per-batch budget as the seal answers
+(`may_tell_client_a_batch_is_missing` — first answer free, then rate-limited, then
+loud give-up), so a peer that cannot supply the parent cannot drive a loop. Any
+successful apply on the row drains the park (`drain_parked_row_batches`, pass-bounded),
+re-running the origin's post-apply work (`finish_parked_row_apply`); an unappliable
+parked batch re-asks for its gap under the budget. Memory is capped both ways —
+`MAX_PARKED_ROW_BATCHES_PER_ROW = 32` (evict oldest, loud) and `MAX_PARKED_ROWS = 256`
+(evict least-recently-parked row, loud) — safe because everything parked is still held
+by its sender and eviction only costs a re-request. Towards an upstream server no
+request payload exists; the park alone covers that direction (replication replays
+supply the ancestor). Nothing is invented for genuinely bad batches: a batch with no
+metadata and no locator, or a non-member of a rejected seal, stays terminally dropped.
+
+How the live wedge heals after deploy, relying on **sender retransmission** (the client
+holds the complete healthy chain; its wedged batches never settled, so their local
+records were never retired): the next heartbeat (or seal-driven resend) fails
+`ParentNotFound(P_n)` → the server parks it and answers `Missing{P_n}` → the client
+retransmits P*n's rows + seal → P_n fails on P*{n-1}, is parked, `Missing{P_{n-1}}` —
+one free first answer per DISTINCT ancestor, so the walk-back runs at round-trip speed,
+not the 5 s interval — until the first batch after the last applied one, whose parent
+IS present, applies; the drain then cascades forward through everything parked, and
+per-row-cap evictions only add a bounded re-request per gap. One round trip per
+missing ancestor, no operator action, no graft.
+
+Gates (`sync_manager/tests/wedged_row_recovery.rs`), with a `MemoryStorage`
+row-mutation failure knob (`set_row_mutation_failure`) as the ENOSPC stand-in:
+`a_row_wedged_by_a_transient_commit_failure_converges_after_the_storage_heals` — the
+incident end to end through the permission-approval path; red before the fix at the
+convergence assertion (applied = `{}`, wedged forever).
+`a_missing_parent_is_requested_from_the_sender_and_the_child_applies_when_it_arrives` —
+the protocol face; red before the fix at the request assertion (0 `Missing` answers).
+Controls: a malformed batch is still dropped without parking or requests (green on both
+sides of the fix); five orphan resends produce exactly one ancestor request and no park
+growth; the per-row park evicts its oldest at the cap. Falsified by disarming the
+wrapper back to drop-on-failure: both gates red at exactly those assertions; rearm
+green. Suite: 1534 passed / 0 failed (1529 + these five);
+`offline_reap_delivery.rs` 8/8, `offline_delivery_edges.rs` 4/4, crossing/policy gates
+of entries 19-25 green.
+
+Attribution: UPSTREAM-INHERITED (drop-on-error verbatim at `e84d84a6`; the fork had
+added the `source`/`parents` fields to the warn — which is what measured this — but no
+repair).
+Groove (codex/jazz-core-engine-swap): not verified for this entry. The class is
+delivery-repair, which the groove line rearchitects (`CommitUnit`/`FateUpdate`, per-peer
+payload inventory, and parking for unknown-schema rows); whether a failed COMMIT parks
+or drops there was not checked.
+
+---
+
 ## Groove line: verification summary (2026-08-15)
 
 Upstream's Thursday publishes are cut from the integration branch

@@ -467,3 +467,4 @@ mod settlements;
 mod subscriptions;
 mod transaction_sealing;
 mod visible_ancestor_cost;
+mod wedged_row_recovery;

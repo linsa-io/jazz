@@ -117,6 +117,7 @@ async fn ws_handshake_open(
         auth,
         catalogue_state_hash: None,
         declared_schema_hash: None,
+        acks_deliveries: false,
     };
     let payload = serde_json::to_vec(&handshake).expect("serialize AuthHandshake");
     ws.send(Message::Binary(frame_encode(&payload).into()))

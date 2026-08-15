@@ -109,6 +109,24 @@ pub const MISSING_ANSWER_GIVE_UP_AFTER_MICROS: u64 = REDELIVERY_GIVE_UP_AFTER_MI
 /// further. A peer that cycles fresh ids to dodge the budget hits both.
 pub(super) const MAX_TRACKED_MISSING_ANSWERS: usize = 1024;
 
+/// How many recoverably-failed row batches are kept parked per `(row, branch)`.
+///
+/// A parked batch is one whose apply failed for a reason a later arrival can cure — a
+/// transient storage error, or a parent that has not landed yet. The queue must be capped
+/// because its depth is peer-driven: a wedged row keeps receiving one new child per
+/// heartbeat for as long as the wedge lasts (548 batches over one incident afternoon,
+/// production 2026-08-15). Past the cap the OLDEST parked batch is dropped with a warning —
+/// dropped from the park only, not lost: every parked batch is still held by its sender,
+/// and the ancestor-request path re-obtains it when the healed prefix reaches its gap.
+pub(super) const MAX_PARKED_ROW_BATCHES_PER_ROW: usize = 32;
+
+/// How many distinct `(row, branch)` keys may hold parked batches at once.
+///
+/// Bounds the second axis a peer controls: fresh row ids. Past the cap the least-recently
+/// parked row's whole queue is dropped with a warning, on the same reasoning as the per-row
+/// cap — the senders still hold everything dropped here.
+pub(super) const MAX_PARKED_ROWS: usize = 256;
+
 /// What this authority has already told one client about the batches it cannot complete.
 ///
 /// The tracked ids are kept in creation order so making room is O(1): the cap is reached
@@ -175,6 +193,26 @@ pub struct SyncManager {
     /// and no fate is invented, because on the peer a `Rejected` destroys the row and the
     /// graft tool is offline-only.
     pub(super) missing_answers: HashMap<ClientId, ClientMissingAnswers>,
+
+    /// Row batches whose apply failed recoverably, kept until a later arrival on the same
+    /// row makes them applicable.
+    ///
+    /// Two failure shapes land here, and both used to be terminal (the batch was dropped
+    /// with one warn line, while the sender's dedup bookkeeping recorded it as delivered):
+    /// a transient storage error on the commit, and `ParentNotFound` — which the first
+    /// shape then manufactures for every subsequent batch of the row, forever (production
+    /// 2026-08-15: one ENOSPC commit, 548 cascading `ParentNotFound` failures over two
+    /// wedged rows, presence and profile edits dead for every device). Parked batches are
+    /// retried whenever a batch for their row applies; a missing ancestor is requested
+    /// from the sending client via the existing `BatchFate::Missing` retransmission
+    /// instruction, budget-gated by `may_tell_client_a_batch_is_missing`.
+    ///
+    /// In-memory on purpose: everything parked is still held by its sender, so a restart
+    /// loses nothing that the ancestor-request path cannot re-obtain.
+    pub(super) parked_row_batches: HashMap<(ObjectId, BranchName), VecDeque<inbox::ParkedRowBatch>>,
+    /// Insertion order of the keys in `parked_row_batches`, for least-recently-parked
+    /// eviction at `MAX_PARKED_ROWS`. Kept exactly in sync with the map's key set.
+    pub(super) parked_rows_order: VecDeque<(ObjectId, BranchName)>,
 
     /// Rows this node has applied and not yet reported upstream.
     ///
@@ -361,6 +399,8 @@ impl SyncManager {
             outbox: Vec::new(),
             pending_client_deliveries: HashMap::new(),
             missing_answers: HashMap::new(),
+            parked_row_batches: HashMap::new(),
+            parked_rows_order: VecDeque::new(),
             applied_rows_to_confirm: Vec::new(),
             upstream_supports_delivery_acks: false,
             pending_permission_checks: Vec::new(),

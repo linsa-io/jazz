@@ -6114,3 +6114,201 @@ fn a_denied_nested_user_include_clips_its_element_not_the_outer_row() {
         "the denied user's content leaked into the served result: {serialized}"
     );
 }
+
+/// Structural presence schema for the defect-25 gate: policy-stripped, the
+/// way the app's runtime schema arrives; enforcement comes from the
+/// permissions head below.
+fn presence_users_structural_schema(with_doomed_table: bool) -> Schema {
+    let builder = SchemaBuilder::new().table(
+        TableSchema::builder("users")
+            .column("name", ColumnType::Text)
+            .column("onlineTimeUpdatedAtMs", ColumnType::Timestamp),
+    );
+    if with_doomed_table {
+        builder
+            .table(TableSchema::builder("user_emails").column("email", ColumnType::Text))
+            .build()
+    } else {
+        builder.build()
+    }
+}
+
+/// The permissions head for the defect-25 gate: the app's `users` shape —
+/// UPDATE gated by whereOld AND whereNew (`USING` + `WITH CHECK`), both
+/// requiring the row to be the session user's own.
+fn presence_users_auth_schema() -> Schema {
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("users")
+                .column("name", ColumnType::Text)
+                .column("onlineTimeUpdatedAtMs", ColumnType::Timestamp)
+                .policies(
+                    TablePolicies::new()
+                        .with_select(PolicyExpr::True)
+                        .with_insert(PolicyExpr::True)
+                        .with_update(
+                            Some(PolicyExpr::eq_session("name", vec!["user_id".into()])),
+                            PolicyExpr::eq_session("name", vec!["user_id".into()]),
+                        ),
+                ),
+        )
+        .build()
+}
+
+/// Defect-25 gate: a session UPDATE to the user's OWN row whose family is
+/// SPLIT across the schema crossing, under a permissions head with
+/// whereOld + whereNew, MUST apply — and land on the writer's branch.
+///
+/// The whereOld arm forces write authorization to read the row's OLD
+/// content; across the crossing that content's tip lives on the
+/// pre-migration branch (first update) and then the family is split
+/// (second update). Investigated as the suspected mechanism of the
+/// 2026-08-15 frozen-presence incident; the engine handled this shape at
+/// every probed level (the incident traced to the store file itself —
+/// see UPSTREAM-DEFECTS.md entry 25), and this pins the behavior against
+/// an actual regression.
+///
+/// Controls, don't-weaken: whereOld still denies the session another
+/// user's row; whereNew still denies rewriting the row to another owner;
+/// a row born in the NEW world updates the same way (v16.12-era shape).
+#[test]
+fn an_owner_updates_their_split_family_row_under_the_permissions_head() {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        presence_users_structural_schema(true),
+        "defect25-split-update",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(presence_users_auth_schema());
+    let alice = Session::new("alice");
+    let alice_ctx = WriteContext::from_session(alice.clone());
+    let bob_ctx = WriteContext::from_session(Session::new("bob"));
+
+    // Rows born in the OLD world.
+    let ((alice_row, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([
+            ("name".to_string(), Value::Text("alice".to_string())),
+            ("onlineTimeUpdatedAtMs".to_string(), Value::Timestamp(1_000)),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("alice's row inserts under the old schema");
+    let ((bob_row, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([
+            ("name".to_string(), Value::Text("bob".to_string())),
+            ("onlineTimeUpdatedAtMs".to_string(), Value::Timestamp(1_000)),
+        ]),
+        Some(&bob_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("bob's row inserts under the old schema");
+    core.batched_tick();
+    core.immediate_tick();
+
+    // The crossing: same store, identity-compatible schema minus a table.
+    let storage = core.into_storage();
+    let mut core = recreate_runtime_rehydrated(
+        presence_users_structural_schema(false),
+        "defect25-split-update",
+        storage,
+    );
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(presence_users_auth_schema());
+    core.immediate_tick();
+
+    // First post-crossing heartbeat: the row's tip still lives on the OLD
+    // branch, so whereOld must read across the crossing.
+    core.update(
+        alice_row,
+        vec![("onlineTimeUpdatedAtMs".to_string(), Value::Timestamp(2_000))],
+        Some(&alice_ctx),
+    )
+    .expect("the owner's update across the crossing applies");
+    core.batched_tick();
+    core.immediate_tick();
+
+    // Second heartbeat: the family is now SPLIT — old-branch history plus a
+    // new-branch tip. The incident shape.
+    core.update(
+        alice_row,
+        vec![("onlineTimeUpdatedAtMs".to_string(), Value::Timestamp(3_000))],
+        Some(&alice_ctx),
+    )
+    .expect("the owner's update to the split family applies");
+    core.batched_tick();
+    core.immediate_tick();
+
+    // The write is visible fresh under the owner's session.
+    let online_index = column_index(
+        &presence_users_structural_schema(false),
+        "users",
+        "onlineTimeUpdatedAtMs",
+    );
+    let alice_query = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .query("users")
+        .filter_eq("name", Value::Text("alice".to_string()))
+        .build();
+    let served = execute_runtime_query(&mut core, alice_query, Some(alice.clone()));
+    assert_eq!(
+        served.len(),
+        1,
+        "alice reads exactly her row (served: {served:?})"
+    );
+    assert_eq!(
+        served[0].1[online_index],
+        Value::Timestamp(3_000),
+        "the split-family update's content must be what reads serve"
+    );
+
+    // Don't-weaken: whereOld still denies another user's row.
+    let foreign = core.update(
+        bob_row,
+        vec![("onlineTimeUpdatedAtMs".to_string(), Value::Timestamp(4_000))],
+        Some(&alice_ctx),
+    );
+    assert!(
+        foreign.is_err(),
+        "alice updated bob's row — whereOld no longer bites: {foreign:?}"
+    );
+
+    // Don't-weaken: whereNew still denies rewriting the row to another owner.
+    let stolen = core.update(
+        alice_row,
+        vec![("name".to_string(), Value::Text("mallory".to_string()))],
+        Some(&alice_ctx),
+    );
+    assert!(
+        stolen.is_err(),
+        "alice renamed her row to another owner — whereNew no longer bites: {stolen:?}"
+    );
+
+    // v16.12-era control: a row born in the NEW world updates the same way.
+    let carol_ctx = WriteContext::from_session(Session::new("carol"));
+    let ((carol_row, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([
+            ("name".to_string(), Value::Text("carol".to_string())),
+            ("onlineTimeUpdatedAtMs".to_string(), Value::Timestamp(1_000)),
+        ]),
+        Some(&carol_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("carol's row inserts under the new schema");
+    core.update(
+        carol_row,
+        vec![("onlineTimeUpdatedAtMs".to_string(), Value::Timestamp(5_000))],
+        Some(&carol_ctx),
+    )
+    .expect("a same-world update still applies");
+}

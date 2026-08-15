@@ -65,6 +65,37 @@ impl ApplySource {
     }
 }
 
+/// The peer an inbound row batch came from, kept alongside a parked batch: it is who a
+/// missing ancestor can be requested from, and who post-apply forwarding must except.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowApplyOrigin {
+    Client(ClientId),
+    Server(ServerId),
+}
+
+/// A row batch whose apply failed for a reason a later arrival can cure.
+///
+/// Everything needed to re-run the apply and the origin-appropriate post-apply work, so a
+/// parked batch completes exactly as it would have on first arrival.
+#[derive(Clone)]
+pub(crate) struct ParkedRowBatch {
+    pub(super) metadata: Option<RowMetadata>,
+    pub(super) row: StoredRowBatch,
+    pub(super) fate_recording: AuthoritativeFateRecording,
+    pub(super) source: ApplySource,
+    pub(super) origin: RowApplyOrigin,
+}
+
+/// What one apply attempt did with a batch. `Dropped` is the terminal no — the batch is
+/// unusable here and the warn named it. `Failed` is the recoverable no this module used to
+/// conflate with it: the batch is fine, this attempt was not, and dropping it is what
+/// turned one transient commit failure into a permanently wedged row.
+enum RowApplyOutcome {
+    Applied(Box<AppliedRowBatch>),
+    Dropped,
+    Failed(crate::row_histories::RowHistoryError),
+}
+
 impl SyncManager {
     fn retain_client_batch_fate(&mut self, fate: &BatchFate) -> bool {
         tracing::debug!(
@@ -541,14 +572,17 @@ impl SyncManager {
         Some(visible_rows)
     }
 
-    fn apply_row_updated<H: Storage>(
+    /// One apply attempt, no recovery. Callers outside the recovery machinery
+    /// go through [`Self::apply_row_updated`], which parks a `Failed` outcome
+    /// instead of forgetting it.
+    fn try_apply_row_updated<H: Storage>(
         &mut self,
         storage: &mut H,
         metadata: Option<RowMetadata>,
         mut row: StoredRowBatch,
         fate_recording: AuthoritativeFateRecording,
         source: ApplySource,
-    ) -> Option<AppliedRowBatch> {
+    ) -> RowApplyOutcome {
         let authoritative_tier = match (row.confirmed_tier, self.max_local_durability_tier()) {
             (Some(incoming), Some(local)) => Some(incoming.max(local)),
             (Some(incoming), None) => Some(incoming),
@@ -557,7 +591,10 @@ impl SyncManager {
         };
         row.confirmed_tier = None;
 
-        let metadata = self.row_metadata_from_payload(storage, &row, metadata.as_ref())?;
+        let Some(metadata) = self.row_metadata_from_payload(storage, &row, metadata.as_ref())
+        else {
+            return RowApplyOutcome::Dropped;
+        };
         if matches!(
             storage.load_authoritative_batch_fate(row.batch_id),
             Ok(Some(BatchFate::Rejected { .. }))
@@ -583,7 +620,7 @@ impl SyncManager {
                         })
                 });
             if !is_declared_member {
-                return None;
+                return RowApplyOutcome::Dropped;
             }
             row.state = RowState::Rejected;
         }
@@ -620,7 +657,7 @@ impl SyncManager {
                                 ?err,
                                 "failed to apply synced row batch"
                             );
-                            return None;
+                            return RowApplyOutcome::Failed(err);
                         }
                     }
                 }
@@ -637,7 +674,7 @@ impl SyncManager {
                                 ?err,
                                 "failed to apply synced row batch"
                             );
-                            return None;
+                            return RowApplyOutcome::Failed(err);
                         }
                     }
                 }
@@ -664,11 +701,307 @@ impl SyncManager {
             }
         }
 
-        Some(AppliedRowBatch {
+        RowApplyOutcome::Applied(Box::new(AppliedRowBatch {
             metadata,
             row,
             visibility_change,
-        })
+        }))
+    }
+
+    /// Apply an inbound row batch, recovering what one attempt cannot do alone.
+    ///
+    /// A recoverable failure — a transient storage error, a parent that has not landed —
+    /// parks the batch instead of dropping it, and a `ParentNotFound` additionally asks
+    /// the sending client to retransmit the missing ancestor (`BatchFate::Missing` is the
+    /// existing instruction whose client handler resends a batch's rows and seal; the ask
+    /// is budget-gated exactly like the seal path's). Any successful apply then retries
+    /// the row's parked batches, so a healed prefix cascades through every child that
+    /// arrived while the row was wedged.
+    ///
+    /// This is what makes one failed commit non-terminal. Before it, the failed batch was
+    /// dropped with a warn while the sender's dedup bookkeeping recorded it as delivered —
+    /// so every later batch of the row died with `ParentNotFound`, unboundedly (production
+    /// 2026-08-15: one ENOSPC commit, 548 cascading failures, two rows wedged until this
+    /// mechanism existed).
+    fn apply_row_updated<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        origin: RowApplyOrigin,
+        metadata: Option<RowMetadata>,
+        row: StoredRowBatch,
+        fate_recording: AuthoritativeFateRecording,
+        source: ApplySource,
+    ) -> Option<AppliedRowBatch> {
+        let row_key = (row.row_id, BranchName::new(&row.branch));
+        let first_attempt = self.try_apply_row_updated(
+            storage,
+            metadata.clone(),
+            row.clone(),
+            fate_recording,
+            source,
+        );
+        let error = match first_attempt {
+            RowApplyOutcome::Applied(applied) => {
+                self.drain_parked_row_batches(storage, row_key);
+                return Some(*applied);
+            }
+            RowApplyOutcome::Dropped => return None,
+            RowApplyOutcome::Failed(error) => error,
+        };
+
+        // A parked ancestor may have become applicable since it failed — the storage that
+        // rejected its commit healed, or its own parent arrived on another path. Give the
+        // parked set one pass and retry once before parking this batch too.
+        let error = if self.parked_row_batches.contains_key(&row_key) {
+            self.drain_parked_row_batches(storage, row_key);
+            match self.try_apply_row_updated(
+                storage,
+                metadata.clone(),
+                row.clone(),
+                fate_recording,
+                source,
+            ) {
+                RowApplyOutcome::Applied(applied) => {
+                    self.drain_parked_row_batches(storage, row_key);
+                    return Some(*applied);
+                }
+                RowApplyOutcome::Dropped => return None,
+                RowApplyOutcome::Failed(error) => error,
+            }
+        } else {
+            error
+        };
+
+        self.park_failed_row_batch(
+            ParkedRowBatch {
+                metadata,
+                row,
+                fate_recording,
+                source,
+                origin,
+            },
+            &error,
+        );
+        None
+    }
+
+    /// Keep a recoverably-failed batch for retry, and ask its sender for a missing parent.
+    fn park_failed_row_batch(
+        &mut self,
+        parked: ParkedRowBatch,
+        error: &crate::row_histories::RowHistoryError,
+    ) {
+        let row_key = (parked.row.row_id, BranchName::new(&parked.row.branch));
+
+        if let crate::row_histories::RowHistoryError::ParentNotFound(parent) = error {
+            self.request_missing_ancestor(parked.origin, row_key.0, *parent);
+        }
+
+        if !self.parked_row_batches.contains_key(&row_key) {
+            if self.parked_row_batches.len() >= MAX_PARKED_ROWS
+                && let Some(evicted_key) = self.parked_rows_order.pop_front()
+            {
+                let evicted = self
+                    .parked_row_batches
+                    .remove(&evicted_key)
+                    .map(|queue| queue.len())
+                    .unwrap_or(0);
+                tracing::warn!(
+                    target: "jazz::sync",
+                    row_id = %evicted_key.0,
+                    branch_name = %evicted_key.1,
+                    batches = evicted,
+                    "dropping the least-recently parked row's batches: too many rows are \
+                     parked at once; the senders still hold them and the ancestor-request \
+                     path re-obtains them"
+                );
+            }
+            self.parked_rows_order.push_back(row_key);
+        }
+        let queue = self.parked_row_batches.entry(row_key).or_default();
+        if let Some(existing) = queue
+            .iter_mut()
+            .find(|candidate| candidate.row.batch_id == parked.row.batch_id)
+        {
+            // A retransmission of an already-parked batch refreshes it in place: the queue
+            // must not grow with resends of the same batch.
+            *existing = parked;
+            return;
+        }
+        if queue.len() >= MAX_PARKED_ROW_BATCHES_PER_ROW {
+            let evicted = queue.pop_front();
+            tracing::warn!(
+                target: "jazz::sync",
+                row_id = %row_key.0,
+                branch_name = %row_key.1,
+                evicted_batch_id = ?evicted.map(|entry| entry.row.batch_id),
+                "evicting the oldest parked batch for a row at its parking cap; its sender \
+                 still holds it and the ancestor-request path re-obtains it"
+            );
+        }
+        tracing::debug!(
+            target: "jazz::sync",
+            row_id = %row_key.0,
+            branch_name = %row_key.1,
+            batch_id = ?parked.row.batch_id,
+            parked = queue.len() + 1,
+            ?error,
+            "parking a row batch whose apply failed recoverably"
+        );
+        queue.push_back(parked);
+    }
+
+    /// Ask the peer that sent a child for the ancestor this authority is missing.
+    ///
+    /// Towards a client this is `BatchFate::Missing`, the existing retransmission
+    /// instruction, under the same per-batch budget as the seal path — a peer that cannot
+    /// supply the ancestor is answered a bounded number of times and then loudly given up
+    /// on. Towards an upstream server no request payload exists; the parked batch waits
+    /// for the ancestor to arrive by replication, and the warn names the gap.
+    fn request_missing_ancestor(
+        &mut self,
+        origin: RowApplyOrigin,
+        row_id: ObjectId,
+        parent: crate::row_histories::BatchId,
+    ) {
+        match origin {
+            RowApplyOrigin::Client(client_id) => {
+                if self.may_tell_client_a_batch_is_missing(client_id, parent) {
+                    tracing::warn!(
+                        target: "jazz::sync",
+                        %client_id,
+                        %row_id,
+                        missing_parent = ?parent,
+                        "requesting a missing ancestor batch from the client that sent its child"
+                    );
+                    self.queue_batch_fate_to_client_unfiltered(
+                        client_id,
+                        BatchFate::Missing { batch_id: parent },
+                    );
+                }
+            }
+            RowApplyOrigin::Server(server_id) => {
+                tracing::warn!(
+                    target: "jazz::sync",
+                    %server_id,
+                    %row_id,
+                    missing_parent = ?parent,
+                    "parked a row batch missing an ancestor from an upstream server; \
+                     waiting for replication to supply it"
+                );
+            }
+        }
+    }
+
+    /// Retry a row's parked batches until a pass makes no progress.
+    ///
+    /// Each applied batch runs the same post-apply work its origin's inbox arm would have
+    /// run, and may unblock further parked batches — hence the outer loop, which is bounded
+    /// by the queue length (every pass that continues has applied and removed at least one
+    /// entry). A batch that still cannot apply stays parked; if what it is missing is a
+    /// parent, the ask is repeated under the same budget as on first failure, so a healed
+    /// prefix immediately pulls the next gap instead of waiting for new row traffic.
+    fn drain_parked_row_batches<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        row_key: (ObjectId, BranchName),
+    ) {
+        loop {
+            let Some(queue) = self.parked_row_batches.remove(&row_key) else {
+                break;
+            };
+            let mut kept: std::collections::VecDeque<ParkedRowBatch> =
+                std::collections::VecDeque::new();
+            let mut progressed = false;
+            for parked in queue {
+                match self.try_apply_row_updated(
+                    storage,
+                    parked.metadata.clone(),
+                    parked.row.clone(),
+                    parked.fate_recording,
+                    parked.source,
+                ) {
+                    RowApplyOutcome::Applied(applied) => {
+                        progressed = true;
+                        self.finish_parked_row_apply(storage, &parked, *applied);
+                    }
+                    RowApplyOutcome::Dropped => {
+                        // Terminal for this batch; the warn inside the attempt named it.
+                    }
+                    RowApplyOutcome::Failed(error) => {
+                        if let crate::row_histories::RowHistoryError::ParentNotFound(parent) =
+                            &error
+                        {
+                            self.request_missing_ancestor(parked.origin, row_key.0, *parent);
+                        }
+                        kept.push_back(parked);
+                    }
+                }
+            }
+            let done = kept.is_empty();
+            if done {
+                if let Some(position) = self
+                    .parked_rows_order
+                    .iter()
+                    .position(|candidate| *candidate == row_key)
+                {
+                    self.parked_rows_order.remove(position);
+                }
+            } else {
+                self.parked_row_batches.insert(row_key, kept);
+            }
+            if done || !progressed {
+                break;
+            }
+        }
+    }
+
+    /// The post-apply work the origin's inbox arm would have run had the batch applied on
+    /// first arrival: forwarding, fate settlement, and visibility propagation.
+    fn finish_parked_row_apply<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        parked: &ParkedRowBatch,
+        applied: AppliedRowBatch,
+    ) {
+        let object_id = applied.row.row_id;
+        let branch_name = BranchName::new(&applied.row.branch);
+        match parked.origin {
+            RowApplyOrigin::Server(server_id) => {
+                self.note_applied_row(object_id, applied.row.branch.as_str(), applied.row.batch_id);
+                self.apply_authoritative_transaction_fate_for_row(storage, server_id, &applied.row);
+                if let Some(update) = applied.visibility_change {
+                    self.pending_row_visibility_changes.push(update);
+                    self.forward_update_to_clients_with_storage(storage, object_id, branch_name);
+                }
+            }
+            RowApplyOrigin::Client(client_id) => {
+                self.forward_row_batch_to_servers(
+                    storage,
+                    object_id,
+                    applied.metadata.clone(),
+                    parked.row.clone(),
+                );
+                if !matches!(
+                    applied.row.state,
+                    RowState::StagingPending | RowState::Superseded
+                ) && let Some(update) = applied.visibility_change
+                {
+                    self.pending_row_visibility_changes.push(update);
+                    self.forward_update_to_clients_except_with_storage(
+                        storage,
+                        object_id,
+                        branch_name,
+                        client_id,
+                    );
+                }
+                self.try_accept_completed_sealed_batch_from_client(
+                    storage,
+                    client_id,
+                    applied.row.batch_id,
+                );
+            }
+        }
     }
 
     pub(super) fn respond_to_batch_fate_request<H: Storage>(
@@ -1704,6 +2037,7 @@ impl SyncManager {
                 );
                 if let Some(applied) = self.apply_row_updated(
                     storage,
+                    RowApplyOrigin::Server(server_id),
                     metadata,
                     row.clone(),
                     AuthoritativeFateRecording::AcceptedByLocalAuthority,
@@ -2300,9 +2634,14 @@ impl SyncManager {
                     .or_default()
                     .insert(client_id);
 
-                if let Some(applied) =
-                    self.apply_row_updated(storage, metadata, row.clone(), fate_recording, source)
-                {
+                if let Some(applied) = self.apply_row_updated(
+                    storage,
+                    RowApplyOrigin::Client(client_id),
+                    metadata,
+                    row.clone(),
+                    fate_recording,
+                    source,
+                ) {
                     self.forward_row_batch_to_servers(
                         storage,
                         object_id,

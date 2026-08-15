@@ -3846,6 +3846,607 @@ mod store_probe {
         let storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
         probe_membership_include(storage);
     }
+
+    /// Defect-25 write probe: the app's presence heartbeat —
+    /// `db.update(users, <own id>, { onlineTimeUpdatedAtMs: now })` under the
+    /// owner's session — against a COPY of the incident store, rehydrated
+    /// from its own catalogue (permissions head included, so write
+    /// authorization is enforced exactly as on the device). Prints the exact
+    /// failure if the write does not apply, and where the row's visible
+    /// versions sit per branch before and after.
+    fn probe_incident_write<S: Storage>(mut storage: S) {
+        use crate::query_manager::session::{Session as PolicySession, WriteContext};
+        use crate::query_manager::types::Schema;
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let current_hash_hex =
+            std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+        let user_row_id = crate::object::ObjectId::from_uuid(
+            uuid::Uuid::parse_str(
+                &std::env::var("JAZZ_PROBE_ROW_ID").expect("set JAZZ_PROBE_ROW_ID"),
+            )
+            .expect("valid row id"),
+        );
+
+        // Two-phase rehydrate, identical to the read probes.
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target_hash = crate::query_manager::types::SchemaHash::from_hex(&current_hash_hex)
+            .expect("valid schema hash");
+        let current_schema = extractor
+            .context()
+            .live_schemas
+            .get(&target_hash)
+            .or_else(|| extractor.context().pending_schemas.get(&target_hash))
+            .cloned()
+            .expect("the app's schema must be in the catalogue");
+
+        let mut sm = SchemaManager::new(SyncManager::new(), current_schema, app_id, "dev", "main")
+            .expect("phase-2 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(&mut sm, &storage, app_id)
+            .expect("phase-2 rehydrate");
+
+        let branches = sm.query_manager().all_query_branches();
+        println!("branches: {branches:?}");
+
+        let dump_row = |storage: &S, label: &str| {
+            for branch in &branches {
+                let rows = scan_visible_row_bytes_with_storage(storage, "users", branch.as_str())
+                    .unwrap_or_default();
+                for row in rows.iter().filter(|row| row.row_id == user_row_id) {
+                    let version = row
+                        .bytes
+                        .get(0x10..0x18)
+                        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+                    println!(
+                        "{label}: users {} @ {branch} len={} version={version:?}",
+                        row.row_id,
+                        row.bytes.len()
+                    );
+                }
+            }
+        };
+        dump_row(&storage, "before");
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let session = PolicySession::new(user_row_id.to_string());
+        let write_context = WriteContext::from_session(session);
+        let result = sm.update(
+            &mut storage,
+            user_row_id,
+            &[(
+                "onlineTimeUpdatedAtMs".to_string(),
+                Value::Timestamp(now_ms),
+            )],
+            Some(&write_context),
+        );
+        println!("owner heartbeat update result: {result:?}");
+        dump_row(&storage, "after");
+
+        // Negative control BEFORE the assert: the same session updating
+        // ANOTHER user's row must stay denied (whereOld must still bite).
+        let other_row_id = branches.iter().find_map(|branch| {
+            scan_visible_row_bytes_with_storage(&storage, "users", branch.as_str())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| row.row_id)
+                .find(|row_id| *row_id != user_row_id)
+        });
+        if let Some(other_row_id) = other_row_id {
+            let foreign = sm.update(
+                &mut storage,
+                other_row_id,
+                &[(
+                    "onlineTimeUpdatedAtMs".to_string(),
+                    Value::Timestamp(now_ms),
+                )],
+                Some(&write_context),
+            );
+            println!("foreign-row update result (must be denied): {foreign:?}");
+            assert!(
+                foreign.is_err(),
+                "the session updated ANOTHER user's row — whereOld no longer bites"
+            );
+        } else {
+            println!("no second users row found for the negative control");
+        }
+
+        assert!(
+            result.is_ok(),
+            "the owner's own heartbeat update must apply: {result:?}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn incident_app_store_applies_the_owner_heartbeat() {
+        // Copy-then-open, same reason as the probes above.
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch = std::env::temp_dir().join(format!(
+            "jazz-heartbeat-probe-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the store for the probe");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
+        probe_incident_write(storage);
+    }
+
+    /// Defect-25 write probe, DEVICE-SHAPED: the exact jazz-rn init order
+    /// (SchemaManager::new with the bundle schema, catalogue rehydrate,
+    /// RuntimeCore::new, persist_schema) followed by the app's heartbeat
+    /// update through RuntimeCore::update — the device's actual write entry
+    /// point.
+    #[cfg(feature = "sqlite")]
+    fn probe_incident_runtime_write(storage: SqliteStorage) {
+        use crate::query_manager::session::{Session as PolicySession, WriteContext};
+        use crate::query_manager::types::Schema;
+        use crate::runtime_core::{NoopScheduler, RuntimeCore, VecSyncSender};
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let current_hash_hex =
+            std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+        let user_row_id = crate::object::ObjectId::from_uuid(
+            uuid::Uuid::parse_str(
+                &std::env::var("JAZZ_PROBE_ROW_ID").expect("set JAZZ_PROBE_ROW_ID"),
+            )
+            .expect("valid row id"),
+        );
+
+        // Extract the bundle-equivalent current schema from the catalogue.
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target_hash = crate::query_manager::types::SchemaHash::from_hex(&current_hash_hex)
+            .expect("valid schema hash");
+        let current_schema = extractor
+            .context()
+            .live_schemas
+            .get(&target_hash)
+            .or_else(|| extractor.context().pending_schemas.get(&target_hash))
+            .cloned()
+            .expect("the app's schema must be in the catalogue");
+
+        // The jazz-rn constructor's exact order.
+        let mut sm = SchemaManager::new(SyncManager::new(), current_schema, app_id, "dev", "main")
+            .expect("device-shaped schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(&mut sm, &storage, app_id)
+            .expect("device-shaped rehydrate");
+        let mut core = RuntimeCore::new(sm, storage, NoopScheduler);
+        core.set_sync_sender(Box::new(VecSyncSender::new()));
+        core.persist_schema();
+
+        let branches = core.schema_manager().query_manager().all_query_branches();
+        println!("runtime branches: {branches:?}");
+        let dump_row = |storage: &SqliteStorage, label: &str| {
+            for branch in &branches {
+                let rows = scan_visible_row_bytes_with_storage(storage, "users", branch.as_str())
+                    .unwrap_or_default();
+                for row in rows.iter().filter(|row| row.row_id == user_row_id) {
+                    let version = row
+                        .bytes
+                        .get(0x10..0x18)
+                        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+                    println!(
+                        "{label}: users {} @ {branch} len={} version={version:?}",
+                        row.row_id,
+                        row.bytes.len()
+                    );
+                }
+            }
+        };
+        dump_row(core.storage(), "runtime before");
+
+        // Optionally reproduce the app's live-session shape before the write:
+        // session subscriptions (the users query and the full chat list
+        // shape) plus a tick, the way the app reads before it heartbeats.
+        if std::env::var("JAZZ_PROBE_SUBSCRIBE_FIRST").is_ok() {
+            let session = PolicySession::new(user_row_id.to_string());
+            let users_query = core
+                .schema_manager_mut()
+                .query_manager_mut()
+                .query("users")
+                .build();
+            let sub = core.subscribe(users_query, |_| {}, Some(session.clone()));
+            println!("runtime users subscription: {:?}", sub.map(|_| "ok"));
+
+            let user_id_text = user_row_id.to_string();
+            let list_query = core
+                .schema_manager_mut()
+                .query_manager_mut()
+                .query("chat_members")
+                .filter_eq("userId", Value::Text(user_id_text.clone()))
+                .filter_eq("isBanned", Value::Boolean(false))
+                .order_by_desc("$createdAt")
+                .with_array("chat", |sub| {
+                    sub.from("chats")
+                        .correlate("id", "chat_members.chatId")
+                        .with_array("chat_membersViaChat", |sub| {
+                            sub.from("chat_members")
+                                .correlate("chatId", "chats.id")
+                                .with_array("user", |sub| {
+                                    sub.from("users")
+                                        .correlate("id", "chat_members.userId")
+                                        .with_array("unique_namesViaUser", |sub| {
+                                            sub.from("unique_names").correlate("userId", "users.id")
+                                        })
+                                })
+                        })
+                        .with_array("callsViaChat", |sub| {
+                            sub.from("calls")
+                                .correlate("chatId", "chats.id")
+                                .filter_eq("callShape", Value::Text("group".into()))
+                                .filter_eq("isEnded", Value::Boolean(false))
+                                .limit(1)
+                        })
+                })
+                .build();
+            let sub2 = core.subscribe(list_query, |_| {}, Some(session));
+            println!("runtime list subscription: {:?}", sub2.map(|_| "ok"));
+            core.batched_tick();
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let session = PolicySession::new(user_row_id.to_string());
+        let write_context = WriteContext::from_session(session);
+        let result = core.update(
+            user_row_id,
+            vec![(
+                "onlineTimeUpdatedAtMs".to_string(),
+                Value::Timestamp(now_ms),
+            )],
+            Some(&write_context),
+        );
+        println!("runtime owner heartbeat update result: {result:?}");
+        dump_row(core.storage(), "runtime after");
+
+        // Negative control: the same session on another user's row stays denied.
+        let other_row_id = branches.iter().find_map(|branch| {
+            scan_visible_row_bytes_with_storage(core.storage(), "users", branch.as_str())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| row.row_id)
+                .find(|row_id| *row_id != user_row_id)
+        });
+        if let Some(other_row_id) = other_row_id {
+            let foreign = core.update(
+                other_row_id,
+                vec![(
+                    "onlineTimeUpdatedAtMs".to_string(),
+                    Value::Timestamp(now_ms),
+                )],
+                Some(&write_context),
+            );
+            println!("runtime foreign-row update result (must be denied): {foreign:?}");
+            assert!(
+                foreign.is_err(),
+                "the session updated ANOTHER user's row through the runtime"
+            );
+        } else {
+            println!("no second users row found for the negative control");
+        }
+
+        assert!(
+            result.is_ok(),
+            "the owner's heartbeat update must apply through the runtime: {result:?}"
+        );
+    }
+
+    /// Defect-25 forensics: the incident store holds ~1377 users-row history
+    /// batches on the new branch (the 10s heartbeats of the v16.13/v16.14
+    /// sessions) that never became visible. Dump everything the publish path
+    /// consults for a sample of them: row locator, batch table locators,
+    /// per-generation loads, row state, local batch record, sealed
+    /// submission, authoritative fate, and the family history scan.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn incident_app_store_stuck_heartbeat_forensics() {
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch = std::env::temp_dir().join(format!(
+            "jazz-forensics-probe-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the store for the probe");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
+
+        let user_row_id = crate::object::ObjectId::from_uuid(
+            uuid::Uuid::parse_str(
+                &std::env::var("JAZZ_PROBE_ROW_ID").expect("set JAZZ_PROBE_ROW_ID"),
+            )
+            .expect("valid row id"),
+        );
+        let branch = "dev-b32dae47bbd9-main";
+
+        // The current-generation users descriptor, for decoding batch data.
+        let users_descriptor = {
+            use crate::query_manager::types::Schema;
+            use crate::schema_manager::{AppId, SchemaManager};
+            use crate::sync_manager::SyncManager;
+            let app_id = AppId::from_string(
+                &std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"),
+            )
+            .expect("valid app id");
+            let mut extractor =
+                SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                    .expect("descriptor schema manager");
+            crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+                &mut extractor,
+                &storage,
+                app_id,
+            )
+            .expect("descriptor rehydrate");
+            let target_hash = crate::query_manager::types::SchemaHash::from_hex(
+                &std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH"),
+            )
+            .expect("valid schema hash");
+            extractor
+                .context()
+                .live_schemas
+                .get(&target_hash)
+                .or_else(|| extractor.context().pending_schemas.get(&target_hash))
+                .expect("the app's schema must be in the catalogue")
+                .get(&crate::query_manager::types::TableName::new("users"))
+                .expect("users table")
+                .columns
+                .clone()
+        };
+        let describe_data = |data: &[u8]| -> String {
+            match crate::row_format::decode_row(&users_descriptor, data) {
+                Ok(values) => users_descriptor
+                    .columns
+                    .iter()
+                    .zip(values.iter())
+                    .filter(|(_, value)| !matches!(value, Value::Null))
+                    .map(|(column, value)| format!("{}={value:?}", column.name.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Err(err) => format!("DECODE ERR {err:?}"),
+            }
+        };
+
+        println!("row locator: {:?}", storage.load_row_locator(user_row_id));
+
+        match storage.scan_history_row_batches("users", user_row_id) {
+            Ok(rows) => {
+                println!("family history scan: Ok({} rows)", rows.len());
+                let mut by_state: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                let mut by_author: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for row in &rows {
+                    *by_state.entry(format!("{:?}", row.state)).or_default() += 1;
+                    let provenance = row.row_provenance();
+                    *by_author
+                        .entry(format!(
+                            "created_by={} updated_by={}",
+                            provenance.created_by, provenance.updated_by
+                        ))
+                        .or_default() += 1;
+                }
+                println!("  states: {by_state:?}");
+                println!("  authors: {by_author:?}");
+                // The last five by (branch, updated_at): batch id time vs
+                // provenance time vs decoded content.
+                for row in rows.iter().rev().take(5) {
+                    let batch_ms = u64::from_be_bytes([
+                        0,
+                        0,
+                        row.batch_id().0[0],
+                        row.batch_id().0[1],
+                        row.batch_id().0[2],
+                        row.batch_id().0[3],
+                        row.batch_id().0[4],
+                        row.batch_id().0[5],
+                    ]);
+                    let provenance = row.row_provenance();
+                    println!(
+                        "  tail: batch={} batch_ms={batch_ms} branch={} state={:?} \
+                         created_at={} updated_at={} updated_by={} data_len={}\n    \
+                         values: {}",
+                        row.batch_id(),
+                        row.branch,
+                        row.state,
+                        provenance.created_at,
+                        provenance.updated_at,
+                        provenance.updated_by,
+                        row.data.len(),
+                        describe_data(&row.data)
+                    );
+                }
+            }
+            Err(err) => println!("family history scan: ERR {err}"),
+        }
+
+        let batch_hex = [
+            // first stuck heartbeat (12:40:17Z), one with a twin row in the
+            // old generation raw table, the last stuck one (16:51:47Z), and
+            // an Aug-13-era batch stored in the old generation raw table
+            // under the new branch.
+            "01a0047d910e773284d20dbc3a20553c",
+            "01a0047e2ee778a081381e5dce3821b5",
+            "01a0056390197ef094f40cf5300d81ff",
+            "019ffb87202a7ed2b73d3f994a928da6",
+        ];
+        let hashes = [
+            (
+                "new",
+                SchemaHash::from_hex(
+                    "b32dae47bbd935a12360128d126c0208654da71704dd24e57ffb6d8c5117549b",
+                )
+                .unwrap(),
+            ),
+            (
+                "old",
+                SchemaHash::from_hex(
+                    "53710882d8e01a0184604d82934f3ec8bb8359afec4aa326dc10ee488fc6cb59",
+                )
+                .unwrap(),
+            ),
+        ];
+        for hex in batch_hex {
+            let mut bytes = [0u8; 16];
+            for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+                bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
+            }
+            let batch_id = crate::row_histories::BatchId(bytes);
+            println!("batch {hex}:");
+            println!(
+                "  batch table locator: {:?}",
+                storage.load_history_row_batch_table_locator(branch, user_row_id, batch_id)
+            );
+            for (label, hash) in &hashes {
+                match storage.load_history_row_batch_for_schema_hash(
+                    "users",
+                    *hash,
+                    branch,
+                    user_row_id,
+                    batch_id,
+                ) {
+                    Ok(Some(row)) => println!(
+                        "  {label}-gen row: state={:?} updated_at={} parents={} data_len={}",
+                        row.state,
+                        row.updated_at,
+                        row.parents.len(),
+                        row.data.len()
+                    ),
+                    Ok(None) => println!("  {label}-gen row: none"),
+                    Err(err) => println!("  {label}-gen row: ERR {err}"),
+                }
+            }
+            println!(
+                "  local batch record: {:?}",
+                storage.load_local_batch_record(batch_id).map(|record| {
+                    record.map(|record| {
+                        format!(
+                            "mode={:?} sealed={} members={} fate={:?}",
+                            record.mode,
+                            record.sealed,
+                            record.members.len(),
+                            record.latest_fate
+                        )
+                    })
+                })
+            );
+            println!(
+                "  local batch row index: {:?}",
+                storage.load_local_batch_row_index(batch_id).map(|index| {
+                    index.map(|members| {
+                        members
+                            .iter()
+                            .map(|member| {
+                                format!(
+                                    "{}@{} hash={}",
+                                    member.table_name,
+                                    member.branch_name,
+                                    &member.schema_hash.to_string()[..12]
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+            );
+            println!(
+                "  sealed submission: {:?}",
+                storage
+                    .load_sealed_batch_submission(batch_id)
+                    .map(|submission| submission.map(|submission| format!(
+                        "mode={:?} target={} members={}",
+                        submission.mode,
+                        submission.target_branch_name,
+                        submission.members.len()
+                    )))
+            );
+            println!(
+                "  authoritative fate: {:?}",
+                storage.load_authoritative_batch_fate(batch_id)
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn incident_app_store_applies_the_owner_heartbeat_through_the_runtime() {
+        // Copy-then-open, same reason as the probes above.
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch = std::env::temp_dir().join(format!(
+            "jazz-runtime-heartbeat-probe-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the store for the probe");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
+        probe_incident_runtime_write(storage);
+    }
 }
 
 // Deterministic CI witness for the defect-20 read fallbacks: a physical

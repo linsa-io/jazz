@@ -48,6 +48,12 @@ pub struct MemoryStorage {
     flush_wal_failures: std::cell::RefCell<Option<(StorageError, Option<usize>)>>,
     #[cfg(test)]
     flush_wal_call_count: std::cell::RefCell<usize>,
+    /// Test-only failure injection at the row-mutation commit — the shape of a
+    /// full disk under a rocksdb txn commit (defect 26). While set, both row
+    /// mutation entry points fail with a clone of this error; reads and all
+    /// other writes stay healthy.
+    #[cfg(test)]
+    row_mutation_failure: std::cell::RefCell<Option<StorageError>>,
     /// Whole-history reads for one row, so a gate can pin which paths pay for
     /// one. A row that accumulates thousands of versions makes each expensive.
     #[cfg(test)]
@@ -141,6 +147,20 @@ impl MemoryStorage {
         *self.flush_wal_call_count.borrow()
     }
 
+    /// Arm (`Some`) or heal (`None`) the row-mutation commit failure.
+    #[cfg(test)]
+    pub(crate) fn set_row_mutation_failure(&self, error: Option<StorageError>) {
+        *self.row_mutation_failure.borrow_mut() = error;
+    }
+
+    #[cfg(test)]
+    fn injected_row_mutation_failure(&self) -> Result<(), StorageError> {
+        match self.row_mutation_failure.borrow().as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
     fn ensure_cached_raw_table_header(
         &mut self,
         raw_table: &str,
@@ -178,6 +198,8 @@ impl Default for MemoryStorage {
             flush_wal_failures: std::cell::RefCell::new(None),
             #[cfg(test)]
             flush_wal_call_count: std::cell::RefCell::new(0),
+            #[cfg(test)]
+            row_mutation_failure: std::cell::RefCell::new(None),
             #[cfg(test)]
             history_scans: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -218,6 +240,8 @@ impl Storage for MemoryStorage {
         encoded_visible_rows: &[OwnedVisibleRowBytes],
         index_mutations: &[IndexMutation<'_>],
     ) -> Result<(), StorageError> {
+        #[cfg(test)]
+        self.injected_row_mutation_failure()?;
         if history_rows.len() != encoded_history_rows.len() {
             return Err(StorageError::IoError(format!(
                 "prepared history row count mismatch: {} decoded vs {} encoded",
@@ -310,6 +334,8 @@ impl Storage for MemoryStorage {
         visible_rows: &[OwnedVisibleRowBytes],
         index_mutations: &[IndexMutation<'_>],
     ) -> Result<(), StorageError> {
+        #[cfg(test)]
+        self.injected_row_mutation_failure()?;
         let table = table.to_string();
         let mut decoded_history_rows = Vec::with_capacity(history_rows.len());
 
