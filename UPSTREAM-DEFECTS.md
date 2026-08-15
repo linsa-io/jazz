@@ -1,11 +1,13 @@
 # Defects found in jazz while running it in production
 
 We run a local-first messenger on a fork of `garden-co/jazz` (`linsa-io/jazz`, branch
-`linsa`), diverged at `e84d84a6` on 2026-07-27. Everything below is a defect in **upstream
-code**, found by running it under a real workload, with a fix and a measurement. Fixes to
-code we added ourselves are deliberately excluded — this is not a changelog of our fork.
+`linsa`), diverged at `e84d84a6` on 2026-07-27. Each numbered entry below is a defect in
+**upstream code**, found by running it under a real workload, with a fix and a measurement —
+except where labeled otherwise: entry 4 is withdrawn (its mechanism turned out to be this
+fork's own), and entry 18 is an open investigation, not attributed upstream. Fixes to code
+we added ourselves are deliberately excluded — this is not a changelog of our fork.
 
-Every entry gives what goes wrong, the fix, the fork commit, what covers it, and a number.
+Every entry gives what goes wrong, the fix (or, for entry 12, the gate that will catch it — that defect stands unfixed by design), what covers it, and a number.
 
 ## Track record
 
@@ -40,6 +42,9 @@ and "missing".
 That one set explains all three ways it heals: a reap drops `sent_metadata` with the rest of
 `ClientState`, a store wipe changes the client id, and a restart loses it with the process.
 
+(the fork's fix, shown for the shape of the change — upstream's line lacks the
+`force_resend` term)
+
 ```rust
 let include_metadata = force_resend || !client.sent_metadata.contains(&object_id);
 ```
@@ -52,6 +57,11 @@ exactly-once delivery. The silent discard is now logged.
 Two conditions must hold together, which is why it hides: the peer returns with the same
 wire client id (persisted with its store, so only a reinstall changes it), and it is not
 reaped — so a short `--client-ttl-secs` accidentally masks it.
+
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — no metadata sidecar; every wire
+record carries its full `SchemaVersionId`. The delivery-window class it belongs to is still
+churning upstream (PRs #1535, #1520).
 
 ## 2. Per-peer delivery tracking grows without bound
 
@@ -66,6 +76,10 @@ applies idempotently. The `ParentNotFound` over-claim class is structurally impo
 
 Fix `20580ad3`. Pinned by an ancestor-DFS termination test: **zero storage loads after a
 512-deep chain**.
+
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): unknown — the replacement is a per-peer payload
+inventory (`ViewUpdate`), and we found no pruning of it.
 
 ## 3. A subquery recompiles its graph for every outer row
 
@@ -83,21 +97,19 @@ Keeping the settled `SubgraphInstance` per (outer row, element index) and re-set
 sound: the compiled shape is identical across re-evaluations, only the correlation binding
 differs, and results are read from `current_output_tuples()` — full state, not a delta.
 
-Fix `8a5730f4`. **Compilations to zero, CPU to single digits.**
+Fix `8a5730f4`. **Compilations to zero, CPU to single digits.** The eventual fix direction
+is routing invalidation by correlation value, so a write reaches only the instances whose
+binding it can affect, rather than caching in front of a broadcast.
 
-## 4. Include dirtiness is broadcast to every instance
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — prepared shapes, one maintained
+graph.
 
-A write marked every cached subquery instance, so one write cost O(live outer rows). On the
-live server this **doubled cold-start CPU** and turned a ten-second presence heartbeat into
-a CPU burst; `Vec<TupleElement>::clone` under that collect was worth **−12.4%** alone.
+## ~~4. Include dirtiness is broadcast to every instance~~
 
-Two changes: buffer the marks and apply them when an instance is next evaluated
-(`98eca871`), and route dirt by correlation value through two indices instead of
-broadcasting (`14ad429c`). Reads that went **204 → 4004 (19.6×) become 8 → 8**; bytes that
-went 20.2× become flat.
-
-Both bugs escaped every existing gate because those varied history depth only. The new gate
-varies instance count, and marking is pinned flat: **1.03× at 1000 instances vs 50**.
+Withdrawn on attribution audit: the defective mechanism was this fork's own v13
+instance-cache layer, not upstream code. Upstream's kernel of the same cost class —
+indiscriminate `reevaluate_all` — is entry 3.
 
 ## 5. Every write-tick rescans the full index of each dirty table
 
@@ -107,6 +119,9 @@ membership, so write cost scaled with index size rather than with what changed.
 Fix `b33832e1`: incremental scans from row-precise dirty marks. Covered by a randomized
 differential test (300-step insert/update/delete against a model, filtered and unfiltered
 live subscriptions) and an interleaved full-dirty handoff test.
+
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — INV-INC-1 outlaws the class.
 
 ## 6. Blob payloads cross both language bridges one byte at a time
 
@@ -149,6 +164,11 @@ asserts a shape, not a duration, so it cannot flake); a size gate on the RN delt
 both inline forms measured so the gap stays visible; and `ffi-value.test.ts` over the full
 byte range, chunk-seam sizes and a 1 MiB round-trip.
 
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): split — the napi side is fixed (bytes cross as
+`Uint8Array`); the RN side is still present (hex-in-JSON at `jazz-rn/rust/src/lib.rs:122`),
+and the RN runtime rewrite is open PR #1367.
+
 ## 7. Schema and descriptor structures are cloned through subquery compilation
 
 Compilation cloned the `Schema` and `SchemaContext` per subquery, and descriptor column lists
@@ -156,6 +176,9 @@ per node.
 
 Fixes `afd4f9f7` and `6ad129f8` share them via `Arc`. **462 MiB → 324 MiB** on the amplified
 rig, with an integration test pinning that recursive nodes hold the same shared handles.
+
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away.
 
 ## 8. Row history rebuilds from scratch on a serial write
 
@@ -174,6 +197,10 @@ Byte-exactness is proved by a randomized differential oracle running dual-mode �
 and off — per backend, plus seven fixtures pinning tier-sparse chains, tier-hole divergence,
 frontier coverage and the decline cases.
 
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away by design; the serial-write cost
+there is unmeasured.
+
 ---
 
 ## 9. Every transactional write reads the whole store to build a payload nobody reads
@@ -182,7 +209,7 @@ frontier coverage and the decline cases.
 
 `RuntimeCore::sealed_batch_submission` (`runtime_core/writes.rs:459`) calls
 `Storage::capture_family_visible_frontier` for every `Transactional` batch, and that helper
-(`storage/storage_trait.rs:1271`) scans every visible raw table with an empty prefix and
+(`storage/storage_trait.rs:1264`) scans every visible raw table with an empty prefix and
 decodes every row it finds. The result is compatibility payload: PR #920 removed the
 validation that consumed it — transactional conflicts are decided from the staged rows' own
 parents in `SyncManager::validate_transactional_parent_frontiers`
@@ -221,6 +248,10 @@ old-format submission itself and demands it back verbatim.
 
 **After both fixes, on the same device and the same scenario: settle passes over 100 MB went
 148 of 469 → 0, passes over 500 ms 148 → 0, worst pass 1000 ms / 768 MB → 178 ms / 0.27 MB.**
+
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — the CommitUnit protocol captures
+no frontier.
 
 ## 10. An index scan reads — and can admit — rows belonging to other tables
 
@@ -265,6 +296,9 @@ mode this document already contains two entries about.
 
 **After the fix, with the overlay demonstrably populated (peak 73 entries), reads per overlay
 entry went from ~2 MB to 2.8 KB.**
+
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — per-lineage ahead-current tables.
 
 ---
 
@@ -311,11 +345,15 @@ Gate: `a_seal_without_rows_must_not_loop_full_store_scans` (drops the row payloa
 delivers the seal, retries it, then derives the pending set twice — asserts the Missing
 answer, at most one scan, and cache reuse across derivations).
 
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — atomic units, parking, and a
+`MalformedCommit` answer.
+
 ---
 
 ## 12. The browser binding still hands blobs over one byte at a time
 
-Defect 9's napi fix (blobs as bytes rather than as an array of a million Numbers) was never
+Defect 6's napi fix (blobs as bytes rather than as an array of a million Numbers) was never
 applied to `jazz-wasm`, and nothing measured it: the crate has two Rust tests and had no
 TypeScript coverage of the boundary at all.
 
@@ -339,6 +377,10 @@ that still marshal per byte are `it.fails`, so they pass while the defect stands
 the moment the Rust side starts handing bytes; the subscription case is an ordinary gate
 that keeps the fast path fast. Both bindings now share `testing/blob-fixtures.ts`, so each
 boundary is asked the identical question.
+
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): fixed there — `serde_bytes` is in place and bytes
+cross as `Uint8Array` (moderate confidence; not measured).
 
 ---
 
@@ -383,6 +425,9 @@ ever seen keeping visible rows.
 Gate: `a_policy_rejected_write_costs_no_full_store_scan` — six policy-denied
 writes, six rejected fates, zero full-store scans (6/6 before the fix).
 
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — fate is keyed by `tx_id`.
+
 ---
 
 ## 14. Resolving a batch's ancestors copies the whole row history, twice
@@ -413,6 +458,9 @@ Gate: `resolving_ancestors_does_not_clone_the_whole_history` — a 200-entry
 linear history whose every entry is an ancestor; asserts the returned vector
 is the caller's own allocation (same pointer, same capacity). Verified red
 against the upstream shape and green with the fix.
+
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — parking plus point application.
 
 ---
 
@@ -448,6 +496,12 @@ fix, verified by removing it).
 store with several branches still pays the read for parentless writes;
 answering "which branches does THIS row span" cheaply needs a storage
 primitive that does not exist yet.
+
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — but a new cousin of the same cost
+class lives there: an O(current-table) scan per update/delete policy check, at
+`crates/jazz/src/node/policy.rs:273-306`. Flagged as a fresh upstream-reportable issue, not
+a carry-over of this entry.
 
 ---
 
@@ -552,6 +606,11 @@ seal, client-driven, no amplification. And `an_exact_replay_costs_one_history_re
 `load_history_row_batch` only; the sealed path's `load_history_row_batch_for_schema_hash`
 is not instrumented, so that gate proves the reorder rather than the whole replay cost.
 
+Attribution: MIXED — upstream's digest/parents design plus one fork-added `Missing` answer,
+as stated above.
+Groove (codex/jazz-core-engine-swap): architected away — no `Missing` fate exists.
+Residual: the parking maps are unbounded; we found no cap.
+
 ## 17. The USING policy decodes old content under the writer's schema, not the row's
 
 An owner's UPDATE onto a row authored before a schema deployment is rejected by
@@ -597,9 +656,18 @@ asserted); and a non-owner's cross-shelf update — sent as a raw batch past the
 client-side policy engine — still denied, so the decode fix demonstrably did not
 loosen the decision.
 
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — the schema travels with the bytes,
+and policy resolves the source schema from the version row, fail-closed. Upstream is
+actively fixing fresh instances of the class: open PR #1538.
+
 ---
 
 ## 18. A client write racing delivery: clean at this level, poisonous somewhere below
+
+OPEN INVESTIGATION — NOT ATTRIBUTED UPSTREAM. The remaining suspects sit in code this fork
+modified heavily (the jazz-rn actor pipeline, the binding's error propagation); do not read
+this entry as an upstream defect report.
 
 Reproduced live (simulator, 2026-08-14): an app on a freshly wiped store wrote
 within the first seconds while hydration was in flight, and threw uncaught
@@ -678,6 +746,11 @@ Gates: `a_row_of_an_untouched_table_is_served_across_a_lensless_migration`
 axis check), `a_row_from_an_identical_table_on_another_schema_branch_is_served_without_a_lens`
 (manager level — red before the fix at 0 rows). Suite: 1515 passed / 0 failed.
 
+Attribution: UPSTREAM-INHERITED.
+Groove (codex/jazz-core-engine-swap): architected away — publish requires the lineage lens
+bundle, and untouched tables reuse physical ids. The area is churning: PRs #1533, #1537,
+#1518, #1523.
+
 ---
 
 ## 20. A delivered row lands split across two raw-table hashes — locator lies, reads miss
@@ -699,7 +772,7 @@ hash (`common_case_exact_visible_row_table_locator`), computes
 misses. Result: the row is delivered, confirmed, indexed, settled and
 unreadable; the account query settles empty with the identity in hand.
 Reproduced headlessly: `storage::store_probe::incident_app_store_serves_the_users_row_after_rehydrate`
-(ignored, needs JAZZ*PROBE*\* env) is red against the store copy on the
+(ignored, needs `JAZZ_PROBE_*` env) is red against the store copy on the
 POST-defect-19 engine — defect 19's fix does not heal this state.
 
 FIXED (2026-08-15, third pass), oracle-reviewed. Three read-side fallbacks
@@ -737,20 +810,28 @@ into the row locator. Live consequence measured end to end on the sim: the
 subscription's in-flight delta makes the account query true (the app reaches
 chats), the next materialization re-reads through the locator, misses the
 misplaced visible row, and the query settles empty — welcome → chats → kick,
-the original production symptom, one mechanism. Fix direction: (a) writer
-consistency — persist the locator with the hash the write actually used (the
-one whose descriptor decoded the bytes); (b) reader fallback — when the
-locator-named raw table misses, scan the other registered raw tables of the
-same logical table for `<branch>:<row>` (heals already-poisoned stores,
-including the phone, without a repair migration). The
-runtime-core harness `a_delivered_old_branch_row_lands_readably_in_a_fresh_store`
-(ignored, red by design) does not yet reproduce the app's partial-write state:
-its delivery is dropped before anything is written, so the faithful ingest
-model is still to be built. Next steps: pin the writer via the ladder in
-`required_history_user_descriptor_and_schema_hash_for_row`, then decide
-writer-fix + reader-side identity fallback (same invariant as defect 19: a
-same-descriptor raw table is as good as the named one), plus a store repair
-for poisoned stores.
+the original production symptom, one mechanism. Both fix directions this
+pass identified — (a) writer consistency, persisting the locator with the
+hash the write actually used (the one whose descriptor decoded the bytes),
+and (b) a reader fallback that scans the other registered raw tables of the
+same logical table for `<branch>:<row>` when the locator-named one misses
+(healing already-poisoned stores, including the phone, without a repair
+migration; same invariant as defect 19: a same-descriptor raw table is as
+good as the named one) — shipped as described in the FIXED paragraph above.
+One caveat stands: the runtime-core harness
+`a_delivered_old_branch_row_lands_readably_in_a_fresh_store` (ignored, red
+by design) does not reproduce the app's partial-write state — its delivery
+is dropped before anything is written — so the faithful ingest model for
+that exact sequence remains future work; the shipped gates cover the
+mechanism from the store side instead.
+
+Attribution: UPSTREAM-INHERITED — all three mechanism functions
+(`common_case_exact_visible_row_table_locator`, the
+`required_history_user_descriptor_and_schema_hash_for_row` ladder,
+`ensure_object_metadata`) are present unchanged at the merge-base
+`e84d84a6`, and `git diff e84d84a6 origin/main -- crates` is empty.
+Groove (codex/jazz-core-engine-swap): architected away — unknown-schema commits park, so
+the race is unrepresentable. Upstream is fixing the old-engine twin on main: PR #1201.
 
 ---
 
@@ -786,11 +867,119 @@ shared best-visible loader. Gate:
 fix with the row served twice, green after; disarm/rearm falsified. Suite:
 1519 passed / 0 failed.
 
+Attribution: UPSTREAM-INHERITED — the same forwarding is at the merge-base:
+`e84d84a6:crates/jazz-tools/src/query_manager/graph_nodes/materialize.rs:244` pushes
+`result.updated.push((old_tuple, materialized))`, pairing the materialized new tuple
+against the union's raw old tuple.
+Groove (codex/jazz-core-engine-swap): architected away — the IVM is weighted: an update
+travels as a −1 pre-image record and a +1 post-image record, consolidated before terminal
+emission (`crates/groove/src/ivm/runtime/mod.rs:10537`), so there is no updated-pair arm
+whose old side could be forwarded raw.
+
+---
+
+## 22. A parent ref-include compiles to a row-id probe carrying the foreign-key value — every include comes back empty
+
+A reverse (child→parent) ref-include — `chat_members.include({chat})` —
+compiles the parent lookup as a per-binding correlated subquery: each
+instance is `chats` filtered `id = <binding.chatId>`. The relation-IR
+lowering then rewrote condition columns schema-blind: `to_runtime_column`
+(`query_manager/relation_ir_query_plan.rs`) mapped `id` → `_id`
+unconditionally. Every inner instance therefore compiled to a probe of the
+row-id index carrying the foreign-key VALUE — measured with a `column` field
+added to the IndexScan trace: `IndexScan results table=chats column=_id
+condition=Eq(Uuid(<chats.id value>)) … scanned=0` on every branch. The `_id`
+index is keyed by row ids, the probe value was the `id` column's uuid, so
+the include came back empty for every row — on ANY branch; a schema crossing
+was only the incident context, not the trigger.
+
+The lowering was the lone dissenter: every other reader already resolves
+`id` descriptor-first — `include_routing::correlate_source` ("an actual
+column of that name wins"), `query::row_condition_row_id_element`,
+`sort_keys_from_order_by`, the policy evaluators. The forward (parent→child)
+include never hit this because it correlates a real child column against the
+parent's row id.
+
+Live consequence (2026-08-15, second half of the shrinking-list incident):
+with defect 21 fixed, membership rows flowed but each one's `chat` include
+resolved null, and a list that drops null-chat rows rendered 3 chats out of
+7 present in the store.
+
+Fix: condition lowering keeps the written column name; a
+`bind_row_id_condition_columns` pass over the finished plan (which is the
+first point where every scope's table is known) binds each `id` condition to
+the declared `id` column when the scope's table declares one, and to the row
+id otherwise — exact status quo for tables without one. `column_type_for_scan`
+made descriptor-first for the same reason (a declared non-Uuid `id` must not
+be force-normalized to Uuid). Gates:
+`a_membership_list_keeps_its_chats_across_the_crossing_and_a_split`
+(runtime-core, models the incident: memberships born under the old schema,
+rehydrated under the new, include must serve every chat, then survive a
+cross-branch family split) and
+`a_parent_ref_include_resolves_across_a_cross_branch_family` (query-manager
+twin) — both red at the baseline assertion before the fix, green after;
+disarm (blind rewrite forced back on) turns exactly these two red again.
+Plus `lower_relation_binds_id_conditions_to_a_declared_id_column` on the
+lowering itself. Suite: 1523 passed / 0 failed.
+
+Attribution: UPSTREAM-INHERITED — the blind rewrite is at the merge-base verbatim:
+`e84d84a6:crates/jazz-tools/src/query_manager/relation_ir_query_plan.rs` (`to_runtime_column`,
+`if column == "id" { "_id" }` with no descriptor consultation).
+Groove (codex/jazz-core-engine-swap): PARTIALLY STILL PRESENT (static reading at `aada95800`,
+not a runtime repro). Groove's condition path is descriptor-aware
+(`crates/jazz/src/tools/public_api/query.rs` `row_condition_row_id_element`: a declared
+column wins), but two readers resolve `id` blind to the row id: flat-join value refs
+(`crates/jazz/src/node/query_eval.rs:6958,6983` — `column == "id" || column == "_id"` →
+`RowIdRef`, no descriptor check) and sort keys
+(`crates/jazz/src/tools/public_api/query.rs:958`). `TableSchemaBuilder::column` accepts the
+name `id` with no reservation, so a schema like ours (every table declares an `id` uuid
+column) makes both sites reachable: a flat join `ON x.ref = y.id` or an `order_by("id")`
+against a declared `id` column silently reads the row id instead. Same class, narrower
+surface — worth a reservation on the name or descriptor-first resolution at those two sites.
+
+---
+
+## Groove line: verification summary (2026-08-15)
+
+Upstream's Thursday publishes are cut from the integration branch
+`codex/jazz-core-engine-swap` (PR #1094), with roughly forty open PRs based on it. Its
+merge-base with our fork is `f540e59ef` (2026-07-20) — our fork point `e84d84a6` is NOT an
+ancestor of it, so main-line fixes reach the groove line only by cherry-pick.
+
+What the groove line replaces, in the terms this document uses:
+
+| old engine                  | groove line                                                               |
+| --------------------------- | ------------------------------------------------------------------------- |
+| branch per schema hash      | per-row `SchemaVersionAlias`                                              |
+| row locators                | gone                                                                      |
+| ad-hoc schema activation    | single catalogue sequencer, Staged→Active, mandatory lineage lens bundles |
+| guessing at unknown schemas | parking                                                                   |
+| `SealBatch` / `Missing`     | `CommitUnit` / `FateUpdate`                                               |
+| confirm-me delivery         | `ViewUpdate` with a per-peer payload inventory                            |
+
+Open PRs on the branch that overlap entries here: #1538 → 17; #1533, #1537 → 19; #1518,
+#1523 → 19/20; #1535, #1520 → 1's class; #1201 → 20's twin on main; #1367, #1503 → 18 and
+6's RN half; #1200 is tier-adjacent.
+
+The risk verdict: 16 of the 21 live entries (entry 4 is withdrawn; 22 total) have mechanisms unrepresentable on the groove line,
+including 17, 19 and 20 — the schema-crossing class. Still present: 6's RN half, the
+new O(table) policy scan flagged under entry 15, and 22's blind `id` readers (flat-join
+value refs and sort keys resolve a declared `id` column as the row id). Unknown: 2, 18,
+the cost profiles of 8, 12 and 15, and the parking memory bound. The bottom line is architecture-ahead but
+mobile-behind: the RN binding on the integration branch does not compile against the new
+core (it imports the deleted `jazz::tools` modules) — its rewrite is open PR #1367 — so
+Thursday's cut ships a new, field-untested mobile runtime.
+
+Method: every entry above was re-attributed against merge-base `e84d84a6` and current
+`origin/main` (`git diff e84d84a6 origin/main -- crates` is empty — upstream has not
+touched `crates/` since the fork point); groove claims cite files at the
+`origin/codex/jazz-core-engine-swap` tip `aada95800`.
+
 ---
 
 ## Notes on method
 
-Every number above is a measurement, not an estimate, each taken with one variable changed
+Every load-bearing number above is a measurement, not an estimate (two are derived rather than directly measured: entry 2's ~16 B per batch per peer, and entry 12's ~12 s of projected main-thread work — both arithmetic on measured rates), each taken with one variable changed
 against a control. Where a measurement later proved wrong we re-ran it rather than adjusting
 the conclusion — for defect 1, two mechanisms were written, reviewed, implemented and
 discarded before probing showed what the code actually did.

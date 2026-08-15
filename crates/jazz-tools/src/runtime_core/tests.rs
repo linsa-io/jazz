@@ -5214,3 +5214,143 @@ fn a_delivered_old_branch_row_lands_readably_in_a_fresh_store() {
          placed it where no read path looks"
     );
 }
+
+/// The app's chat-list shape across the crossing: memberships with a PARENT
+/// ref-include, then the parent touched on the new branch.
+///
+/// `chat_members.include({ chat })` compiles the singular ref as a correlated
+/// subquery from the child to the parent table. Two faces must hold: the
+/// whole family served across a lensless identity crossing (the list after an
+/// upgrade), and the family SPLIT — the parent's newest version written under
+/// the new schema while members stay on the old branch (the second device's
+/// touch). The app drops memberships whose `chat` include is empty, so either
+/// failure erases the chat from every device's list while the rows sit
+/// intact server-side (live incident 2026-08-15).
+#[test]
+fn a_membership_list_keeps_its_chats_across_the_crossing_and_a_split() {
+    let old_schema = || {
+        SchemaBuilder::new()
+            .table(
+                TableSchema::builder("chats")
+                    .column("id", ColumnType::Uuid)
+                    .column("title", ColumnType::Text),
+            )
+            .table(
+                TableSchema::builder("chat_members")
+                    .column("chatId", ColumnType::Uuid)
+                    .column("name", ColumnType::Text),
+            )
+            .table(TableSchema::builder("chat_activities").column("kind", ColumnType::Text))
+            .build()
+    };
+    let new_schema = || {
+        SchemaBuilder::new()
+            .table(
+                TableSchema::builder("chats")
+                    .column("id", ColumnType::Uuid)
+                    .column("title", ColumnType::Text),
+            )
+            .table(
+                TableSchema::builder("chat_members")
+                    .column("chatId", ColumnType::Uuid)
+                    .column("name", ColumnType::Text),
+            )
+            .build()
+    };
+
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        old_schema(),
+        "list-family-crossing",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    let chat_uuid = ObjectId::new();
+    let ((chat_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "chats",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(chat_uuid)),
+            ("title".to_string(), Value::Text("family chat".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the chat under the old schema");
+    for name in ["alice", "bob"] {
+        let (_, _confirmation) = insert_and_wait_for_batch(
+            &mut core,
+            "chat_members",
+            HashMap::from([
+                ("chatId".to_string(), Value::Uuid(chat_uuid)),
+                ("name".to_string(), Value::Text(name.to_string())),
+            ]),
+            None,
+            DurabilityTier::Local,
+        )
+        .expect("seed a membership under the old schema");
+    }
+    core.batched_tick();
+    core.immediate_tick();
+
+    // The upgrade: same store, new schema, NO lens (identity crossing).
+    let storage = core.into_storage();
+    let mut core = recreate_runtime_rehydrated(new_schema(), "list-family-crossing", storage);
+    core.immediate_tick();
+
+    let list_query = |core: &mut TestCore| {
+        core.schema_manager_mut()
+            .query_manager_mut()
+            .query("chat_members")
+            .with_array("chat", |sub| {
+                sub.from("chats").correlate("id", "chat_members.chatId")
+            })
+            .build()
+    };
+    let chat_of = |values: &Vec<Value>| -> usize {
+        values
+            .iter()
+            .filter_map(|value| value.as_array().map(|rows| rows.len()))
+            .next_back()
+            .unwrap_or(0)
+    };
+
+    let query = list_query(&mut core);
+    let baseline = execute_runtime_query(&mut core, query, None);
+    assert_eq!(
+        baseline.len(),
+        2,
+        "both memberships must resolve across the crossing"
+    );
+    assert!(
+        baseline.iter().all(|(_, values)| chat_of(values) == 1),
+        "every membership must carry its chat across the crossing, or the split \
+         assertion below gates nothing"
+    );
+
+    // The second device's touch: the chat updated under the NEW schema — the
+    // family splits across branches.
+    core.update(
+        chat_row_id,
+        vec![(
+            "title".to_string(),
+            Value::Text("family chat renamed".to_string()),
+        )],
+        None,
+    )
+    .expect("the new-schema update applies");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let query = list_query(&mut core);
+    let after = execute_runtime_query(&mut core, query, None);
+    assert_eq!(
+        after.len(),
+        2,
+        "memberships vanished after the parent's cross-branch touch"
+    );
+    assert!(
+        after.iter().all(|(_, values)| chat_of(values) == 1),
+        "a membership's parent ref-include came back empty after the family \
+         split — the app drops such rows and the chat vanishes from the list"
+    );
+}

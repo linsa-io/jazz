@@ -37,7 +37,7 @@ impl fmt::Display for QueryBuildError {
 
 impl std::error::Error for QueryBuildError {}
 
-fn parse_condition_column(column: &str) -> Option<(Option<&str>, &str)> {
+pub(crate) fn parse_condition_column(column: &str) -> Option<(Option<&str>, &str)> {
     let trimmed = column.trim();
     if trimmed.is_empty() {
         return None;

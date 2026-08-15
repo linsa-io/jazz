@@ -6,7 +6,7 @@ use super::relation_ir::{
     ColumnRef, JoinKind, OrderDirection, PredicateCmpOp, PredicateExpr, ProjectColumn, ProjectExpr,
     RelExpr, RowIdRef, ValueRef,
 };
-use super::types::TableName;
+use super::types::{Schema, TableName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueryEnvelope<'a> {
@@ -69,11 +69,15 @@ fn to_runtime_column(column: &str) -> String {
     }
 }
 
-fn to_scoped_runtime_column(column_ref: &ColumnRef) -> String {
-    let column = to_runtime_column(&column_ref.column);
+/// Condition columns keep the name the query wrote. `id` is table-relative —
+/// a declared `id` column wins over the row id (`query::parse_condition_column`
+/// consumers, `sort_keys_from_order_by`, `include_routing::correlate_source`
+/// all resolve it that way) — and only the finished plan knows every scope's
+/// table, so `bind_row_id_condition_columns` resolves it there.
+fn to_scoped_condition_column(column_ref: &ColumnRef) -> String {
     match column_ref.scope.as_deref() {
-        Some(scope) => format!("{scope}.{column}"),
-        None => column,
+        Some(scope) => format!("{scope}.{}", column_ref.column),
+        None => column_ref.column.clone(),
     }
 }
 
@@ -129,7 +133,7 @@ fn predicate_term_to_condition(predicate: &PredicateExpr) -> Option<Condition> {
             op,
             right: ValueRef::Literal(value),
         } => {
-            let column = to_scoped_runtime_column(left);
+            let column = to_scoped_condition_column(left);
             Some(match op {
                 PredicateCmpOp::Eq => Condition::Eq {
                     column,
@@ -161,14 +165,14 @@ fn predicate_term_to_condition(predicate: &PredicateExpr) -> Option<Condition> {
             left,
             right: ValueRef::Literal(value),
         } => Some(Condition::Contains {
-            column: to_scoped_runtime_column(left),
+            column: to_scoped_condition_column(left),
             value: value.clone(),
         }),
         PredicateExpr::IsNull { column } => Some(Condition::IsNull {
-            column: to_scoped_runtime_column(column),
+            column: to_scoped_condition_column(column),
         }),
         PredicateExpr::IsNotNull { column } => Some(Condition::IsNotNull {
-            column: to_scoped_runtime_column(column),
+            column: to_scoped_condition_column(column),
         }),
         PredicateExpr::True => None,
         _ => None,
@@ -205,7 +209,7 @@ fn relation_predicate_to_disjuncts(predicate: &PredicateExpr) -> Option<Vec<Conj
         }
         PredicateExpr::In { left, values } => {
             if values.is_empty() {
-                let column = to_scoped_runtime_column(left);
+                let column = to_scoped_condition_column(left);
                 // Empty IN lists must match no rows. Represent that as a
                 // contradiction so the existing query planner can still lower
                 // the predicate into normal scan/filter conditions.
@@ -226,7 +230,7 @@ fn relation_predicate_to_disjuncts(predicate: &PredicateExpr) -> Option<Vec<Conj
                 };
                 out.push(Conjunction {
                     conditions: vec![Condition::Eq {
-                        column: to_scoped_runtime_column(left),
+                        column: to_scoped_condition_column(left),
                         value: literal,
                     }],
                 });
@@ -927,6 +931,7 @@ pub(crate) fn lower_relation_to_execution_plan(
     include_deleted: bool,
     array_subqueries: Vec<ArraySubquerySpec>,
     select_columns: Option<Vec<String>>,
+    schema: &Schema,
 ) -> Option<ExecutionQueryPlan> {
     let envelope = unwrap_query_envelope(relation);
     let core_plan = parse_runtime_core_plan(envelope.core)?;
@@ -938,7 +943,7 @@ pub(crate) fn lower_relation_to_execution_plan(
         .project_columns
         .or_else(|| select_columns.map(builder_select_columns_to_project_columns));
 
-    Some(ExecutionQueryPlan {
+    let mut plan = ExecutionQueryPlan {
         table: core_plan.table,
         base_scope: core_plan.base_scope,
         branches: branches.to_vec(),
@@ -953,7 +958,94 @@ pub(crate) fn lower_relation_to_execution_plan(
         include_deleted,
         array_subqueries,
         project_columns,
-    })
+    };
+    bind_row_id_condition_columns(&mut plan, schema);
+    Some(plan)
+}
+
+fn condition_column_mut(condition: &mut Condition) -> &mut String {
+    match condition {
+        Condition::Eq { column, .. }
+        | Condition::Ne { column, .. }
+        | Condition::Lt { column, .. }
+        | Condition::Le { column, .. }
+        | Condition::Gt { column, .. }
+        | Condition::Ge { column, .. }
+        | Condition::Between { column, .. }
+        | Condition::Contains { column, .. }
+        | Condition::IsNull { column }
+        | Condition::IsNotNull { column } => column,
+    }
+}
+
+/// Bind each `id` condition to the declared `id` column of its scope's table,
+/// or to the row id (`_id`) when the table declares none — the resolution
+/// every descriptor-aware reader already uses (`query::is_row_id_condition_column`
+/// consumers, `sort_keys_from_order_by`, `include_routing::correlate_source`).
+/// A scope this pass cannot resolve keeps the row-id reading. Explicit `_id`
+/// is never touched.
+fn bind_row_id_condition_columns(plan: &mut ExecutionQueryPlan, schema: &Schema) {
+    let scopes: Vec<(String, TableName)> = std::iter::once((plan.base_scope.clone(), plan.table))
+        .chain(
+            plan.joins
+                .iter()
+                .map(|join| (join.effective_name().to_string(), join.table)),
+        )
+        .collect();
+    for disjunct in &mut plan.disjuncts {
+        for condition in &mut disjunct.conditions {
+            bind_condition_row_id_column(condition, plan.table, &scopes, schema);
+        }
+    }
+
+    if let Some(recursive) = plan.recursive.as_mut() {
+        let step_scopes: Vec<(String, TableName)> =
+            std::iter::once((recursive.table.as_str().to_string(), recursive.table))
+                .chain(
+                    recursive
+                        .joins
+                        .iter()
+                        .map(|join| (join.effective_name().to_string(), join.table)),
+                )
+                .collect();
+        for condition in &mut recursive.filters {
+            bind_condition_row_id_column(condition, recursive.table, &step_scopes, schema);
+        }
+    }
+}
+
+fn bind_condition_row_id_column(
+    condition: &mut Condition,
+    base_table: TableName,
+    scopes: &[(String, TableName)],
+    schema: &Schema,
+) {
+    let Some((scope, name)) =
+        crate::query_manager::query::parse_condition_column(condition.raw_column())
+    else {
+        return;
+    };
+    if name != "id" {
+        return;
+    }
+    let table = match scope {
+        None => Some(base_table),
+        Some(scope) => scopes
+            .iter()
+            .find(|(candidate, _)| candidate == scope)
+            .map(|(_, table)| *table),
+    };
+    let declares_id = table
+        .and_then(|table| schema.get(&table))
+        .is_some_and(|table_schema| table_schema.columns.column_index("id").is_some());
+    if declares_id {
+        return;
+    }
+    let bound = match scope {
+        Some(scope) => format!("{scope}._id"),
+        None => "_id".to_string(),
+    };
+    *condition_column_mut(condition) = bound;
 }
 
 #[cfg(test)]
@@ -961,6 +1053,60 @@ mod tests {
     use super::*;
     use crate::query_manager::relation_ir::{ColumnRef, JoinCondition, PredicateCmpOp};
     use crate::query_manager::types::Value;
+
+    /// An `id` condition reads the table's DECLARED `id` column when one
+    /// exists and the row id otherwise — the resolution every
+    /// descriptor-aware reader uses (`include_routing::correlate_source`,
+    /// `sort_keys_from_order_by`). A blind `id` → `_id` rewrite here is what
+    /// made a parent ref-include probe the row-id index with a foreign-key
+    /// VALUE and come back empty (live incident 2026-08-15).
+    #[test]
+    fn lower_relation_binds_id_conditions_to_a_declared_id_column() {
+        use crate::query_manager::types::{ColumnDescriptor, ColumnType, RowDescriptor};
+
+        let id_filter = |table: &str| RelExpr::Filter {
+            input: Box::new(RelExpr::TableScan {
+                table: TableName::new(table),
+            }),
+            predicate: PredicateExpr::Cmp {
+                left: ColumnRef::unscoped("id"),
+                op: PredicateCmpOp::Eq,
+                right: ValueRef::Literal(Value::Text("some-id".to_string())),
+            },
+        };
+        let branches = vec!["main".to_string()];
+        let mut schema = Schema::new();
+        schema.insert(
+            TableName::new("chats"),
+            RowDescriptor::new(vec![ColumnDescriptor::new("id", ColumnType::Uuid)]).into(),
+        );
+        schema.insert(
+            TableName::new("file_parts"),
+            RowDescriptor::new(vec![ColumnDescriptor::new("label", ColumnType::Text)]).into(),
+        );
+
+        let declared = lower_relation_to_execution_plan(
+            &id_filter("chats"),
+            &branches,
+            false,
+            Vec::new(),
+            None,
+            &schema,
+        )
+        .expect("declared-id filter should lower");
+        assert_eq!(declared.disjuncts[0].conditions[0].column(), "id");
+
+        let row_id = lower_relation_to_execution_plan(
+            &id_filter("file_parts"),
+            &branches,
+            false,
+            Vec::new(),
+            None,
+            &schema,
+        )
+        .expect("row-id filter should lower");
+        assert_eq!(row_id.disjuncts[0].conditions[0].column(), "_id");
+    }
 
     #[test]
     fn lower_relation_to_execution_plan_preserves_scoped_join_filters() {
@@ -993,8 +1139,15 @@ mod tests {
         };
         let branches = vec!["main".to_string()];
 
-        let plan = lower_relation_to_execution_plan(&relation, &branches, false, Vec::new(), None)
-            .expect("scoped join filters should lower");
+        let plan = lower_relation_to_execution_plan(
+            &relation,
+            &branches,
+            false,
+            Vec::new(),
+            None,
+            &Schema::new(),
+        )
+        .expect("scoped join filters should lower");
 
         assert_eq!(plan.base_scope, "u");
         assert_eq!(plan.joins.len(), 1);
@@ -1029,8 +1182,15 @@ mod tests {
         };
         let branches = vec!["main".to_string()];
 
-        let plan = lower_relation_to_execution_plan(&relation, &branches, false, Vec::new(), None)
-            .expect("single-table alias filter should lower");
+        let plan = lower_relation_to_execution_plan(
+            &relation,
+            &branches,
+            false,
+            Vec::new(),
+            None,
+            &Schema::new(),
+        )
+        .expect("single-table alias filter should lower");
 
         assert_eq!(plan.base_scope, "u");
         assert_eq!(
@@ -1055,8 +1215,15 @@ mod tests {
         };
         let branches = vec!["main".to_string()];
 
-        let plan = lower_relation_to_execution_plan(&relation, &branches, false, Vec::new(), None)
-            .expect("empty in should lower to a valid no-match plan");
+        let plan = lower_relation_to_execution_plan(
+            &relation,
+            &branches,
+            false,
+            Vec::new(),
+            None,
+            &Schema::new(),
+        )
+        .expect("empty in should lower to a valid no-match plan");
 
         assert_eq!(plan.disjuncts.len(), 1);
         assert_eq!(
@@ -1110,8 +1277,15 @@ mod tests {
         };
         let branches = vec!["main".to_string()];
 
-        let plan = lower_relation_to_execution_plan(&relation, &branches, false, Vec::new(), None)
-            .expect("post-projection result-element filter should lower");
+        let plan = lower_relation_to_execution_plan(
+            &relation,
+            &branches,
+            false,
+            Vec::new(),
+            None,
+            &Schema::new(),
+        )
+        .expect("post-projection result-element filter should lower");
 
         assert_eq!(plan.base_scope, "user_team_edges");
         assert_eq!(plan.result_element_index, Some(1));
@@ -1187,8 +1361,15 @@ mod tests {
         };
         let branches = vec!["main".to_string()];
 
-        let plan = lower_relation_to_execution_plan(&relation, &branches, false, Vec::new(), None)
-            .expect("join-seeded gather should lower");
+        let plan = lower_relation_to_execution_plan(
+            &relation,
+            &branches,
+            false,
+            Vec::new(),
+            None,
+            &Schema::new(),
+        )
+        .expect("join-seeded gather should lower");
 
         let Some(RelExpr::Project { input, columns }) = plan.seed_relation else {
             panic!("expected projected seed relation");

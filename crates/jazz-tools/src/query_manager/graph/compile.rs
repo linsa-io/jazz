@@ -455,6 +455,7 @@ impl QueryGraph {
             features.include_deleted,
             features.array_subqueries,
             features.select_columns,
+            schema,
         )?;
         validate_execution_plan(&plan, schema).ok()?;
         Self::compile_execution_plan_with_schema_context(
@@ -1027,6 +1028,7 @@ impl QueryGraph {
             query.include_deleted,
             query.array_subqueries.clone(),
             query.select_columns.clone(),
+            schema.as_ref(),
         )
         .ok_or_else(|| {
             QueryCompileError::InvalidPlan(
@@ -2477,15 +2479,18 @@ fn column_type_for_scan<'a>(
     table_schema: &'a crate::query_manager::types::TableSchema,
     column: &str,
 ) -> Option<&'a ColumnType> {
-    if column == "_id" || column == "id" {
-        return Some(&ColumnType::Uuid);
-    }
-    table_schema
+    // A declared column wins: a table may genuinely declare `id`, and forcing
+    // Uuid onto it would mis-normalize non-Uuid values. Only the fallback
+    // reads `id`/`_id` as the row id.
+    if let Some(declared) = table_schema
         .columns
         .columns
         .iter()
         .find(|descriptor| descriptor.name == column)
-        .map(|descriptor| &descriptor.column_type)
+    {
+        return Some(&declared.column_type);
+    }
+    (column == "_id" || column == "id").then_some(&ColumnType::Uuid)
 }
 
 fn normalize_scan_value(value: &Value, column_type: Option<&ColumnType>) -> Option<Value> {

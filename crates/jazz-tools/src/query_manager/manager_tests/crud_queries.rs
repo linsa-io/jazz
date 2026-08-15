@@ -1090,3 +1090,168 @@ fn a_plain_query_over_a_cross_branch_family_serves_one_row() {
     );
     scope_holds(&qm, "after the second touch");
 }
+
+/// The app's chat-list shape: memberships with a PARENT ref-include over a
+/// cross-branch family.
+///
+/// `chat_members.where({userId}).include({ chat })` compiles the singular ref
+/// as a correlated subquery from the CHILD to the PARENT table. When the
+/// parent chat's family splits across same-lineage branches (the second
+/// device touched it), that leg must still resolve the winner — the app
+/// explicitly drops memberships whose `chat` include comes back empty, which
+/// is exactly how touched chats vanished from every device's list while the
+/// rows sat intact server-side.
+#[test]
+fn a_parent_ref_include_resolves_across_a_cross_branch_family() {
+    use crate::query_manager::encoding::encode_row;
+    use std::collections::HashMap;
+
+    let sync_manager = SyncManager::new();
+    let mut schema = Schema::new();
+    schema.insert(
+        TableName::new("chats"),
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("id", ColumnType::Uuid),
+            ColumnDescriptor::new("title", ColumnType::Text),
+        ])
+        .into(),
+    );
+    schema.insert(
+        TableName::new("chat_members"),
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("chatId", ColumnType::Uuid),
+            ColumnDescriptor::new("name", ColumnType::Text),
+        ])
+        .into(),
+    );
+    let (mut qm, mut storage) = create_query_manager(sync_manager, schema.clone());
+
+    let mut old_schema = schema.clone();
+    old_schema.insert(
+        TableName::new("chat_activities"),
+        RowDescriptor::new(vec![ColumnDescriptor::new("kind", ColumnType::Text)]).into(),
+    );
+    let old_hash = crate::query_manager::types::SchemaHash::compute(&old_schema);
+    let old_branch = crate::query_manager::types::ComposedBranchName::new("dev", old_hash, "main")
+        .to_branch_name();
+    qm.add_live_schema(old_schema.clone());
+
+    let chat_uuid = ObjectId::new();
+    let chat_row_id = ObjectId::new();
+    let chats_descriptor = old_schema
+        .get(&TableName::new("chats"))
+        .expect("chats in old schema")
+        .columns
+        .clone();
+    let members_descriptor = old_schema
+        .get(&TableName::new("chat_members"))
+        .expect("chat_members in old schema")
+        .columns
+        .clone();
+
+    let receive = |qm: &mut QueryManager,
+                   storage: &mut MemoryStorage,
+                   table: &str,
+                   row_id: ObjectId,
+                   branch: &str,
+                   data: Vec<u8>,
+                   at: u64| {
+        let mut meta = HashMap::new();
+        meta.insert(MetadataKey::Table.to_string(), table.to_string());
+        meta.insert(
+            MetadataKey::OriginSchemaHash.to_string(),
+            old_hash.to_string(),
+        );
+        put_test_row_metadata(storage, row_id, meta);
+        let commit = stored_row_commit(smallvec![], data, at, row_id.to_string());
+        receive_row_commit(qm, storage, row_id, branch, commit);
+    };
+
+    // Chat + both memberships born under the OLD schema.
+    receive(
+        &mut qm,
+        &mut storage,
+        "chats",
+        chat_row_id,
+        old_branch.as_str(),
+        encode_row(
+            &chats_descriptor,
+            &[Value::Uuid(chat_uuid), Value::Text("family chat".into())],
+        )
+        .unwrap(),
+        1000,
+    );
+    for (index, name) in ["alice", "bob"].iter().enumerate() {
+        receive(
+            &mut qm,
+            &mut storage,
+            "chat_members",
+            ObjectId::new(),
+            old_branch.as_str(),
+            encode_row(
+                &members_descriptor,
+                &[Value::Uuid(chat_uuid), Value::Text((*name).into())],
+            )
+            .unwrap(),
+            1100 + index as u64,
+        );
+    }
+    qm.process(&mut storage);
+
+    // The app's list shape: memberships with the parent chat riding a
+    // correlated include.
+    let query = qm
+        .query("chat_members")
+        .with_array("chat", |sub| {
+            sub.from("chats").correlate("id", "chat_members.chatId")
+        })
+        .build();
+    let sub_id = qm.subscribe(query).unwrap();
+    qm.process(&mut storage);
+    let chat_of = |values: &Vec<Value>| -> usize {
+        values
+            .iter()
+            .filter_map(|value| value.as_array().map(|rows| rows.len()))
+            .next_back()
+            .unwrap_or(0)
+    };
+    let baseline = qm.get_subscription_results(sub_id);
+    assert_eq!(baseline.len(), 2, "both memberships must be served");
+    assert!(
+        baseline.iter().all(|(_, values)| chat_of(values) == 1),
+        "every membership must carry its chat before the touch, or this gates nothing"
+    );
+
+    // The second device touches the chat: a delivered newer version on the
+    // CURRENT branch — the family splits.
+    let current_branch = get_branch(&qm);
+    let renamed = encode_row(
+        &chats_descriptor,
+        &[
+            Value::Uuid(chat_uuid),
+            Value::Text("family chat renamed".into()),
+        ],
+    )
+    .unwrap();
+    let commit = stored_row_commit(smallvec![], renamed, 2000, chat_row_id.to_string());
+    receive_row_commit(
+        &mut qm,
+        &mut storage,
+        chat_row_id,
+        current_branch.as_str(),
+        commit,
+    );
+    qm.process(&mut storage);
+
+    let after = qm.get_subscription_results(sub_id);
+    assert_eq!(
+        after.len(),
+        2,
+        "memberships vanished after the parent's cross-branch touch"
+    );
+    assert!(
+        after.iter().all(|(_, values)| chat_of(values) == 1),
+        "a membership's parent ref-include came back empty after the family \
+         split — the app drops such rows and the chat vanishes from the list"
+    );
+}

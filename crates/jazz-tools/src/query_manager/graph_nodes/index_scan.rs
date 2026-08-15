@@ -446,6 +446,7 @@ impl SourceNode for IndexScanNode {
 
         tracing::trace!(
             table = %self.table,
+            column = %self.column,
             branch = %self.branch,
             scanned = new_ids.len(),
             added = added.len(),

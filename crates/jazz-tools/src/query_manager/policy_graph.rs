@@ -62,9 +62,10 @@ impl<'a> PolicyGraphBuildOptions<'a> {
 }
 
 impl PolicyGraph {
-    fn exists_rel_output_table(rel: &RelExpr, branch: &str) -> Option<TableName> {
+    fn exists_rel_output_table(rel: &RelExpr, branch: &str, schema: &Schema) -> Option<TableName> {
         let branches = vec![branch.to_string()];
-        let plan = lower_relation_to_execution_plan(rel, &branches, false, Vec::new(), None)?;
+        let plan =
+            lower_relation_to_execution_plan(rel, &branches, false, Vec::new(), None, schema)?;
         match plan.result_element_index {
             None | Some(0) => Some(plan.table),
             Some(index) => plan.joins.get(index - 1).map(|join| join.table),
@@ -264,7 +265,8 @@ impl PolicyGraph {
         let use_structural_rows = structural_scans
             || current_table
                 .and_then(|table| {
-                    Self::exists_rel_output_table(rel, branch).map(|output| output == *table)
+                    Self::exists_rel_output_table(rel, branch, schema)
+                        .map(|output| output == *table)
                 })
                 .unwrap_or(false);
         let compile_schema: Schema = if use_structural_rows {
