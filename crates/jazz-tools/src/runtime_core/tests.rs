@@ -4579,3 +4579,247 @@ fn a_select_policy_still_sees_the_owners_row_after_the_migration() {
          select policy cannot see the old-shelf row"
     );
 }
+
+/// Schema pair for the include crossing — the mobile account query's shape:
+/// a parent `users` row read together with related rows as include arrays.
+/// v2 adds one column to the parent, which is all a schema needs to mint a
+/// new shelf.
+fn account_include_schema_v1() -> Schema {
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("users")
+                .column("id", ColumnType::Uuid)
+                .column("name", ColumnType::Text),
+        )
+        .table(
+            TableSchema::builder("user_emails")
+                .column("email", ColumnType::Text)
+                .fk_column("user_id", "users"),
+        )
+        .table(
+            TableSchema::builder("unique_names")
+                .column("handle", ColumnType::Text)
+                .fk_column("user_id", "users"),
+        )
+        .build()
+}
+
+fn account_include_schema_v2() -> Schema {
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("users")
+                .column("id", ColumnType::Uuid)
+                .column("name", ColumnType::Text)
+                .column("bio", ColumnType::Text),
+        )
+        .table(
+            TableSchema::builder("user_emails")
+                .column("email", ColumnType::Text)
+                .fk_column("user_id", "users"),
+        )
+        .table(
+            TableSchema::builder("unique_names")
+                .column("handle", ColumnType::Text)
+                .fk_column("user_id", "users"),
+        )
+        .build()
+}
+
+/// Row ids a client was served, both delivery variants, drained once.
+fn served_row_ids_for(core: &mut TestCore, client_id: ClientId) -> Vec<ObjectId> {
+    core.sync_sender()
+        .take()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload:
+                    SyncPayload::RowBatchCreated { row, .. }
+                    | SyncPayload::RowBatchNeeded { row, .. },
+            } if id == client_id => Some(row.row_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An include-shaped subscription must serve the parent AND its relations
+/// across the crossing.
+///
+/// Production 2026-08-15: after the schema deployment the mobile app's account
+/// query — `users` by id with backref includes — settles empty for an identity
+/// whose rows predate the migration, and the rpc-server's own hydration
+/// samples count whole identity tables at zero. Every flat-table crossing gate
+/// above is green, so if this gate is red the disease lives in the include
+/// path; if it is green the hunt moves off this layer.
+///
+/// No serving assertion for an include-shaped query exists anywhere else in
+/// the crate — migrated or not — so the flat-table gates cannot stand in for
+/// this one. The pre-migration subscription runs first as the positive
+/// control: it proves the harness observes include serving at all (parent and
+/// children as row batches), so the post-migration assertion can only fail
+/// for crossing reasons.
+#[test]
+fn an_include_query_serves_the_parent_and_its_relations_across_the_migration() {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        account_include_schema_v1(),
+        "include-crossing",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    let user_id = ObjectId::new();
+    let ((user_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(user_id)),
+            ("name".to_string(), Value::Text("Owner".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the v1 user");
+    let ((email_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "user_emails",
+        HashMap::from([
+            ("user_id".to_string(), Value::Uuid(user_id)),
+            (
+                "email".to_string(),
+                Value::Text("owner@example.test".to_string()),
+            ),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the v1 email");
+    let ((name_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "unique_names",
+        HashMap::from([
+            ("user_id".to_string(), Value::Uuid(user_id)),
+            ("handle".to_string(), Value::Text("owner".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the v1 handle");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let include_query = |core: &mut TestCore| {
+        core.schema_manager_mut()
+            .query_manager_mut()
+            .query("users")
+            .with_array("user_emails", |sub| {
+                sub.from("user_emails").correlate("user_id", "users.id")
+            })
+            .with_array("unique_names", |sub| {
+                sub.from("unique_names").correlate("user_id", "users.id")
+            })
+            .build()
+    };
+
+    // Positive control: pre-migration, the include subscription must serve
+    // all three rows, or the observation channel proves nothing.
+    let pre_client = ClientId::new();
+    core.add_client(pre_client, Some(Session::new("reader")));
+    core.sync_sender().take();
+    let query = include_query(&mut core);
+    core.park_sync_message(InboxEntry {
+        source: Source::Client(pre_client),
+        payload: SyncPayload::QuerySubscription {
+            query_id: crate::sync_manager::QueryId(21),
+            query: Box::new(query),
+            session: Some(Session::new("reader")),
+            required_tier: None,
+            propagation: crate::sync_manager::QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    core.batched_tick();
+    core.immediate_tick();
+    let pre_served = served_row_ids_for(&mut core, pre_client);
+    for (label, id) in [
+        ("parent users row", user_row_id),
+        ("included user_emails row", email_row_id),
+        ("included unique_names row", name_row_id),
+    ] {
+        assert!(
+            pre_served.contains(&id),
+            "pre-migration include subscription did not serve the {label}; the harness \
+             cannot observe include serving, so the crossing assertion below would be \
+             vacuous (served: {pre_served:?})"
+        );
+    }
+
+    // The deployment: same store, new schema, migration lens published.
+    let storage = core.into_storage();
+    assert!(
+        !storage
+            .scan_catalogue_entries()
+            .expect("catalogue readable")
+            .is_empty(),
+        "the v1 runtime persisted no catalogue entries; the crossing cannot even begin"
+    );
+    let mut core =
+        recreate_runtime_rehydrated(account_include_schema_v2(), "include-crossing", storage);
+    let lens = crate::schema_manager::auto_lens::generate_lens(
+        &account_include_schema_v1(),
+        &account_include_schema_v2(),
+    );
+    core.publish_lens(&lens).expect("lens publishes");
+    core.immediate_tick();
+
+    // Axis check: the LOCAL include query first. If this sees the rows while
+    // the subscription below serves nothing, the defect is in serving, not in
+    // schema resolution.
+    let local_query = include_query(&mut core);
+    let local = execute_runtime_query(&mut core, local_query, None);
+    assert_eq!(
+        local.len(),
+        1,
+        "the local include query must resolve the v1 parent row after the migration"
+    );
+    let array_lens: Vec<usize> = local[0]
+        .1
+        .iter()
+        .filter_map(|value| value.as_array().map(|rows| rows.len()))
+        .collect();
+    assert_eq!(
+        array_lens,
+        vec![1, 1],
+        "the local include query must carry both related rows across the migration"
+    );
+
+    // A v2 client subscribes with the same include query, exactly as the
+    // upgraded app does.
+    let post_client = ClientId::new();
+    core.add_client(post_client, Some(Session::new("reader")));
+    core.sync_sender().take();
+    let query = include_query(&mut core);
+    core.park_sync_message(InboxEntry {
+        source: Source::Client(post_client),
+        payload: SyncPayload::QuerySubscription {
+            query_id: crate::sync_manager::QueryId(22),
+            query: Box::new(query),
+            session: Some(Session::new("reader")),
+            required_tier: None,
+            propagation: crate::sync_manager::QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    core.batched_tick();
+    core.immediate_tick();
+    let post_served = served_row_ids_for(&mut core, post_client);
+    for (label, id) in [
+        ("parent users row", user_row_id),
+        ("included user_emails row", email_row_id),
+        ("included unique_names row", name_row_id),
+    ] {
+        assert!(
+            post_served.contains(&id),
+            "the {label} vanished from the include subscription after the schema moved \
+             on (served: {post_served:?})"
+        );
+    }
+}
