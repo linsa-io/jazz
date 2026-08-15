@@ -702,9 +702,23 @@ Reproduced headlessly: `storage::store_probe::incident_app_store_serves_the_user
 (ignored, needs JAZZ*PROBE*\* env) is red against the store copy on the
 POST-defect-19 engine — defect 19's fix does not heal this state.
 
-The store is mixed-era (entries from several engine versions and at least one
-wipe); which era's writer chose the wrong table — or whether the locator and
-the visible write simply came from different writers — is not yet pinned. The
+PINNED (2026-08-15, second pass): reproduced on a FRESH store with the
+v16.9 engine — the split is written by the CURRENT ingest when the row
+arrives BEFORE the catalogue knows its origin schema. The resolution ladder
+(`required_history_user_descriptor_and_schema_hash_for_row`) falls through to
+the any-decoding-descriptor table fallback and picks the only schema the
+fresh catalogue has — the CURRENT one — for the raw-table placement, while
+`ensure_object_metadata` has already persisted the server-stamped origin hash
+into the row locator. Live consequence measured end to end on the sim: the
+subscription's in-flight delta makes the account query true (the app reaches
+chats), the next materialization re-reads through the locator, misses the
+misplaced visible row, and the query settles empty — welcome → chats → kick,
+the original production symptom, one mechanism. Fix direction: (a) writer
+consistency — persist the locator with the hash the write actually used (the
+one whose descriptor decoded the bytes); (b) reader fallback — when the
+locator-named raw table misses, scan the other registered raw tables of the
+same logical table for `<branch>:<row>` (heals already-poisoned stores,
+including the phone, without a repair migration). The
 runtime-core harness `a_delivered_old_branch_row_lands_readably_in_a_fresh_store`
 (ignored, red by design) does not yet reproduce the app's partial-write state:
 its delivery is dropped before anything is written, so the faithful ingest

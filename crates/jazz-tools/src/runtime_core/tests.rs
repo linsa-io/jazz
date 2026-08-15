@@ -5137,10 +5137,10 @@ fn a_row_of_an_untouched_table_is_served_across_a_lensless_migration() {
 /// deliver an old-branch row into a fresh runtime that knows both schemas,
 /// then require the local query to resolve it.
 #[test]
-#[ignore = "defect 20, open: red by design while the ingest harness is made faithful — \
-the app store shows history+locator+visible all written but split across two raw-table \
-hashes; this harness so far reproduces an even earlier drop (nothing written). \
-See UPSTREAM-DEFECTS.md entry 20."]
+#[ignore = "defect 20, open: red by design until the split-hash ingest fix lands — \
+a row delivered BEFORE the catalogue knows its origin schema is placed in the \
+current schema's raw table while the locator names the origin, and every read \
+misses it. See UPSTREAM-DEFECTS.md entry 20."]
 fn a_delivered_old_branch_row_lands_readably_in_a_fresh_store() {
     let old_schema = users_with_doomed_table_schema();
     let old_hash = SchemaHash::compute(&old_schema);
@@ -5150,14 +5150,6 @@ fn a_delivered_old_branch_row_lands_readably_in_a_fresh_store() {
         MemoryStorage::new(),
         SyncManager::new(),
     );
-    // The catalogue knows the old schema too (catalogue sync delivered it);
-    // identity activation makes its branch queryable.
-    core.schema_manager_mut()
-        .query_manager_mut()
-        .add_live_schema(old_schema.clone());
-    core.batched_tick();
-    core.immediate_tick();
-
     let old_branch = crate::query_manager::types::ComposedBranchName::new("dev", old_hash, "main")
         .to_branch_name();
     let row_id = ObjectId::new();
@@ -5203,6 +5195,14 @@ fn a_delivered_old_branch_row_lands_readably_in_a_fresh_store() {
             row: delivered,
         },
     });
+    core.batched_tick();
+    core.immediate_tick();
+
+    // The catalogue learns the old schema AFTER the row landed — the app's
+    // measured race. Identity activation makes the old branch queryable.
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .add_live_schema(old_schema.clone());
     core.batched_tick();
     core.immediate_tick();
 
