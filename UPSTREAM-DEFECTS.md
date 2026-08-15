@@ -680,6 +680,42 @@ axis check), `a_row_from_an_identical_table_on_another_schema_branch_is_served_w
 
 ---
 
+## 20. OPEN — a delivered row lands split across two raw-table hashes in a mixed-era store
+
+The mobile app's store (copy preserved at
+`~/git/anysynth/jazz-incident-stores/app-store.sqlite`) holds, for the
+incident user's `users` row after tonight's confirmed delivery:
+
+- `__row_locator` naming origin schema hash **b32dae47** (the OLD schema);
+- the visible row bytes inside raw table
+  `rowtable:visible:users:53710882…` (the NEW schema's raw table), branch
+  `dev-b32dae47…-main`, batch id = tonight's delivered batch;
+- the `users:_id` index entry on the old branch;
+- the batch settlement record.
+
+Every read path resolves the visible raw table THROUGH THE LOCATOR's origin
+hash (`common_case_exact_visible_row_table_locator`), computes
+`users:b32dae47…` — a raw table that does not exist in this store — and
+misses. Result: the row is delivered, confirmed, indexed, settled and
+unreadable; the account query settles empty with the identity in hand.
+Reproduced headlessly: `storage::store_probe::incident_app_store_serves_the_users_row_after_rehydrate`
+(ignored, needs JAZZ*PROBE*\* env) is red against the store copy on the
+POST-defect-19 engine — defect 19's fix does not heal this state.
+
+The store is mixed-era (entries from several engine versions and at least one
+wipe); which era's writer chose the wrong table — or whether the locator and
+the visible write simply came from different writers — is not yet pinned. The
+runtime-core harness `a_delivered_old_branch_row_lands_readably_in_a_fresh_store`
+(ignored, red by design) does not yet reproduce the app's partial-write state:
+its delivery is dropped before anything is written, so the faithful ingest
+model is still to be built. Next steps: pin the writer via the ladder in
+`required_history_user_descriptor_and_schema_hash_for_row`, then decide
+writer-fix + reader-side identity fallback (same invariant as defect 19: a
+same-descriptor raw table is as good as the named one), plus a store repair
+for poisoned stores.
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed

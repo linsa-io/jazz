@@ -5124,3 +5124,93 @@ fn a_row_of_an_untouched_table_is_served_across_a_lensless_migration() {
         "the untouched table's row vanished from serving across a lensless migration"
     );
 }
+
+/// A delivered old-branch row must land READABLY in a fresh store.
+///
+/// The app's measured state, production 2026-08-15: a fresh client store
+/// (post-wipe), catalogue carrying both schemas, receives the user's own
+/// pre-migration `users` row from the server (confirm-me delivery, receiver
+/// confirmed). The history batch, the id index entry and a visible row all
+/// land — but the visible row sits in the raw table suffixed with one schema
+/// hash while the row locator names the other, so every read path misses it
+/// and the account query stays empty forever. This gate is that exact flow:
+/// deliver an old-branch row into a fresh runtime that knows both schemas,
+/// then require the local query to resolve it.
+#[test]
+#[ignore = "defect 20, open: red by design while the ingest harness is made faithful — \
+the app store shows history+locator+visible all written but split across two raw-table \
+hashes; this harness so far reproduces an even earlier drop (nothing written). \
+See UPSTREAM-DEFECTS.md entry 20."]
+fn a_delivered_old_branch_row_lands_readably_in_a_fresh_store() {
+    let old_schema = users_with_doomed_table_schema();
+    let old_hash = SchemaHash::compute(&old_schema);
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        users_survivor_schema(),
+        "fresh-client-ingest",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    // The catalogue knows the old schema too (catalogue sync delivered it);
+    // identity activation makes its branch queryable.
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .add_live_schema(old_schema.clone());
+    core.batched_tick();
+    core.immediate_tick();
+
+    let old_branch = crate::query_manager::types::ComposedBranchName::new("dev", old_hash, "main")
+        .to_branch_name();
+    let row_id = ObjectId::new();
+    let descriptor = &old_schema
+        .get(&TableName::new("users"))
+        .expect("users exists in the old schema")
+        .columns;
+    let delivered = crate::row_histories::StoredRowBatch::new(
+        row_id,
+        old_branch.as_str(),
+        Vec::new(),
+        encode_row(
+            descriptor,
+            &[Value::Uuid(row_id), Value::Text("born before".to_string())],
+        )
+        .expect("row encodes under the shared descriptor"),
+        crate::metadata::RowProvenance::for_insert(row_id.to_string(), 1_000),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+    let upstream = ClientId::new();
+    core.add_client(upstream, Some(Session::new("upstream")));
+    core.sync_sender().take();
+    core.park_sync_message(InboxEntry {
+        source: Source::Client(upstream),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: Some(crate::sync_manager::RowMetadata {
+                id: row_id,
+                metadata: HashMap::from([
+                    (
+                        crate::metadata::MetadataKey::Table.as_str().to_string(),
+                        "users".to_string(),
+                    ),
+                    (
+                        crate::metadata::MetadataKey::OriginSchemaHash
+                            .as_str()
+                            .to_string(),
+                        old_hash.to_string(),
+                    ),
+                ]),
+            }),
+            row: delivered,
+        },
+    });
+    core.batched_tick();
+    core.immediate_tick();
+
+    let local = execute_runtime_query(&mut core, Query::new("users"), None);
+    assert_eq!(
+        local.len(),
+        1,
+        "a delivered old-branch row is unreadable in a fresh store — the ingest \
+         placed it where no read path looks"
+    );
+}
