@@ -3637,4 +3637,114 @@ mod split_locator_tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// The locator must not move on a FAILED apply. The aligned locator rides
+    /// the request, but persists only after `apply_row_batch_with_context`
+    /// succeeds — a batch that fails validation (a routine ParentNotFound on
+    /// out-of-order delivery) must leave the stored locator untouched, or
+    /// batches stored without exact locators under the old hash become
+    /// unreachable (parent checks, tier patches, replay dedup, the
+    /// USING-policy old-content load).
+    #[test]
+    fn a_failed_apply_leaves_the_row_locator_untouched() {
+        let path = std::env::temp_dir().join(format!(
+            "jazz-locator-flip-test-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut storage = SqliteStorage::open(&path).expect("temp sqlite store opens");
+
+        let schema = users_schema();
+        let schema_hash = crate::test_support::persist_test_schema(&mut storage, &schema);
+        let branch = ComposedBranchName::new("dev", schema_hash, "main").to_branch_name();
+
+        // The stored locator names a hash the resolve ladder will NOT pick —
+        // alignment would trigger if the apply succeeded.
+        let stamped_hash = SchemaHash::from_bytes([7u8; 32]);
+        let row_id = ObjectId::new();
+        storage
+            .put_row_locator(
+                row_id,
+                Some(&RowLocator {
+                    table: "users".to_string().into(),
+                    origin_schema_hash: Some(stamped_hash),
+                }),
+            )
+            .expect("locator persists");
+
+        let descriptor = schema
+            .get(&TableName::new("users"))
+            .expect("users descriptor")
+            .columns
+            .clone();
+        let data = crate::row_format::encode_row(
+            &descriptor,
+            &[crate::query_manager::types::Value::Text("orphan".into())],
+        )
+        .expect("row encodes");
+        // A parent batch id that does not exist anywhere — the apply must fail.
+        let missing_parent = crate::row_histories::BatchId([9u8; 16]);
+        let orphan = StoredRowBatch::new(
+            row_id,
+            branch.as_str(),
+            vec![missing_parent],
+            data.clone(),
+            crate::metadata::RowProvenance::for_insert(row_id.to_string(), 1_000),
+            std::collections::HashMap::new(),
+            RowState::VisibleDirect,
+            None,
+        );
+        let failed = apply_row_batch(
+            &mut storage,
+            row_id,
+            &BranchName::new(branch.as_str()),
+            orphan,
+            &[],
+        );
+        assert!(
+            failed.is_err(),
+            "the orphan batch must fail its parent check, or this gates nothing"
+        );
+        let locator = storage
+            .load_row_locator(row_id)
+            .expect("locator readable")
+            .expect("locator still present");
+        assert_eq!(
+            locator.origin_schema_hash,
+            Some(stamped_hash),
+            "a FAILED apply moved the row locator — batches stored without exact \
+             locators under the stamped hash are now unreachable"
+        );
+
+        // The happy half: a valid batch aligns the locator to the resolved hash.
+        let rooted = StoredRowBatch::new(
+            row_id,
+            branch.as_str(),
+            Vec::new(),
+            data,
+            crate::metadata::RowProvenance::for_insert(row_id.to_string(), 1_100),
+            std::collections::HashMap::new(),
+            RowState::VisibleDirect,
+            None,
+        );
+        apply_row_batch(
+            &mut storage,
+            row_id,
+            &BranchName::new(branch.as_str()),
+            rooted,
+            &[],
+        )
+        .expect("the rooted batch applies");
+        let locator = storage
+            .load_row_locator(row_id)
+            .expect("locator readable")
+            .expect("locator present");
+        assert_eq!(
+            locator.origin_schema_hash,
+            Some(schema_hash),
+            "a successful apply must align the locator to the resolved hash"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
