@@ -893,17 +893,21 @@ index is keyed by row ids, the probe value was the `id` column's uuid, so
 the include came back empty for every row — on ANY branch; a schema crossing
 was only the incident context, not the trigger.
 
-The lowering was the lone dissenter: every other reader already resolves
-`id` descriptor-first — `include_routing::correlate_source` ("an actual
-column of that name wins"), `query::row_condition_row_id_element`,
-`sort_keys_from_order_by`, the policy evaluators. The forward (parent→child)
-include never hit this because it correlates a real child column against the
-parent's row id.
+The lowering — with the scan-type normalizer beside it,
+`column_type_for_scan` — dissented from the merge-base's own convention:
+`query::row_condition_row_id_element` and the policy evaluators consult the
+descriptor before the row-id fallback; `sort_keys_from_order_by` spells the
+rule out ("id" maps to internal row id when no explicit "id" column exists);
+join-key resolution tries the declared column first. The forward
+(parent→child) include never hit this because it correlates a real child
+column against the parent's row id.
 
 Live consequence (2026-08-15, second half of the shrinking-list incident):
 with defect 21 fixed, membership rows flowed but each one's `chat` include
-resolved null, and a list that drops null-chat rows rendered 3 chats out of
-7 present in the store.
+resolved null. The device's list — which drops null-chat rows, and with
+defects 23/24 still live under this one — rendered 3 chats out of 7 present
+in the store; the include face itself is pinned by the `scanned=0` trace
+above.
 
 Fix: condition lowering keeps the written column name; a
 `bind_row_id_condition_columns` pass over the finished plan (which is the
@@ -926,20 +930,21 @@ Attribution: UPSTREAM-INHERITED — the blind rewrite is at the merge-base verba
 `e84d84a6:crates/jazz-tools/src/query_manager/relation_ir_query_plan.rs` (`to_runtime_column`,
 `if column == "id" { "_id" }` with no descriptor consultation).
 Groove (codex/jazz-core-engine-swap): PARTIALLY STILL PRESENT (static reading at `aada95800`,
-not a runtime repro). Groove's condition path is descriptor-aware
+not a runtime repro). Groove's tools-side row-condition path is descriptor-aware
 (`crates/jazz/src/tools/public_api/query.rs` `row_condition_row_id_element`: a declared
-column wins), but two readers resolve `id` blind to the row id: flat-join value refs
-(`crates/jazz/src/node/query_eval.rs:6958,6983` — `column == "id" || column == "_id"` →
-`RowIdRef`, no descriptor check) and sort keys
-(`crates/jazz/src/tools/public_api/query.rs:958`). `TableSchemaBuilder::column` accepts the
-name `id` with no reservation, so a schema like ours (every table declares an `id` uuid
-column) makes both sites reachable: a flat join `ON x.ref = y.id` or an `order_by("id")`
-against a declared `id` column silently reads the row id instead. Same class, narrower
-surface — worth a reservation on the name or descriptor-first resolution at those two sites.
+column wins), but the IVM normalizer resolves `id` blind to the row id: the central
+operand arm (`crates/jazz/src/node/query_eval.rs:3164` — `Operand::Column(column) if
+column == "id"` → `RowIdRef`, no descriptor in reach) feeds comparison operands, order
+keys and group-by refs, and the flat-join value refs repeat the check locally
+(`:6958,6983`). `TableSchemaBuilder::column` accepts the name `id` with no reservation,
+so a schema like ours (every table declares an `id` uuid column) makes these sites
+reachable: an `order_by("id")`, a flat join `ON x.ref = y.id`, or an IVM-path comparison
+on `id` against a declared `id` column silently reads the row id instead. Same class —
+worth a reservation on the name or descriptor-first resolution in the normalizer.
 
 ---
 
-## 23. Authorization fails closed for every row of an older schema generation — a session sees a third of the store
+## 23. Authorization fails closed for every row of an older schema generation — a session sees 2 of 12 rows
 
 **Severity: silent data invisibility under sessions.** The read path was taught the
 identity crossing (defects 19/20/22); the authorization path was not. Two independent
@@ -955,14 +960,15 @@ loads the row fine and fails `transform_content_to_authorization_schema` with
 `NoLensPath { old → current }` — authorization fails closed before any policy content
 runs. Current-generation rows survive only via the `source_hash == current_hash`
 short-circuit. Measured on a copy of the incident store (probe
-`storage::store_probe::incident_app_store_serves_the_membership_include`): the app's
-chat list query serves 12 of 12 membership rows without a session, **2 of 12 with
-one** — every dropped row is old-generation, even though the table's read policy is
-`always()`. On the device this rendered as "my chats disappeared after the
+`storage::store_probe::incident_app_store_serves_the_membership_include`): a
+store-wide membership-include sweep (`chat_members` with its `chat` include, no
+per-user filter — all 12 membership rows in the store) serves 12 of 12 without a
+session, **2 of 12 with one** — every dropped row is old-generation, even though the
+table's read policy is `always()`. On the device this rendered as "my chats disappeared after the
 migration" while an admin inspector (no session) showed every row intact.
 
 Face 2: policy evaluation is single-branch. PolicyFilter wiring picks
-`branch_for_policy = branches.first()` (merge-base `graph/compile.rs` lines 691, 1406) and threads ONE branch into `PolicyContextEvaluator`/`PolicyGraph`, so a
+`branch_for_policy = branches.first()` (merge-base `graph/compile.rs` lines 691, 1406, 1516) and threads ONE branch into `PolicyContextEvaluator`/`PolicyGraph`, so a
 policy arm that needs a supporting row (readReferencing/INHERITS shapes) probes only
 the first branch of the query's sanctioned set — support rows living across the
 crossing are invisible to the arm and the row is denied.
@@ -996,7 +1002,7 @@ independently. Probe after: 12 of 12 with a session. Suite: 1526 passed / 0 fail
 Attribution: UPSTREAM-INHERITED — both faces at the merge-base:
 `e84d84a6:crates/jazz-tools/src/query_manager/server_queries.rs:244` (auth context seeded
 from `known_schemas` only, iteration at :270) and
-`e84d84a6:crates/jazz-tools/src/query_manager/graph/compile.rs:691,1406`
+`e84d84a6:crates/jazz-tools/src/query_manager/graph/compile.rs:691,1406,1516`
 (`branch_for_policy = branches.first()`).
 Groove (codex/jazz-core-engine-swap): architected away (static reading at `aada95800`) —
 policy is projected per version row (`policy_projection_for_version_row`,
@@ -1024,7 +1030,8 @@ tip had moved to the NEW generation was denied because its grounding `chat_membe
 live only in the OLD one, and that single denial (face 1) deleted two chats from the
 list's outer rows.
 
-Measured end to end on the incident store (session-scoped, the app's own list query):
+Measured end to end on the incident store (session-scoped, the app's own list query —
+the user's own five membership rows, a narrower shape than entry 23's store-wide 12):
 simple include serves 5 of 5 memberships; adding the first POLICIED nested level
 (member → user) drops to 3 — the production "my chats disappeared" number, reproduced in
 the probe with a one-element toggle. Bisect pinned it: ordering innocent, 2-level
@@ -1083,8 +1090,8 @@ Open PRs on the branch that overlap entries here: #1538 → 17; #1533, #1537 →
 The risk verdict: 17 of the 23 live entries (entry 4 is withdrawn; 24 total) have mechanisms unrepresentable on the groove line,
 plus entry 24's branch-universe face (its outer-row-kill face is an unverified review item there),
 including 17, 19, 20 and 23 — the schema-crossing class. Still present: 6's RN half, the
-new O(table) policy scan flagged under entry 15, and 22's blind `id` readers (flat-join
-value refs and sort keys resolve a declared `id` column as the row id). Unknown: 2, 18,
+new O(table) policy scan flagged under entry 15, and 22's blind `id` readers (the IVM
+operand normalizer and flat-join value refs resolve a declared `id` column as the row id). Unknown: 2, 18,
 the cost profiles of 8, 12 and 15, and the parking memory bound. The bottom line is architecture-ahead but
 mobile-behind: the RN binding on the integration branch does not compile against the new
 core (it imports the deleted `jazz::tools` modules) — its rewrite is open PR #1367 — so
