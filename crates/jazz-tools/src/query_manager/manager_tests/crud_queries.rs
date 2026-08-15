@@ -684,3 +684,104 @@ fn a_row_from_an_identical_table_on_another_schema_branch_is_served_without_a_le
     assert_eq!(results[0].1[0], Value::Text("Alice".into()));
     assert_eq!(results[0].1[1], Value::Integer(100));
 }
+
+/// A row delivered BEFORE the catalogue knows its origin schema must still be
+/// readable once the catalogue catches up.
+///
+/// Production 2026-08-15, the second face of the crossing (defect 20): a
+/// fresh client store receives the user's pre-migration `users` row before
+/// catalogue sync delivers the old schema. The write-context ladder falls
+/// through to the any-decoding-descriptor fallback and places the visible
+/// bytes in the CURRENT schema's raw table, while the row locator keeps the
+/// server-stamped origin hash — and every read path resolves the raw table
+/// through the locator, so the row is delivered, confirmed, indexed and
+/// unreadable. Measured live: the account query flips true off the in-flight
+/// delta (the app reaches chats), the next materialization misses, and the
+/// user is kicked back to welcome.
+#[test]
+fn a_row_delivered_before_the_catalogue_knows_its_schema_is_still_readable() {
+    use crate::query_manager::encoding::encode_row;
+    use std::collections::HashMap;
+
+    let sync_manager = SyncManager::new();
+    let schema = test_schema();
+    let (mut qm, mut storage) = create_query_manager(sync_manager, schema);
+
+    // A local write first: it seeds the catalogue with the CURRENT schema
+    // (the app persists its own schema at boot) and doubles as the control
+    // row that must remain visible throughout.
+    qm.insert(
+        &mut storage,
+        "users",
+        &[Value::Text("local".into()), Value::Integer(1)],
+    )
+    .unwrap();
+    qm.process(&mut storage);
+
+    // The old world's schema: `users` IDENTICAL, hash differs by an extra
+    // table. NOT registered anywhere yet — the row will arrive first.
+    let mut old_schema = Schema::new();
+    old_schema.insert(
+        TableName::new("users"),
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("name", ColumnType::Text),
+            ColumnDescriptor::new("score", ColumnType::Integer),
+        ])
+        .into(),
+    );
+    old_schema.insert(
+        TableName::new("chat_activities"),
+        RowDescriptor::new(vec![ColumnDescriptor::new("kind", ColumnType::Text)]).into(),
+    );
+    let old_hash = crate::query_manager::types::SchemaHash::compute(&old_schema);
+    let old_branch = crate::query_manager::types::ComposedBranchName::new("dev", old_hash, "main")
+        .to_branch_name();
+
+    // The delivery: server-stamped metadata (locator carries the origin
+    // hash), row bytes on the old branch.
+    let row_id = ObjectId::new();
+    let mut metadata = HashMap::new();
+    metadata.insert(MetadataKey::Table.to_string(), "users".to_string());
+    metadata.insert(
+        MetadataKey::OriginSchemaHash.to_string(),
+        old_hash.to_string(),
+    );
+    put_test_row_metadata(&mut storage, row_id, metadata);
+    let old_descriptor = old_schema
+        .get(&TableName::new("users"))
+        .expect("old users table exists")
+        .columns
+        .clone();
+    let old_data = encode_row(
+        &old_descriptor,
+        &[Value::Text("delivered".into()), Value::Integer(100)],
+    )
+    .unwrap();
+    let commit = stored_row_commit(smallvec![], old_data, 1000, row_id.to_string());
+    receive_row_commit(&mut qm, &mut storage, row_id, old_branch.as_str(), commit);
+    qm.process(&mut storage);
+
+    // Catalogue sync catches up: the old schema becomes known and its branch
+    // queryable (identity activation).
+    qm.add_live_schema(old_schema);
+    qm.process(&mut storage);
+
+    let sub_id = qm.subscribe(qm.query("users").build()).unwrap();
+    qm.process(&mut storage);
+    let results = qm.get_subscription_results(sub_id);
+    assert_eq!(
+        results.len(),
+        2,
+        "the delivered row vanished: a row that arrived before its schema was \
+         catalogued must be readable once the catalogue catches up (only the \
+         local control row is visible)"
+    );
+    let names: Vec<_> = results
+        .iter()
+        .map(|(_, values)| values[0].clone())
+        .collect();
+    assert!(
+        names.contains(&Value::Text("delivered".into())),
+        "the delivered row's content must be served (got: {names:?})"
+    );
+}

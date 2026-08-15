@@ -680,7 +680,7 @@ axis check), `a_row_from_an_identical_table_on_another_schema_branch_is_served_w
 
 ---
 
-## 20. OPEN — a delivered row lands split across two raw-table hashes in a mixed-era store
+## 20. A delivered row lands split across two raw-table hashes — locator lies, reads miss
 
 The mobile app's store (copy preserved at
 `~/git/anysynth/jazz-incident-stores/app-store.sqlite`) holds, for the
@@ -701,6 +701,30 @@ unreadable; the account query settles empty with the identity in hand.
 Reproduced headlessly: `storage::store_probe::incident_app_store_serves_the_users_row_after_rehydrate`
 (ignored, needs JAZZ*PROBE*\* env) is red against the store copy on the
 POST-defect-19 engine — defect 19's fix does not heal this state.
+
+FIXED (2026-08-15, third pass), oracle-reviewed. Three read-side fallbacks
+and one write-side invariant, one principle: the locator is a hint, the bytes
+are the truth. (1) The exact visible read, the history point read and the
+delete resolver all probe every registered raw table of the logical table
+when the locator-directed lookups miss — this heals poisoned stores in place,
+including the history reads that surfaced as "no old content" USING-policy
+rejections, and keeps recovered rows deletable. (2) `apply_row_batch` aligns
+the row locator to the schema hash the write actually resolved — persisted
+only AFTER the apply succeeds (the oracle caught the original
+flip-before-validate: a routine ParentNotFound would have stranded batches
+stored without exact locators). Validation: full suite 1517/0; the real
+poisoned store copy reads the user's row under both bare and session-scoped
+subscriptions; a hermetic sqlite CI witness
+(`a_visible_row_behind_a_lying_locator_is_recovered_and_deletable`) guards
+both fallbacks with a positive control. Probes now copy-then-open
+(SqliteStorage::open mutates unconditionally and truncated two working
+copies). Oracle residuals, accepted and recorded: the writer that poisoned
+the incident store WITHOUT exact locators remains unidentified (every
+in-crate visible-write path writes them on divergence — likely engine-version
+skew on the device), so the reader fallback is load-bearing; a double-poisoned
+store with zero exact locators would serve the lexicographically smallest
+sibling (info-logged); the fallback adds bounded probe cost on visible-read
+misses.
 
 PINNED (2026-08-15, second pass): reproduced on a FRESH store with the
 v16.9 engine — the split is written by the CURRENT ingest when the row

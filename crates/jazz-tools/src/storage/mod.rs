@@ -1666,14 +1666,48 @@ fn exact_visible_row_table_locator_for_delete<H: Storage + ?Sized>(
         return Ok(Some(locator));
     }
 
-    let Some(locator) = common_case_exact_visible_row_table_locator(storage, row_id)? else {
-        return Ok(None);
-    };
-    if locator.table_name.as_str() == table {
-        Ok(Some(locator))
-    } else {
-        Ok(None)
+    if let Some(locator) = common_case_exact_visible_row_table_locator(storage, row_id)? {
+        if locator.table_name.as_str() == table {
+            // Trust the locator only if the row is actually there — a poisoned
+            // store's bytes may sit in a sibling raw table (defect 20), and a
+            // delete issued against the locator-named table would miss them,
+            // leaving an undeletable row that the read fallback then serves
+            // forever.
+            let key = key_codec::visible_row_raw_table_key(branch, row_id);
+            if storage
+                .raw_table_get(locator.row_raw_table.as_str(), &key)?
+                .is_some()
+            {
+                return Ok(Some(locator));
+            }
+        } else {
+            return Ok(None);
+        }
     }
+
+    // Sibling probe: find the raw table that physically holds the row.
+    let key = key_codec::visible_row_raw_table_key(branch, row_id);
+    for row_raw_table_id in row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)? {
+        if storage
+            .raw_table_get(row_raw_table_id.raw_table_name(), &key)?
+            .is_some()
+        {
+            tracing::info!(
+                table,
+                branch,
+                %row_id,
+                raw_table = %row_raw_table_id.raw_table_name(),
+                "delete target recovered from a sibling raw table the locator did not name"
+            );
+            return Ok(Some(ExactRowTableLocator {
+                row_raw_table: row_raw_table_id.raw_table_name().to_string().into(),
+                table_name: row_raw_table_id.table_name.clone(),
+                schema_hash: row_raw_table_id.schema_hash,
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 fn sealed_batch_submission_storage_descriptor_with_branch_ords() -> RowDescriptor {
@@ -2164,7 +2198,7 @@ pub(super) fn scan_visible_row_bytes_with_storage<H: Storage + ?Sized>(
 
 pub(super) fn load_history_row_batch_row_bytes_with_storage<H: Storage + ?Sized>(
     storage: &H,
-    _table: &str,
+    table: &str,
     branch: &str,
     row_id: ObjectId,
     batch_id: BatchId,
@@ -2193,35 +2227,66 @@ pub(super) fn load_history_row_batch_row_bytes_with_storage<H: Storage + ?Sized>
         }
     }
 
-    let Some(locator) = storage.load_history_row_batch_table_locator(branch, row_id, batch_id)?
-    else {
-        return Ok(None);
-    };
-    let resolved = resolved_row_table_from_locator(storage, &locator)?
-        .expect("locator-resolved row table must exist");
-    let row_raw_table = locator.row_raw_table.to_string();
-    Ok(storage
-        .raw_table_get(&row_raw_table, &key)?
-        .map(|bytes| OwnedHistoryRowBytes {
-            row_raw_table_id: RowRawTableId {
-                kind: RowRawTableKind::History,
-                table_name: locator.table_name.clone(),
-                schema_hash: locator.schema_hash,
-                raw_table_name: locator.row_raw_table.clone(),
-            },
-            row_raw_table,
-            user_descriptor: resolved.user_descriptor,
-            branch: branch.to_string(),
-            row_id,
-            batch_id,
-            needs_exact_locator: true,
-            bytes,
-        }))
+    if let Some(locator) = storage.load_history_row_batch_table_locator(branch, row_id, batch_id)? {
+        let resolved = resolved_row_table_from_locator(storage, &locator)?
+            .expect("locator-resolved row table must exist");
+        let row_raw_table = locator.row_raw_table.to_string();
+        if let Some(bytes) = storage.raw_table_get(&row_raw_table, &key)? {
+            return Ok(Some(OwnedHistoryRowBytes {
+                row_raw_table_id: RowRawTableId {
+                    kind: RowRawTableKind::History,
+                    table_name: locator.table_name.clone(),
+                    schema_hash: locator.schema_hash,
+                    raw_table_name: locator.row_raw_table.clone(),
+                },
+                row_raw_table,
+                user_descriptor: resolved.user_descriptor,
+                branch: branch.to_string(),
+                row_id,
+                batch_id,
+                needs_exact_locator: true,
+                bytes,
+            }));
+        }
+    }
+
+    // Last resort — the history twin of the visible sibling probe below: a
+    // poisoned store's history batches sit in a raw table the locators do not
+    // name (defect 20), and this point read backs parent checks, tier
+    // patches, replay dedup and the USING-policy old-content load — misses
+    // here surface as "no old content" rejections.
+    for row_raw_table_id in row_raw_table_ids_for_table(storage, RowRawTableKind::History, table)? {
+        let Some(resolved) = resolved_row_table_from_id(storage, row_raw_table_id.clone())? else {
+            continue;
+        };
+        let row_raw_table = row_raw_table_id.raw_table_name().to_string();
+        if let Some(bytes) = storage.raw_table_get(&row_raw_table, &key)? {
+            tracing::info!(
+                table,
+                branch,
+                %row_id,
+                raw_table = %row_raw_table,
+                "history batch recovered from a sibling raw table the locator did not name"
+            );
+            return Ok(Some(OwnedHistoryRowBytes {
+                row_raw_table_id: row_raw_table_id.clone(),
+                row_raw_table,
+                user_descriptor: resolved.user_descriptor,
+                branch: branch.to_string(),
+                row_id,
+                batch_id,
+                needs_exact_locator: true,
+                bytes,
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
     storage: &H,
-    _table: &str,
+    table: &str,
     branch: &str,
     row_id: ObjectId,
 ) -> Result<Option<OwnedVisibleRowBytes>, StorageError> {
@@ -2248,28 +2313,63 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
         }
     }
 
-    let Some(locator) = storage.load_visible_row_table_locator(branch, row_id)? else {
-        return Ok(None);
-    };
-    let resolved = resolved_row_table_from_locator(storage, &locator)?
-        .expect("locator-resolved row table must exist");
-    let row_raw_table = locator.row_raw_table.to_string();
-    Ok(storage
-        .raw_table_get(&row_raw_table, &key)?
-        .map(|bytes| OwnedVisibleRowBytes {
-            row_raw_table_id: RowRawTableId {
-                kind: RowRawTableKind::Visible,
-                table_name: locator.table_name.clone(),
-                schema_hash: locator.schema_hash,
-                raw_table_name: locator.row_raw_table.clone(),
-            },
-            row_raw_table,
-            user_descriptor: resolved.user_descriptor,
-            branch: branch.to_string(),
-            row_id,
-            needs_exact_locator: true,
-            bytes,
-        }))
+    if let Some(locator) = storage.load_visible_row_table_locator(branch, row_id)? {
+        let resolved = resolved_row_table_from_locator(storage, &locator)?
+            .expect("locator-resolved row table must exist");
+        let row_raw_table = locator.row_raw_table.to_string();
+        if let Some(bytes) = storage.raw_table_get(&row_raw_table, &key)? {
+            return Ok(Some(OwnedVisibleRowBytes {
+                row_raw_table_id: RowRawTableId {
+                    kind: RowRawTableKind::Visible,
+                    table_name: locator.table_name.clone(),
+                    schema_hash: locator.schema_hash,
+                    raw_table_name: locator.row_raw_table.clone(),
+                },
+                row_raw_table,
+                user_descriptor: resolved.user_descriptor,
+                branch: branch.to_string(),
+                row_id,
+                needs_exact_locator: true,
+                bytes,
+            }));
+        }
+    }
+
+    // Last resort: the locators are missing or name a raw table that does not
+    // hold the row — probe every registered visible raw table of this logical
+    // table for `<branch>:<row>`. A row delivered before the catalogue knew
+    // its origin schema was placed via the any-decoding-descriptor fallback
+    // (the CURRENT schema's raw table) while the row locator kept the
+    // server-stamped origin hash, so the locator-directed reads above miss it
+    // forever (defect 20, production 2026-08-15: the account query settled
+    // empty over a delivered, confirmed row — welcome, chats, kick). Bounded
+    // by the handful of schema generations a store ever holds.
+    for row_raw_table_id in row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)? {
+        let Some(resolved) = resolved_row_table_from_id(storage, row_raw_table_id.clone())? else {
+            continue;
+        };
+        let row_raw_table = row_raw_table_id.raw_table_name().to_string();
+        if let Some(bytes) = storage.raw_table_get(&row_raw_table, &key)? {
+            tracing::info!(
+                table,
+                branch,
+                %row_id,
+                raw_table = %row_raw_table,
+                "visible row recovered from a sibling raw table the locator did not name"
+            );
+            return Ok(Some(OwnedVisibleRowBytes {
+                row_raw_table_id: row_raw_table_id.clone(),
+                row_raw_table,
+                user_descriptor: resolved.user_descriptor,
+                branch: branch.to_string(),
+                row_id,
+                needs_exact_locator: true,
+                bytes,
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 fn scan_history_row_batches_for_schema_hash<H: Storage + ?Sized>(
@@ -3390,8 +3490,151 @@ mod store_probe {
     #[test]
     #[ignore]
     fn incident_app_store_serves_the_users_row_after_rehydrate() {
-        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
-        let storage = SqliteStorage::open(&path).expect("open copied app sqlite store");
+        // Copy-then-open, always: SqliteStorage::open mutates unconditionally
+        // (WAL pragma, CREATE TABLE, manifest insert) and has already
+        // truncated two working store copies opened in place.
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch =
+            std::env::temp_dir().join(format!("jazz-incident-probe-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the store for the probe");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
         probe_incident_store(storage);
+    }
+}
+
+// Deterministic CI witness for the defect-20 read fallbacks: a physical
+// sqlite store whose row locator lies about the raw table holding the row.
+// The env-driven incident probes above validate against real store copies but
+// cannot run in CI; this is the hermetic red→green twin.
+#[cfg(all(test, feature = "sqlite"))]
+mod split_locator_tests {
+    use super::*;
+    use crate::object::BranchName;
+    use crate::query_manager::types::{
+        ColumnDescriptor, ColumnType, ComposedBranchName, RowDescriptor, Schema, TableName,
+    };
+    use crate::row_histories::{RowState, StoredRowBatch, apply_row_batch};
+
+    fn users_schema() -> Schema {
+        let mut schema = Schema::new();
+        schema.insert(
+            TableName::new("users"),
+            RowDescriptor::new(vec![ColumnDescriptor::new("name", ColumnType::Text)]).into(),
+        );
+        schema
+    }
+
+    #[test]
+    fn a_visible_row_behind_a_lying_locator_is_recovered_and_deletable() {
+        let path = std::env::temp_dir().join(format!(
+            "jazz-split-locator-test-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut storage = SqliteStorage::open(&path).expect("temp sqlite store opens");
+
+        let schema = users_schema();
+        let schema_hash = crate::test_support::persist_test_schema(&mut storage, &schema);
+        let branch = ComposedBranchName::new("dev", schema_hash, "main").to_branch_name();
+
+        let row_id = ObjectId::new();
+        storage
+            .put_row_locator(
+                row_id,
+                Some(&RowLocator {
+                    table: "users".to_string().into(),
+                    origin_schema_hash: Some(schema_hash),
+                }),
+            )
+            .expect("locator persists");
+        let descriptor = schema
+            .get(&TableName::new("users"))
+            .expect("users descriptor")
+            .columns
+            .clone();
+        let data = crate::row_format::encode_row(
+            &descriptor,
+            &[crate::query_manager::types::Value::Text("split".into())],
+        )
+        .expect("row encodes");
+        let row = StoredRowBatch::new(
+            row_id,
+            branch.as_str(),
+            Vec::new(),
+            data,
+            crate::metadata::RowProvenance::for_insert(row_id.to_string(), 1_000),
+            std::collections::HashMap::new(),
+            RowState::VisibleDirect,
+            None,
+        );
+        apply_row_batch(
+            &mut storage,
+            row_id,
+            &BranchName::new(branch.as_str()),
+            row,
+            &[],
+        )
+        .expect("batch applies");
+
+        // Positive control: the row reads back through the honest locator.
+        let honest =
+            load_visible_region_row_bytes_with_storage(&storage, "users", branch.as_str(), row_id)
+                .expect("read succeeds");
+        assert!(
+            honest.is_some(),
+            "the row must be readable before poisoning"
+        );
+
+        // The poison: re-stamp the locator with a schema hash the store has
+        // no raw tables for — the defect-20 split (locator names one
+        // generation, bytes sit in another).
+        let lying_hash = SchemaHash::from_bytes([7u8; 32]);
+        storage
+            .put_row_locator(
+                row_id,
+                Some(&RowLocator {
+                    table: "users".to_string().into(),
+                    origin_schema_hash: Some(lying_hash),
+                }),
+            )
+            .expect("poisoned locator persists");
+
+        // The read fallback must recover the row from the sibling raw table.
+        let recovered =
+            load_visible_region_row_bytes_with_storage(&storage, "users", branch.as_str(), row_id)
+                .expect("read succeeds");
+        assert!(
+            recovered.is_some(),
+            "a visible row behind a lying locator was not recovered — the defect-20 \
+             read fallback regressed"
+        );
+
+        // And the delete resolver must name the raw table that physically
+        // holds the row, or the recovered row becomes an undeletable ghost.
+        let delete_locator =
+            exact_visible_row_table_locator_for_delete(&storage, "users", branch.as_str(), row_id)
+                .expect("delete resolution succeeds");
+        let delete_locator = delete_locator.expect("the delete target must be found");
+        assert_eq!(
+            delete_locator.schema_hash, schema_hash,
+            "the delete resolver must name the raw table holding the bytes, not the \
+             locator's lie"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

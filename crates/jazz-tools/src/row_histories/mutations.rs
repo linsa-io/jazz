@@ -173,7 +173,33 @@ pub fn apply_row_batch<H: Storage>(
     let branch = SharedString::from(branch_name.as_str().to_string());
     let context = crate::storage::resolve_history_row_write_context(io, &table, &row)
         .map_err(RowHistoryError::StorageError)?;
-    apply_row_batch_with_context(
+    // The locator must name the raw table the write actually lands in, or
+    // every locator-directed read misses the row forever. They diverge when a
+    // row arrives before the catalogue knows its origin schema: the resolve
+    // ladder falls through to the any-decoding-descriptor fallback (a hash
+    // whose descriptor provably decodes these bytes) while the locator still
+    // carries the server-stamped origin (defect 20, production 2026-08-15).
+    // Aligning the locator to the resolved hash is safe for every consumer —
+    // the ladder never picks a descriptor the bytes do not decode under.
+    //
+    // The aligned locator rides the request, but PERSISTS only after the
+    // apply succeeds: a batch that fails validation (a routine ParentNotFound
+    // on out-of-order delivery) must not leave the locator pointing at a
+    // generation whose write never landed — that strands every history point
+    // read for batches stored without exact locators.
+    let context_hash = context.history_row_raw_table_id().schema_hash;
+    let stamped_schema_hash = row_locator.origin_schema_hash;
+    let needs_alignment = stamped_schema_hash != Some(context_hash);
+    let row_locator = if needs_alignment {
+        crate::storage::RowLocator {
+            table: row_locator.table.clone(),
+            origin_schema_hash: Some(context_hash),
+        }
+    } else {
+        row_locator
+    };
+    let aligned_locator = needs_alignment.then(|| row_locator.clone());
+    let result = apply_row_batch_with_context(
         io,
         ApplyRowBatchWithContext {
             object_id,
@@ -186,7 +212,19 @@ pub fn apply_row_batch<H: Storage>(
             context,
             is_known_new_object: false,
         },
-    )
+    )?;
+    if let Some(aligned) = aligned_locator {
+        io.put_row_locator(object_id, Some(&aligned))
+            .map_err(RowHistoryError::StorageError)?;
+        tracing::info!(
+            %object_id,
+            table = %aligned.table,
+            resolved_schema = %context_hash.short(),
+            stamped_schema = ?stamped_schema_hash.map(|hash| hash.short()),
+            "row locator aligned to the schema hash the write resolved"
+        );
+    }
+    Ok(result)
 }
 
 pub(crate) fn apply_row_batch_with_context<H: Storage>(
