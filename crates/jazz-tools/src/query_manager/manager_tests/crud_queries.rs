@@ -785,3 +785,308 @@ fn a_row_delivered_before_the_catalogue_knows_its_schema_is_still_readable() {
         "the delivered row's content must be served (got: {names:?})"
     );
 }
+
+/// A row family split across schema branches must keep its include pairing.
+///
+/// Production 2026-08-15, the live shrinking-chat-list incident: chats and
+/// chat_members were born under one schema; a second device running the other
+/// schema generation then touched a chat row, moving its current version to
+/// the other branch. Every chat whose row was touched cross-branch dropped
+/// out of the LIST subscription on all devices (the rows themselves intact
+/// server-side) — quiet old chats survived only until touched. The include
+/// gates added for defect 19 kept the WHOLE family on one branch; this gate
+/// splits it: parent's newest version on the current branch, children still
+/// on the old branch — the include must keep pairing them.
+#[test]
+fn an_include_family_survives_a_cross_branch_parent_update() {
+    use crate::query_manager::encoding::encode_row;
+    use std::collections::HashMap;
+
+    let sync_manager = SyncManager::new();
+    // Current schema: parent + child, FK-correlated.
+    let mut schema = Schema::new();
+    schema.insert(
+        TableName::new("chats"),
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("id", ColumnType::Uuid),
+            ColumnDescriptor::new("title", ColumnType::Text),
+        ])
+        .into(),
+    );
+    schema.insert(
+        TableName::new("chat_members"),
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("chatId", ColumnType::Uuid),
+            ColumnDescriptor::new("name", ColumnType::Text),
+        ])
+        .into(),
+    );
+    let (mut qm, mut storage) = create_query_manager(sync_manager, schema.clone());
+
+    // The old world: IDENTICAL chats/chat_members, hash differs by an extra
+    // table (the add/remove-table migration shape).
+    let mut old_schema = schema.clone();
+    old_schema.insert(
+        TableName::new("chat_activities"),
+        RowDescriptor::new(vec![ColumnDescriptor::new("kind", ColumnType::Text)]).into(),
+    );
+    let old_hash = crate::query_manager::types::SchemaHash::compute(&old_schema);
+    let old_branch = crate::query_manager::types::ComposedBranchName::new("dev", old_hash, "main")
+        .to_branch_name();
+    qm.add_live_schema(old_schema.clone());
+
+    // The family, born under the OLD schema: one chat, two members.
+    let chat_uuid = ObjectId::new();
+    let chat_row_id = ObjectId::new();
+    let chats_descriptor = old_schema
+        .get(&TableName::new("chats"))
+        .expect("chats in old schema")
+        .columns
+        .clone();
+    let members_descriptor = old_schema
+        .get(&TableName::new("chat_members"))
+        .expect("chat_members in old schema")
+        .columns
+        .clone();
+    let mut meta = HashMap::new();
+    meta.insert(MetadataKey::Table.to_string(), "chats".to_string());
+    meta.insert(
+        MetadataKey::OriginSchemaHash.to_string(),
+        old_hash.to_string(),
+    );
+    put_test_row_metadata(&mut storage, chat_row_id, meta);
+    let chat_data = encode_row(
+        &chats_descriptor,
+        &[Value::Uuid(chat_uuid), Value::Text("family chat".into())],
+    )
+    .unwrap();
+    let commit = stored_row_commit(smallvec![], chat_data, 1000, chat_row_id.to_string());
+    receive_row_commit(
+        &mut qm,
+        &mut storage,
+        chat_row_id,
+        old_branch.as_str(),
+        commit,
+    );
+
+    let mut member_ids = Vec::new();
+    for (index, name) in ["alice", "bob"].iter().enumerate() {
+        let member_row_id = ObjectId::new();
+        let mut meta = HashMap::new();
+        meta.insert(MetadataKey::Table.to_string(), "chat_members".to_string());
+        meta.insert(
+            MetadataKey::OriginSchemaHash.to_string(),
+            old_hash.to_string(),
+        );
+        put_test_row_metadata(&mut storage, member_row_id, meta);
+        let data = encode_row(
+            &members_descriptor,
+            &[Value::Uuid(chat_uuid), Value::Text((*name).into())],
+        )
+        .unwrap();
+        let commit = stored_row_commit(
+            smallvec![],
+            data,
+            1100 + index as u64,
+            member_row_id.to_string(),
+        );
+        receive_row_commit(
+            &mut qm,
+            &mut storage,
+            member_row_id,
+            old_branch.as_str(),
+            commit,
+        );
+        member_ids.push(member_row_id);
+    }
+    qm.process(&mut storage);
+
+    // The LIST subscription: chats with their members included.
+    let query = qm
+        .query("chats")
+        .with_array("chat_members", |sub| {
+            sub.from("chat_members").correlate("chatId", "chats.id")
+        })
+        .build();
+    let sub_id = qm.subscribe(query).unwrap();
+    qm.process(&mut storage);
+    let baseline = qm.get_subscription_results(sub_id);
+    assert_eq!(
+        baseline.len(),
+        1,
+        "the old-branch family must be served before the cross-branch touch, or \
+         this gates nothing"
+    );
+    let members_of = |values: &Vec<Value>| -> usize {
+        values
+            .iter()
+            .filter_map(|value| value.as_array().map(|rows| rows.len()))
+            .next_back()
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        members_of(&baseline[0].1),
+        2,
+        "both members must ride the include before the touch"
+    );
+
+    // The other device's write, as it actually arrives: a DELIVERED newer
+    // version of the SAME chat row on the CURRENT branch (the phone's local
+    // write lands on its own branch and syncs over).
+    let current_branch = get_branch(&qm);
+    let renamed = encode_row(
+        &chats_descriptor,
+        &[
+            Value::Uuid(chat_uuid),
+            Value::Text("family chat renamed".into()),
+        ],
+    )
+    .unwrap();
+    let commit = stored_row_commit(smallvec![], renamed, 2000, chat_row_id.to_string());
+    receive_row_commit(
+        &mut qm,
+        &mut storage,
+        chat_row_id,
+        current_branch.as_str(),
+        commit,
+    );
+    qm.process(&mut storage);
+
+    let after = qm.get_subscription_results(sub_id);
+    assert_eq!(
+        after.len(),
+        1,
+        "the chat dropped out of the list after a cross-branch touch — the \
+         production shrinking-list incident"
+    );
+    assert_eq!(
+        members_of(&after[0].1),
+        2,
+        "the include lost the old-branch members after the parent moved to the \
+         current branch"
+    );
+}
+
+/// The no-include twin: a FILTERED plain query over a cross-branch family
+/// must serve one row and keep its serving-scope refcounts honest.
+///
+/// The include gate above cannot see two of the surfaces the same defect
+/// reached: FilterNode reclassifies an ID-only updated pre-image the same way
+/// ArraySubqueryNode did (an unmaterialized old side evaluates false →
+/// (false,true) → added → doubled entry), and OutputNode's scope refcounts
+/// decremented the raw union tuple's merged provenance instead of what was
+/// incremented — silently shrinking the server serving scope. The
+/// contributing-ids assertion pins the refcount discipline; the second touch
+/// amplifies any drift.
+#[test]
+fn a_plain_query_over_a_cross_branch_family_serves_one_row() {
+    use crate::query_manager::encoding::encode_row;
+    use std::collections::HashMap;
+
+    let sync_manager = SyncManager::new();
+    let mut schema = Schema::new();
+    // No value indexes, deliberately: the id predicate then cannot be consumed
+    // by an index scan and must run through a FilterNode — the surface under
+    // test. (The test receive helper writes no value-index entries anyway.)
+    let mut chats_table: crate::query_manager::types::TableSchema = RowDescriptor::new(vec![
+        ColumnDescriptor::new("id", ColumnType::Uuid),
+        ColumnDescriptor::new("title", ColumnType::Text),
+    ])
+    .into();
+    chats_table.indexed_columns = Some(vec![]);
+    schema.insert(TableName::new("chats"), chats_table);
+    let (mut qm, mut storage) = create_query_manager(sync_manager, schema.clone());
+
+    let mut old_schema = schema.clone();
+    old_schema.insert(
+        TableName::new("chat_activities"),
+        RowDescriptor::new(vec![ColumnDescriptor::new("kind", ColumnType::Text)]).into(),
+    );
+    let old_hash = crate::query_manager::types::SchemaHash::compute(&old_schema);
+    let old_branch = crate::query_manager::types::ComposedBranchName::new("dev", old_hash, "main")
+        .to_branch_name();
+    qm.add_live_schema(old_schema.clone());
+
+    let chat_uuid = ObjectId::new();
+    let chat_row_id = ObjectId::new();
+    let descriptor = old_schema
+        .get(&TableName::new("chats"))
+        .expect("chats in old schema")
+        .columns
+        .clone();
+    let mut meta = HashMap::new();
+    meta.insert(MetadataKey::Table.to_string(), "chats".to_string());
+    meta.insert(
+        MetadataKey::OriginSchemaHash.to_string(),
+        old_hash.to_string(),
+    );
+    put_test_row_metadata(&mut storage, chat_row_id, meta);
+    let born = encode_row(
+        &descriptor,
+        &[Value::Uuid(chat_uuid), Value::Text("family chat".into())],
+    )
+    .unwrap();
+    let commit = stored_row_commit(smallvec![], born, 1000, chat_row_id.to_string());
+    receive_row_commit(
+        &mut qm,
+        &mut storage,
+        chat_row_id,
+        old_branch.as_str(),
+        commit,
+    );
+    qm.process(&mut storage);
+
+    // Plain no-include query; FilterNode-shaped coverage is a follow-up (the
+    // planner offers no scan for a filtered unindexed column in this harness).
+    let query = qm.query("chats").build();
+    let sub_id = qm.subscribe(query).unwrap();
+    qm.process(&mut storage);
+    assert_eq!(
+        qm.get_subscription_results(sub_id).len(),
+        1,
+        "the old-branch row must be served before the touch, or this gates nothing"
+    );
+
+    let touch = |qm: &mut QueryManager, storage: &mut MemoryStorage, title: &str, at: u64| {
+        let current_branch = get_branch(qm);
+        let data = encode_row(
+            &descriptor,
+            &[Value::Uuid(chat_uuid), Value::Text(title.into())],
+        )
+        .unwrap();
+        let commit = stored_row_commit(smallvec![], data, at, chat_row_id.to_string());
+        receive_row_commit(qm, storage, chat_row_id, current_branch.as_str(), commit);
+        qm.process(storage);
+    };
+
+    touch(&mut qm, &mut storage, "family chat renamed", 2000);
+    let after = qm.get_subscription_results(sub_id);
+    assert_eq!(
+        after.len(),
+        1,
+        "the no-include subscription doubled the cross-branch family"
+    );
+    assert_eq!(
+        after[0].1[1],
+        Value::Text("family chat renamed".into()),
+        "the winner's content must be served"
+    );
+
+    // The refcount discipline: the row contributes under its winner branch,
+    // and a SECOND touch must not drift the scope.
+    let scope_holds = |qm: &QueryManager, label: &str| {
+        let ids = qm.get_subscription_contributing_ids(sub_id);
+        assert!(
+            ids.iter().any(|(id, _)| *id == chat_row_id),
+            "{label}: the row vanished from the serving scope (scope refcounts drifted)"
+        );
+    };
+    scope_holds(&qm, "after the first touch");
+    touch(&mut qm, &mut storage, "family chat renamed twice", 3000);
+    assert_eq!(
+        qm.get_subscription_results(sub_id).len(),
+        1,
+        "the second cross-branch touch doubled or dropped the row"
+    );
+    scope_holds(&qm, "after the second touch");
+}

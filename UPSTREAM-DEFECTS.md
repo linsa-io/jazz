@@ -754,6 +754,40 @@ for poisoned stores.
 
 ---
 
+## 21. A cross-branch touch serves the row twice — live lists shrink and double
+
+The second face of whole-schema branch identity (defect 19 was reads;
+this is live maintenance). When the SAME row id has visible versions on two
+same-lineage branches — exactly what happens the moment devices on two schema
+generations coexist — the union already collapses the id and the row loader
+already picks the best-visible winner. The incremental path did not:
+`MaterializeNode::materialize_tuples` forwarded the union's updated pair with
+its OLD side as a raw, unmaterialized ID-only tuple. `ArraySubqueryNode`
+could not rebuild an old output from a contentless tuple and reclassified the
+update as `added`; `SortNode` inserted a second entry for an id it already
+held; `OutputNode` adopted the doubled ordering — the row served twice, old
+and new content side by side. For subscribers without includes the same
+ID-only pre-image made `TupleDelta::to_row_delta()` return `None`, silently
+dropping the tick's whole RowDelta.
+
+Live incident, 2026-08-15 afternoon: two devices on one account, one bundling
+each schema generation. Every chat row the second device touched split its
+family across branches, and the chat LIST on every client shrank or doubled
+within seconds of each touch — while before/after store dumps proved the
+server lost nothing. The measured production shape ("fewer chats than there
+should be" on TestFlight) is this class.
+
+Fix: the updated arm now pairs against the tuple this node LAST SERVED
+(`take_current_tuple`), mirroring the existing `check_updated_tuples`
+semantics — never-served degrades to `added`, a failed re-materialization
+retracts what was served. Winner selection stays where it always was, in the
+shared best-visible loader. Gate:
+`an_include_family_survives_a_cross_branch_parent_update` — red before the
+fix with the row served twice, green after; disarm/rearm falsified. Suite:
+1519 passed / 0 failed.
+
+---
+
 ## Notes on method
 
 Every number above is a measurement, not an estimate, each taken with one variable changed

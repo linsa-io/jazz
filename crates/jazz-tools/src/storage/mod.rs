@@ -3388,6 +3388,11 @@ mod store_probe {
                 match scan_visible_row_bytes_with_storage(&storage, table, branch.as_str()) {
                     Ok(rows) if !rows.is_empty() => {
                         println!("visible {table} @ {branch} = {}", rows.len());
+                        if table == "chats" || table == "chat_members" {
+                            for row in &rows {
+                                println!("  {} {}", table, row.row_id);
+                            }
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => println!("visible {table} @ {branch} = error: {e}"),

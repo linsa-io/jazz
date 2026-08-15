@@ -251,13 +251,25 @@ impl MaterializeNode {
         for (old_tuple, new_tuple) in delta.updated {
             self.remove_known_tuple(&old_tuple);
             self.insert_known_tuple(new_tuple.clone());
-            self.remove_current_tuple(&old_tuple);
+            // The upstream old side can be ID-only: a union across
+            // schema-generation branches emits provenance-change pairs of
+            // unmaterialized tuples. Downstream nodes rebuild the update's
+            // pre-image from the old side's CONTENT (the include node drops
+            // a content-less old side and reclassifies the pair as an add,
+            // which double-books the row in Vec-ordered nodes), so the old
+            // side must be the tuple this node last served — exactly what
+            // `check_updated_tuples` emits on the content-mark channel.
+            let previous = self.take_current_tuple(&old_tuple);
             if let Some(materialized) = self.materialize_tuple(&new_tuple, &mut loader) {
                 self.insert_current_tuple(materialized.clone());
-                result.updated.push((old_tuple, materialized));
-            } else {
-                // New version unavailable - emit as removal
-                result.removed.push(old_tuple);
+                match previous {
+                    Some(previous) => result.updated.push((previous, materialized)),
+                    // Never served downstream: this is an add, not an update.
+                    None => result.added.push(materialized),
+                }
+            } else if let Some(previous) = previous {
+                // New version unavailable - retract what was served.
+                result.removed.push(previous);
             }
         }
 
