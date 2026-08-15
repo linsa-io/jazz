@@ -16,6 +16,7 @@ use super::graph_nodes::exists_output::ExistsOutputNode;
 use super::graph_nodes::index_scan::IndexScanNode;
 use super::graph_nodes::materialize::MaterializeNode;
 use super::graph_nodes::policy_filter::{PolicyFilterNode, PolicyFilterOptions};
+use super::graph_nodes::union::UnionNode;
 use super::index::ScanCondition;
 use super::policy::{Operation, PolicyExpr};
 use super::relation_ir::RelExpr;
@@ -62,10 +63,13 @@ impl<'a> PolicyGraphBuildOptions<'a> {
 }
 
 impl PolicyGraph {
-    fn exists_rel_output_table(rel: &RelExpr, branch: &str, schema: &Schema) -> Option<TableName> {
-        let branches = vec![branch.to_string()];
+    fn exists_rel_output_table(
+        rel: &RelExpr,
+        branches: &[String],
+        schema: &Schema,
+    ) -> Option<TableName> {
         let plan =
-            lower_relation_to_execution_plan(rel, &branches, false, Vec::new(), None, schema)?;
+            lower_relation_to_execution_plan(rel, branches, false, Vec::new(), None, schema)?;
         match plan.result_element_index {
             None | Some(0) => Some(plan.table),
             Some(index) => plan.joins.get(index - 1).map(|join| join.table),
@@ -184,15 +188,24 @@ impl PolicyGraph {
 
     /// Create a graph for EXISTS: does any row in table match condition?
     ///
-    /// Graph structure: IndexScan(All) → Materialize → PolicyFilter → ExistsOutput
+    /// Graph structure: IndexScan(All) per branch (+Union) → Materialize →
+    /// PolicyFilter → ExistsOutput
     ///
-    /// Returns None if the table is not in the schema.
+    /// The scan unions over every sanctioned branch, mirroring what the data
+    /// path of the enclosing query does: a supporting policy row born under
+    /// an old schema generation lives on the old branch, and an exists arm
+    /// that scans only the first branch silently denies the rows it guards
+    /// (defect 23). EXISTS is disjunctive, so the union cannot deny a row any
+    /// single-branch scan would have granted — and a session with no
+    /// satisfying row on ANY queried branch still gets nothing.
+    ///
+    /// Returns None if the table is not in the schema or no branch is given.
     pub fn for_exists(
         table: &TableName,
         condition: &PolicyExpr,
         session: &Session,
         schema: &Schema,
-        branch: &str,
+        branches: &[String],
         policy_operation: Operation,
         row_policy_mode: RowPolicyMode,
     ) -> Option<Self> {
@@ -201,17 +214,31 @@ impl PolicyGraph {
 
         let mut graph = QueryGraph::new(*table, descriptor.clone());
 
-        // IndexScan node: full table scan (check all rows)
+        // IndexScan nodes: full table scan (check all rows), one per branch.
         let id_column = ColumnName::new("_id");
-        let scan_node = IndexScanNode::new_with_branch(
-            *table,
-            id_column,
-            branch,
-            ScanCondition::All,
-            descriptor.clone(),
-        );
-        let scan_id = graph.add_node_with_id(GraphNode::IndexScan(scan_node));
-        graph.index_scan_nodes.push((scan_id, *table, id_column));
+        let mut scan_ids = Vec::new();
+        for branch in branches {
+            let scan_node = IndexScanNode::new_with_branch(
+                *table,
+                id_column,
+                branch,
+                ScanCondition::All,
+                descriptor.clone(),
+            );
+            let scan_id = graph.add_node_with_id(GraphNode::IndexScan(scan_node));
+            graph.index_scan_nodes.push((scan_id, *table, id_column));
+            scan_ids.push(scan_id);
+        }
+        let scan_output = if scan_ids.len() > 1 {
+            let union_node = UnionNode::new();
+            let union_id = graph.add_node_with_id(GraphNode::Union(union_node));
+            for scan_id in scan_ids {
+                graph.add_edge(union_id, scan_id);
+            }
+            union_id
+        } else {
+            *scan_ids.first()?
+        };
 
         // Materialize node: load row content. Carry the resolved table name so
         // `LensTransformer::new` can translate old-branch rows; an empty hint
@@ -219,18 +246,18 @@ impl PolicyGraph {
         let tuple_desc = TupleDescriptor::single(*table, descriptor.clone());
         let mat_node = MaterializeNode::new_all(tuple_desc);
         let mat_id = graph.add_node_with_id(GraphNode::Materialize(mat_node));
-        graph.add_edge(mat_id, scan_id);
+        graph.add_edge(mat_id, scan_output);
 
         // PolicyFilter node: evaluate condition against each row
-        let policy_node = PolicyFilterNode::new_with_branch_policy_mode_and_operation(
+        let policy_node = PolicyFilterNode::new_with_options(
             descriptor.clone(),
             condition.clone(),
             session.clone(),
             Arc::new(schema.clone()),
             table.as_str(),
-            branch,
-            row_policy_mode,
-            policy_operation,
+            PolicyFilterOptions::for_branches(branches.to_vec())
+                .with_row_policy_mode(row_policy_mode)
+                .with_policy_operation(policy_operation),
         );
         let policy_id = graph.add_node_with_id(GraphNode::PolicyFilter(policy_node));
         graph.add_edge(policy_id, mat_id);
@@ -256,7 +283,7 @@ impl PolicyGraph {
     pub fn for_exists_rel(
         rel: &RelExpr,
         schema: &Schema,
-        branch: &str,
+        branches: &[String],
         session: Option<Session>,
         row_policy_mode: RowPolicyMode,
         current_table: Option<&TableName>,
@@ -265,7 +292,7 @@ impl PolicyGraph {
         let use_structural_rows = structural_scans
             || current_table
                 .and_then(|table| {
-                    Self::exists_rel_output_table(rel, branch, schema)
+                    Self::exists_rel_output_table(rel, branches, schema)
                         .map(|output| output == *table)
                 })
                 .unwrap_or(false);
@@ -284,12 +311,14 @@ impl PolicyGraph {
         } else {
             schema.clone()
         };
-        let branches = vec![branch.to_string()];
+        // The relation compiles against the full sanctioned branch set — the
+        // shared planner unions its scans per branch, exactly like the
+        // enclosing query's data path.
         let schema_context = SchemaContext::with_defaults(compile_schema.clone(), "main");
         let mut graph = QueryGraph::compile_relation_ir_with_schema_context_and_features(
             rel,
             &compile_schema,
-            &branches,
+            branches,
             session,
             &schema_context,
             RelationCompileFeatures::default(),
@@ -539,7 +568,7 @@ mod tests {
         let graph = PolicyGraph::for_exists_rel(
             &rel,
             &schema,
-            "main",
+            &["main".to_string()],
             None,
             RowPolicyMode::PermissiveLocal,
             None,
@@ -578,7 +607,7 @@ mod tests {
         let graph = PolicyGraph::for_exists_rel(
             &rel,
             &schema,
-            "main",
+            &["main".to_string()],
             Some(session),
             RowPolicyMode::Enforcing,
             Some(&current_table),
@@ -614,7 +643,7 @@ mod tests {
         let graph = PolicyGraph::for_exists_rel(
             &rel,
             &schema,
-            "main",
+            &["main".to_string()],
             Some(Session::new("user1")),
             RowPolicyMode::Enforcing,
             Some(&current_table),
@@ -650,7 +679,7 @@ mod tests {
         let graph = PolicyGraph::for_exists_rel(
             &rel,
             &schema,
-            "main",
+            &["main".to_string()],
             Some(Session::new("user1")),
             RowPolicyMode::Enforcing,
             Some(&current_table),
@@ -777,7 +806,7 @@ mod tests {
         let graph = PolicyGraph::for_exists_rel(
             &rel,
             &schema,
-            "main",
+            &["main".to_string()],
             Some(Session::new("user1")),
             RowPolicyMode::Enforcing,
             Some(&current_table),

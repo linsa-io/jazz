@@ -784,6 +784,10 @@ impl QueryManager {
             .insert(branch.as_str().to_string(), hash);
         self.mark_schema_catalogue_dirty(hash);
 
+        // A cached authorization context predating this activation stays
+        // blind to the new generation and denies its rows (defect 23).
+        self.authorization_context_cache.clear();
+
         // Mark subscriptions for recompile to pick up new branch
         self.mark_subscriptions_for_recompile();
     }

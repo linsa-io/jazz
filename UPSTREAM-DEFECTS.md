@@ -939,6 +939,73 @@ surface — worth a reservation on the name or descriptor-first resolution at th
 
 ---
 
+## 23. Authorization fails closed for every row of an older schema generation — a session sees a third of the store
+
+**Severity: silent data invisibility under sessions.** The read path was taught the
+identity crossing (defects 19/20/22); the authorization path was not. Two independent
+faces, both at the merge-base.
+
+Face 1 (the incident): `authorization_schema_for_context`
+(`query_manager/server_queries.rs`, merge-base line 244) seeds the authorization
+context ONLY from `known_schemas` — a mirror populated solely by
+`SchemaManager::process`. On surfaces that drive the QueryManager directly (a device
+client's construction path), that mirror is empty while the MAIN context serves the
+old generation to plain reads. A session-scoped read of an old-generation row then
+loads the row fine and fails `transform_content_to_authorization_schema` with
+`NoLensPath { old → current }` — authorization fails closed before any policy content
+runs. Current-generation rows survive only via the `source_hash == current_hash`
+short-circuit. Measured on a copy of the incident store (probe
+`storage::store_probe::incident_app_store_serves_the_membership_include`): the app's
+chat list query serves 12 of 12 membership rows without a session, **2 of 12 with
+one** — every dropped row is old-generation, even though the table's read policy is
+`always()`. On the device this rendered as "my chats disappeared after the
+migration" while an admin inspector (no session) showed every row intact.
+
+Face 2: policy evaluation is single-branch. PolicyFilter wiring picks
+`branch_for_policy = branches.first()` (merge-base `graph/compile.rs` lines 691, 1406) and threads ONE branch into `PolicyContextEvaluator`/`PolicyGraph`, so a
+policy arm that needs a supporting row (readReferencing/INHERITS shapes) probes only
+the first branch of the query's sanctioned set — support rows living across the
+crossing are invisible to the arm and the row is denied.
+
+Note the design context: the permissions head is a SINGLE per-app chain
+(`PermissionsHeadState`, parent-linked bundles), stamped with the schema hash it was
+compiled against. The stamp records provenance; treating it (or the auth context's
+reachable-schema set) as an enforcement scope contradicts the single-head design —
+one head per app means the head governs every identity-compatible generation. This
+also means "publish a second bundle for the old hash" is NOT a workaround: it would
+move the single head and invert the outage.
+
+Fix: (face 1) the authorization context is seeded from the main context's current +
+live schema family — the same sanctioned universe plain reads serve — before
+`try_activate_pending`; activation still applies its own compatibility check, so
+nothing becomes transformable that is not identity-compatible or lens-connected, and
+a table absent from the head stays denied on both branches. The cached authorization
+context is invalidated when a live schema is added. (face 2) policy evaluation is
+branch-set-aware end to end: the full queried-branch set reaches
+PolicyFilter/MagicColumns/PolicyGraph; exists-arms build per-branch IndexScan +
+Union; INHERITS-REFERENCING lookups union over branches. Write-side authorization
+deliberately stays scoped to the write's own branch. Gates:
+`an_explicitly_authorized_session_still_sees_an_old_branch_row` (manager level —
+the incident face; red with the transform failing, green after),
+`a_policied_chat_list_serves_the_old_branch_chat_to_its_member` (runtime_core —
+face 2), plus a runtime-surface control documenting that surfaces which tick
+`SchemaManager::process` mask face 1. Negative controls: a session with no grant on
+ANY branch sees nothing, before and after. Both fixes disarm/rearm falsified
+independently. Probe after: 12 of 12 with a session. Suite: 1526 passed / 0 failed.
+
+Attribution: UPSTREAM-INHERITED — both faces at the merge-base:
+`e84d84a6:crates/jazz-tools/src/query_manager/server_queries.rs:244` (auth context seeded
+from `known_schemas` only, iteration at :270) and
+`e84d84a6:crates/jazz-tools/src/query_manager/graph/compile.rs:691,1406`
+(`branch_for_policy = branches.first()`).
+Groove (codex/jazz-core-engine-swap): architected away (static reading at `aada95800`) —
+policy is projected per version row (`policy_projection_for_version_row`,
+`crates/jazz/src/node/policy.rs:309`): with per-row `SchemaVersionAlias` there is no
+separate authorization schema context to fall out of sync and no query-time branch set for
+policy to truncate.
+
+---
+
 ## Groove line: verification summary (2026-08-15)
 
 Upstream's Thursday publishes are cut from the integration branch
@@ -961,8 +1028,8 @@ Open PRs on the branch that overlap entries here: #1538 → 17; #1533, #1537 →
 #1523 → 19/20; #1535, #1520 → 1's class; #1201 → 20's twin on main; #1367, #1503 → 18 and
 6's RN half; #1200 is tier-adjacent.
 
-The risk verdict: 16 of the 21 live entries (entry 4 is withdrawn; 22 total) have mechanisms unrepresentable on the groove line,
-including 17, 19 and 20 — the schema-crossing class. Still present: 6's RN half, the
+The risk verdict: 17 of the 22 live entries (entry 4 is withdrawn; 23 total) have mechanisms unrepresentable on the groove line,
+including 17, 19, 20 and 23 — the schema-crossing class. Still present: 6's RN half, the
 new O(table) policy scan flagged under entry 15, and 22's blind `id` readers (flat-join
 value refs and sort keys resolve a declared `id` column as the row id). Unknown: 2, 18,
 the cost profiles of 8, 12 and 15, and the parking memory bound. The bottom line is architecture-ahead but

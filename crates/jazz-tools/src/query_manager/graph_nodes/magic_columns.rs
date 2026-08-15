@@ -62,7 +62,9 @@ pub struct MagicColumnsNode {
     element_requests: Vec<ElementMagicColumns>,
     session: Option<Session>,
     schema: Arc<Schema>,
-    branch: String,
+    /// The branch universe canRead/canEdit/canDelete are evaluated against —
+    /// the same set the enclosing query's data scans union over (defect 23).
+    branches: Vec<String>,
     row_policy_mode: RowPolicyMode,
     dependency_tables: HashSet<String>,
     dependency_dirty: bool,
@@ -79,7 +81,7 @@ impl MagicColumnsNode {
         requests: &[MagicColumnRequest],
         session: Option<Session>,
         schema: Arc<Schema>,
-        branch: impl Into<String>,
+        branches: Vec<String>,
         row_policy_mode: RowPolicyMode,
     ) -> Option<Self> {
         if requests.is_empty() {
@@ -163,7 +165,11 @@ impl MagicColumnsNode {
             element_requests: grouped.into_values().collect(),
             session,
             schema,
-            branch: branch.into(),
+            branches: if branches.is_empty() {
+                vec!["main".to_string()]
+            } else {
+                branches
+            },
             row_policy_mode,
             dependency_tables,
             dependency_dirty: false,
@@ -394,7 +400,7 @@ impl MagicColumnsNode {
                 let mut evaluator = PolicyContextEvaluator::new(
                     &self.schema,
                     session,
-                    &self.branch,
+                    &self.branches,
                     self.row_policy_mode,
                 );
                 let operation = match kind {

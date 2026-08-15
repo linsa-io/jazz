@@ -19,7 +19,11 @@ use super::super::encoding::{column_is_null, decode_column};
 pub(crate) struct PolicyContextEvaluator<'a> {
     schema: &'a Schema,
     session: &'a Session,
-    branch: &'a str,
+    /// The branch universe policy sub-queries are evaluated against — the
+    /// same set the enclosing query's data scans union over. Consulting only
+    /// one branch of a same-lineage family denies rows whose supporting
+    /// policy rows live on an older schema generation (defect 23).
+    branches: &'a [String],
     row_policy_mode: RowPolicyMode,
     settlement_eval_cache: Option<&'a mut SettlementEvalCache>,
 }
@@ -28,16 +32,22 @@ impl<'a> PolicyContextEvaluator<'a> {
     pub(crate) fn new(
         schema: &'a Schema,
         session: &'a Session,
-        branch: &'a str,
+        branches: &'a [String],
         row_policy_mode: RowPolicyMode,
     ) -> Self {
         Self {
             schema,
             session,
-            branch,
+            branches,
             row_policy_mode,
             settlement_eval_cache: None,
         }
+    }
+
+    /// Canonical cache-key spelling of the branch universe (`\u{1f}` joined:
+    /// a control character no composed branch name contains).
+    fn branch_set_key(&self) -> String {
+        self.branches.join("\u{1f}")
     }
 
     pub(crate) fn with_settlement_eval_cache(
@@ -155,18 +165,30 @@ impl<'a> PolicyContextEvaluator<'a> {
             return false;
         }
 
-        let candidate_ids = match &col.column_type {
-            ColumnType::Uuid => io.index_lookup(
-                source_table_name.as_str(),
-                col.name.as_str(),
-                self.branch,
-                &Value::Uuid(row.id),
-            ),
-            ColumnType::Array { element } if **element == ColumnType::Uuid => {
-                io.index_scan_all(source_table_name.as_str(), col.name.as_str(), self.branch)
+        // Union the candidate lookup over every sanctioned branch: the
+        // referencing rows of a pre-migration target live on their origin
+        // branch, not on the query's first branch.
+        let mut candidate_ids: Vec<ObjectId> = Vec::new();
+        let mut seen_candidates: HashSet<ObjectId> = HashSet::new();
+        for branch in self.branches {
+            let branch_ids = match &col.column_type {
+                ColumnType::Uuid => io.index_lookup(
+                    source_table_name.as_str(),
+                    col.name.as_str(),
+                    branch,
+                    &Value::Uuid(row.id),
+                ),
+                ColumnType::Array { element } if **element == ColumnType::Uuid => {
+                    io.index_scan_all(source_table_name.as_str(), col.name.as_str(), branch)
+                }
+                _ => return false,
+            };
+            for id in branch_ids {
+                if seen_candidates.insert(id) {
+                    candidate_ids.push(id);
+                }
             }
-            _ => return false,
-        };
+        }
 
         for source_row_id in candidate_ids {
             let Some(source_row) = row_loader(source_row_id, Some(source_table_name)) else {
@@ -368,7 +390,7 @@ impl<'a> PolicyContextEvaluator<'a> {
 
         let cache_key = if depth == 0 && visited.is_empty() {
             Some(RefAccessSubexprKey {
-                branch: self.branch.to_string(),
+                branch_set: self.branch_set_key(),
                 table: *parent_table,
                 id: parent_id,
                 operation,
@@ -478,7 +500,7 @@ impl<'a> PolicyContextEvaluator<'a> {
             &bound_condition,
             self.session,
             self.schema,
-            self.branch,
+            self.branches,
             operation,
             self.row_policy_mode,
         ) {
@@ -525,7 +547,7 @@ impl<'a> PolicyContextEvaluator<'a> {
         let mut graph = match PolicyGraph::for_exists_rel(
             &bound_rel,
             self.schema,
-            self.branch,
+            self.branches,
             Some(self.session.clone()),
             self.row_policy_mode,
             Some(&current_table),

@@ -1608,3 +1608,167 @@ fn anonymous_delete_is_denied_before_policy_eval() {
         }
     );
 }
+
+/// Defect 23, the authorization door (measured live 2026-08-15): with an
+/// EXPLICIT authorization schema (the app's permissions head; runtime schemas
+/// are policy-stripped), session-scoped visibility flows through per-row
+/// authorization, which transforms each provenance row into the authorization
+/// schema's world. The authorization context is built from `known_schemas` —
+/// a mirror synced only by `SchemaManager::process` — so on a surface that
+/// drives the QueryManager directly (the incident store probe's construction,
+/// mirroring the app's), it knows NOTHING of the old schema generation even
+/// while the MAIN schema context serves that generation's rows to plain
+/// reads. The old-branch row then fails `NoLensPath` inside the transform and
+/// authorization fails closed: measured on the incident store, no-session
+/// served 12 memberships, with-session served only the 2 current-branch ones.
+///
+/// The invariant is the identity-crossing one (defects 19/20/22): the branch
+/// universe plain reads serve is the universe session-scoped reads must
+/// evaluate over. The authorization context must therefore know every LIVE
+/// schema generation of the main context, not only the tick-synced mirror.
+#[test]
+fn an_explicitly_authorized_session_still_sees_an_old_branch_row() {
+    use crate::query_manager::encoding::encode_row;
+    use std::collections::HashMap;
+
+    let sync_manager = SyncManager::new();
+    let schema = test_schema();
+    let (mut qm, mut storage) = create_query_manager(sync_manager, schema);
+
+    // A current-branch row owned by alice: the auth-path positive control.
+    let current_row = qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("alice".into()), Value::Integer(1)],
+        )
+        .unwrap();
+    qm.process(&mut storage);
+
+    // The old world: `users` IDENTICAL; the hash differs only because another
+    // table existed there (the one the migration removed).
+    let mut old_schema = Schema::new();
+    old_schema.insert(
+        TableName::new("users"),
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("name", ColumnType::Text),
+            ColumnDescriptor::new("score", ColumnType::Integer),
+        ])
+        .into(),
+    );
+    old_schema.insert(
+        TableName::new("chat_activities"),
+        RowDescriptor::new(vec![ColumnDescriptor::new("kind", ColumnType::Text)]).into(),
+    );
+    let old_descriptor = old_schema
+        .get(&TableName::new("users"))
+        .expect("old schema users table exists")
+        .columns
+        .clone();
+    qm.add_live_schema(old_schema);
+
+    let current_branch = get_branch(&qm);
+    let old_branch = qm
+        .all_query_branches()
+        .into_iter()
+        .find(|b| b != &current_branch)
+        .expect("old schema branch should exist");
+
+    let old_row_id = ObjectId::new();
+    let mut metadata = HashMap::new();
+    metadata.insert(MetadataKey::Table.to_string(), "users".to_string());
+    put_test_row_metadata(&mut storage, old_row_id, metadata);
+    let old_data = encode_row(
+        &old_descriptor,
+        &[Value::Text("alice".into()), Value::Integer(100)],
+    )
+    .unwrap();
+    let commit = stored_row_commit(smallvec![], old_data, 1000, old_row_id.to_string());
+    receive_row_commit(&mut qm, &mut storage, old_row_id, &old_branch, commit);
+    qm.process(&mut storage);
+
+    // The permissions head: same structural table, policies attached. NOTE:
+    // this deliberately arrives the way the app's does — via
+    // `set_authorization_schema`, with `known_schemas` never synced.
+    let mut auth_schema = Schema::new();
+    auth_schema.insert(
+        TableName::new("users"),
+        TableSchema::with_policies(
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("name", ColumnType::Text),
+                ColumnDescriptor::new("score", ColumnType::Integer),
+            ]),
+            TablePolicies::new()
+                .with_select(PolicyExpr::eq_session("name", vec!["user_id".into()]))
+                .with_insert(PolicyExpr::True),
+        ),
+    );
+    qm.set_authorization_schema(auth_schema);
+
+    // Channel control: the no-session read serves BOTH rows across the branches.
+    let plain = qm.subscribe(qm.query("users").build()).unwrap();
+    qm.process(&mut storage);
+    assert_eq!(
+        qm.get_subscription_results(plain).len(),
+        2,
+        "the plain read must serve both generations, or this gates nothing"
+    );
+
+    // Negative control: a session owning neither row sees nothing — before
+    // AND after the fix.
+    let mallory = qm
+        .subscribe_with_session(
+            qm.query("users").build(),
+            Some(PolicySession::new("mallory")),
+            None,
+        )
+        .unwrap();
+    qm.process(&mut storage);
+    assert_eq!(
+        qm.get_subscription_results(mallory).len(),
+        0,
+        "mallory owns neither row and must see nothing"
+    );
+
+    // The owner's session.
+    let alice = qm
+        .subscribe_with_session(
+            qm.query("users").build(),
+            Some(PolicySession::new("alice")),
+            None,
+        )
+        .unwrap();
+    qm.process(&mut storage);
+    let visible: Vec<ObjectId> = qm
+        .get_subscription_results(alice)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        visible.contains(&current_row.row_id),
+        "the owner's CURRENT-branch row is invisible under her session — the \
+         explicit-authorization path itself is broken, upstream of the crossing \
+         (visible: {visible:?})"
+    );
+    assert!(
+        visible.contains(&old_row_id),
+        "defect 23 (authorization door): the owner's OLD-branch row vanished \
+         under her session — the authorization context does not know the old \
+         schema generation the main context serves, the transform fails \
+         NoLensPath, and authorization fails closed (visible: {visible:?})"
+    );
+
+    // Explicit decision, pinned: a table that exists ONLY in the old world
+    // has no query surface under the current schema at all — the head's
+    // family-wide authority extends to rows it can project into its world,
+    // never to tables the current schema no longer declares.
+    assert!(
+        qm.subscribe_with_session(
+            crate::query_manager::query::Query::new("chat_activities"),
+            Some(PolicySession::new("alice")),
+            None,
+        )
+        .is_err(),
+        "an old-world-only table must not be queryable through the current schema"
+    );
+}

@@ -39,8 +39,13 @@ pub struct PolicyFilterNode {
     schema: Arc<Schema>,
     /// Table name for this node (for INHERITS resolution).
     table_name: String,
-    /// Branch name for index lookups.
-    branch: String,
+    /// Branches whose rows this node's query is sanctioned to see. Policy
+    /// sub-queries (EXISTS / INHERITS REFERENCING) consult ALL of them: a row
+    /// born under an old schema generation keeps its supporting policy rows
+    /// on the old branch, and evaluating the arm against only the first
+    /// branch silently denies every such row (defect 23). Never empty; the
+    /// first entry is the primary branch.
+    branches: Vec<String>,
     row_policy_mode: RowPolicyMode,
     /// Initial recursion depth used for policy evaluation.
     initial_depth: usize,
@@ -59,7 +64,7 @@ pub struct PolicyFilterNode {
 
 #[derive(Debug)]
 pub(crate) struct PolicyFilterOptions {
-    branch: String,
+    branches: Vec<String>,
     initial_depth: usize,
     row_policy_mode: RowPolicyMode,
     policy_operation: Operation,
@@ -67,8 +72,17 @@ pub(crate) struct PolicyFilterOptions {
 
 impl PolicyFilterOptions {
     pub(crate) fn for_branch(branch: impl Into<String>) -> Self {
+        Self::for_branches(vec![branch.into()])
+    }
+
+    pub(crate) fn for_branches(branches: Vec<String>) -> Self {
+        let branches = if branches.is_empty() {
+            vec!["main".to_string()]
+        } else {
+            branches
+        };
         Self {
-            branch: branch.into(),
+            branches,
             ..Self::default()
         }
     }
@@ -92,7 +106,7 @@ impl PolicyFilterOptions {
 impl Default for PolicyFilterOptions {
     fn default() -> Self {
         Self {
-            branch: "main".to_string(),
+            branches: vec!["main".to_string()],
             initial_depth: 0,
             row_policy_mode: RowPolicyMode::PermissiveLocal,
             policy_operation: Operation::Select,
@@ -138,13 +152,13 @@ impl PolicyFilterNode {
         )
     }
 
-    pub fn new_with_branch_and_policy_mode(
+    pub fn new_with_branches_and_policy_mode(
         descriptor: RowDescriptor,
         policy: PolicyExpr,
         session: Session,
         schema: Arc<Schema>,
         table_name: impl Into<String>,
-        branch: impl Into<String>,
+        branches: Vec<String>,
         row_policy_mode: RowPolicyMode,
     ) -> Self {
         Self::new_with_options(
@@ -153,30 +167,7 @@ impl PolicyFilterNode {
             session,
             schema,
             table_name,
-            PolicyFilterOptions::for_branch(branch).with_row_policy_mode(row_policy_mode),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_branch_policy_mode_and_operation(
-        descriptor: RowDescriptor,
-        policy: PolicyExpr,
-        session: Session,
-        schema: Arc<Schema>,
-        table_name: impl Into<String>,
-        branch: impl Into<String>,
-        row_policy_mode: RowPolicyMode,
-        policy_operation: Operation,
-    ) -> Self {
-        Self::new_with_options(
-            descriptor,
-            policy,
-            session,
-            schema,
-            table_name,
-            PolicyFilterOptions::for_branch(branch)
-                .with_row_policy_mode(row_policy_mode)
-                .with_policy_operation(policy_operation),
+            PolicyFilterOptions::for_branches(branches).with_row_policy_mode(row_policy_mode),
         )
     }
 
@@ -218,7 +209,7 @@ impl PolicyFilterNode {
             session,
             schema,
             table_name,
-            branch: options.branch,
+            branches: options.branches,
             row_policy_mode: options.row_policy_mode,
             initial_depth: options.initial_depth,
             current_tuples: AHashSet::new(),
@@ -372,7 +363,7 @@ impl PolicyFilterNode {
         let mut evaluator = PolicyContextEvaluator::new(
             &self.schema,
             &self.session,
-            &self.branch,
+            &self.branches,
             self.row_policy_mode,
         );
         let mut visited_referencing = HashSet::new();

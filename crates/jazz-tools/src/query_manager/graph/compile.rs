@@ -709,19 +709,18 @@ impl QueryGraph {
         );
         let scope_table_map = HashMap::from([(plan.base_scope.clone(), plan.table)]);
 
-        // Policy filter node (if session provided and table has SELECT policy)
+        // Policy filter node (if session provided and table has SELECT policy).
+        // Policy sub-queries consult the SAME branch set the data scans above
+        // union over — a single-branch policy denies every row whose
+        // supporting rows live on an older schema generation (defect 23).
         if let (Some(session), Some(policy)) = (&session, select_policy) {
-            let branch_for_policy = branches
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "main".to_string());
-            let policy_node = PolicyFilterNode::new_with_branch_and_policy_mode(
+            let policy_node = PolicyFilterNode::new_with_branches_and_policy_mode(
                 current_descriptor.clone(),
                 policy,
                 session.clone(),
                 Arc::clone(schema),
                 plan.table.as_str(),
-                branch_for_policy,
+                branches.clone(),
                 row_policy_mode,
             );
             let inherits_tables: Vec<TableName> = policy_node
@@ -806,10 +805,7 @@ impl QueryGraph {
                     &requests,
                     session.clone(),
                     Arc::clone(schema),
-                    branches
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "main".to_string()),
+                    branches.clone(),
                     row_policy_mode,
                 )?;
                 let dependency_tables: Vec<TableName> = magic_node
@@ -877,10 +873,7 @@ impl QueryGraph {
                     &requests,
                     session.clone(),
                     Arc::clone(schema),
-                    branches
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "main".to_string()),
+                    branches.clone(),
                     row_policy_mode,
                 )?;
                 let dependency_tables: Vec<TableName> = magic_node
@@ -1367,6 +1360,9 @@ impl QueryGraph {
         } else {
             branches.iter().map(String::as_str).collect()
         };
+        // Policy filters consult the same branch set the per-branch scans
+        // union over (defect 23) — keep the two visibly in lockstep.
+        let policy_branches: Vec<String> = join_branches.iter().map(|b| b.to_string()).collect();
 
         // Track all table names and descriptors for TupleDescriptor
         let mut table_names = vec![plan.base_scope.clone()];
@@ -1451,17 +1447,13 @@ impl QueryGraph {
                 &session,
                 effective_select_policy(base_table_schema, row_policy_mode),
             ) {
-                let branch_for_policy = branches
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "main".to_string());
-                let policy_node = PolicyFilterNode::new_with_branch_and_policy_mode(
+                let policy_node = PolicyFilterNode::new_with_branches_and_policy_mode(
                     base_descriptor.clone(),
                     policy,
                     session.clone(),
                     schema.clone(),
                     plan.table.as_str(),
-                    branch_for_policy,
+                    policy_branches.clone(),
                     row_policy_mode,
                 );
                 let inherits_tables: Vec<TableName> = policy_node
@@ -1561,17 +1553,13 @@ impl QueryGraph {
                 &session,
                 effective_select_policy(right_table_schema, row_policy_mode),
             ) {
-                let branch_for_policy = branches
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "main".to_string());
-                let policy_node = PolicyFilterNode::new_with_branch_and_policy_mode(
+                let policy_node = PolicyFilterNode::new_with_branches_and_policy_mode(
                     right_descriptor.clone(),
                     policy,
                     session.clone(),
                     schema.clone(),
                     join_spec.table.as_str(),
-                    branch_for_policy,
+                    policy_branches.clone(),
                     row_policy_mode,
                 );
                 let inherits_tables: Vec<TableName> = policy_node
@@ -1681,10 +1669,7 @@ impl QueryGraph {
                     &requests,
                     session.clone(),
                     schema.clone(),
-                    branches
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "main".to_string()),
+                    policy_branches.clone(),
                     row_policy_mode,
                 )?;
                 let dependency_tables: Vec<TableName> = magic_node
@@ -1749,10 +1734,7 @@ impl QueryGraph {
                     &requests,
                     session.clone(),
                     schema.clone(),
-                    branches
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "main".to_string()),
+                    policy_branches.clone(),
                     row_policy_mode,
                 )?;
                 let dependency_tables: Vec<TableName> = magic_node

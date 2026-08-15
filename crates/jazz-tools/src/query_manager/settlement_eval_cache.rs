@@ -9,7 +9,10 @@ use super::types::{TableName, Tuple};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct RefAccessSubexprKey {
-    pub(crate) branch: String,
+    /// Canonical key of the branch universe the access was evaluated against
+    /// (the query's sanctioned branch set, `\u{1f}`-joined) — NOT a single
+    /// branch name: policy sub-queries consult every queried branch.
+    pub(crate) branch_set: String,
     pub(crate) table: TableName,
     pub(crate) id: ObjectId,
     pub(crate) operation: Operation,
@@ -62,13 +65,13 @@ mod tests {
     fn ref_access_cache_key_is_branch_scoped() {
         let row_id = ObjectId::new();
         let main_key = RefAccessSubexprKey {
-            branch: "main".to_string(),
+            branch_set: "main".to_string(),
             table: TableName::new("parent"),
             id: row_id,
             operation: Operation::Select,
         };
         let other_branch_key = RefAccessSubexprKey {
-            branch: "preview".to_string(),
+            branch_set: "preview".to_string(),
             ..main_key.clone()
         };
 

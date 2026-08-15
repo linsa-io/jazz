@@ -3519,6 +3519,122 @@ mod store_probe {
         let storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
         probe_incident_store(storage);
     }
+
+    /// The 2026-08-15 shrinking-list incident, third pass: run the app's chat
+    /// LIST query (chat_members with a parent ref-include of chats) against a
+    /// COPY of the sim app's store, rehydrated from its own catalogue. Prints
+    /// every membership with how many chat rows its include resolved.
+    fn probe_membership_include<S: Storage>(mut storage: S) {
+        use crate::query_manager::session::Session as PolicySession;
+        use crate::query_manager::types::Schema;
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let current_hash_hex =
+            std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target_hash = crate::query_manager::types::SchemaHash::from_hex(&current_hash_hex)
+            .expect("valid schema hash");
+        let current_schema = extractor
+            .context()
+            .live_schemas
+            .get(&target_hash)
+            .or_else(|| extractor.context().pending_schemas.get(&target_hash))
+            .cloned()
+            .expect("the app's schema must be in the catalogue");
+
+        let mut sm = SchemaManager::new(SyncManager::new(), current_schema, app_id, "dev", "main")
+            .expect("phase-2 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(&mut sm, &storage, app_id)
+            .expect("phase-2 rehydrate");
+        let qm = sm.query_manager_mut();
+        println!("branches queried: {:?}", qm.all_query_branches());
+
+        let sub = qm
+            .subscribe(
+                qm.query("chat_members")
+                    .with_array("chat", |sub| {
+                        sub.from("chats").correlate("id", "chat_members.chatId")
+                    })
+                    .build(),
+            )
+            .expect("subscribe members+include");
+        qm.process(&mut storage);
+        let results = qm.get_subscription_results(sub);
+        println!("no-session memberships: {}", results.len());
+        for (id, values) in &results {
+            let includes: Vec<usize> = values
+                .iter()
+                .filter_map(|value| value.as_array().map(|rows| rows.len()))
+                .collect();
+            println!("  member {id} include_counts={includes:?}");
+        }
+
+        let session =
+            PolicySession::new(&std::env::var("JAZZ_PROBE_ROW_ID").expect("set JAZZ_PROBE_ROW_ID"));
+        let sub2 = qm
+            .subscribe_with_session(
+                qm.query("chat_members")
+                    .with_array("chat", |sub| {
+                        sub.from("chats").correlate("id", "chat_members.chatId")
+                    })
+                    .build(),
+                Some(session),
+                None,
+            )
+            .expect("session subscribe members+include");
+        qm.process(&mut storage);
+        let with_session = qm.get_subscription_results(sub2);
+        println!("with-session memberships: {}", with_session.len());
+        for (id, values) in &with_session {
+            let includes: Vec<usize> = values
+                .iter()
+                .filter_map(|value| value.as_array().map(|rows| rows.len()))
+                .collect();
+            println!("  member {id} include_counts={includes:?}");
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn incident_app_store_serves_the_membership_include() {
+        // Copy-then-open, same reason as the users probe above.
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch = std::env::temp_dir().join(format!(
+            "jazz-membership-probe-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the store for the probe");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
+        probe_membership_include(storage);
+    }
 }
 
 // Deterministic CI witness for the defect-20 read fallbacks: a physical

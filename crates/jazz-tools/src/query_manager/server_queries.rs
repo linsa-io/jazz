@@ -297,6 +297,36 @@ impl QueryManager {
             }
         }
 
+        // The main context's current + live schemas are the generation family
+        // plain reads serve (identity-activated or lens-connected).
+        // Authorization must know the same family, or a row born under a
+        // generation the authorization context has never seen fails its
+        // transform into the authorization schema (`NoLensPath`) and is
+        // denied while the plain read serves it (defect 23). The permissions
+        // head is a single per-app chain: its stamped schema hash records
+        // which schema the rules were merged into, not an enforcement scope —
+        // the head governs every world of the family that can be projected
+        // into it. `known_schemas` alone cannot carry the family: it is a
+        // mirror synced only by `SchemaManager::process`, and surfaces
+        // driving the QueryManager directly never populate it. Activation
+        // below still applies its own compatibility check, so nothing becomes
+        // transformable that isn't; a table absent from the authorization
+        // schema stays unpoliced and is denied on an enforcing runtime,
+        // whichever world its rows live in.
+        for (hash, live_schema) in self.schema_context.live_schemas.iter() {
+            if *hash != schema_context.current_hash {
+                schema_context.add_pending_schema_with_hash(*hash, live_schema.clone());
+            }
+        }
+        if self.schema_context.is_initialized()
+            && self.schema_context.current_hash != schema_context.current_hash
+        {
+            schema_context.add_pending_schema_with_hash(
+                self.schema_context.current_hash,
+                self.schema_context.current_schema.clone(),
+            );
+        }
+
         schema_context.try_activate_pending();
 
         let schema_context = Arc::new(schema_context);
@@ -534,10 +564,14 @@ impl QueryManager {
             return false;
         };
 
+        // Write authorization stays scoped to the write's own branch: the
+        // branch-set form exists for read paths, whose sanctioned universe is
+        // the query's full branch list.
+        let policy_branches = [branch_name.as_str().to_string()];
         let mut evaluator = PolicyContextEvaluator::new(
             auth_schema,
             session,
-            branch_name.as_str(),
+            &policy_branches,
             self.row_policy_mode,
         )
         .with_settlement_eval_cache(settlement_eval_cache);
@@ -2227,6 +2261,8 @@ impl QueryManager {
         session: &Session,
         branch: &str,
     ) -> Option<Vec<PolicyGraph>> {
+        // Same single-branch scope as evaluate_authorization_policy above.
+        let policy_branches = [branch.to_string()];
         let mut graphs = Vec::new();
 
         for clause in clauses {
@@ -2300,7 +2336,7 @@ impl QueryManager {
                         condition,
                         session,
                         &self.schema,
-                        branch,
+                        &policy_branches,
                         operation,
                         self.row_policy_mode,
                     ) {
@@ -2313,7 +2349,7 @@ impl QueryManager {
                     if let Some(graph) = PolicyGraph::for_exists_rel(
                         rel,
                         &self.schema,
-                        branch,
+                        &policy_branches,
                         Some(session.clone()),
                         self.row_policy_mode,
                         Some(table),

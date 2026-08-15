@@ -5354,3 +5354,354 @@ fn a_membership_list_keeps_its_chats_across_the_crossing_and_a_split() {
          split — the app drops such rows and the chat vanishes from the list"
     );
 }
+
+/// Schema pair for the policied crossing: `chats` readable only by its
+/// members (an EXISTS policy over `chat_members`), the migration merely
+/// dropping an unrelated table so both tables are identity-compatible
+/// across the crossing.
+fn membership_policied_chat_schema(with_doomed_table: bool) -> Schema {
+    use crate::query_manager::policy::{CmpOp, OUTER_ROW_SESSION_PREFIX, PolicyValue};
+    let member_can_read_chat = PolicyExpr::Exists {
+        table: "chat_members".into(),
+        condition: Box::new(PolicyExpr::And(vec![
+            PolicyExpr::Cmp {
+                column: "chatId".into(),
+                op: CmpOp::Eq,
+                value: PolicyValue::SessionRef(vec![OUTER_ROW_SESSION_PREFIX.into(), "id".into()]),
+            },
+            PolicyExpr::eq_session("userId", vec!["user_id".into()]),
+        ])),
+    };
+    let builder = SchemaBuilder::new()
+        .table(
+            TableSchema::builder("chats")
+                .column("id", ColumnType::Uuid)
+                .column("title", ColumnType::Text)
+                .policies(
+                    TablePolicies::new()
+                        .with_select(member_can_read_chat)
+                        .with_insert(PolicyExpr::True),
+                ),
+        )
+        .table(
+            TableSchema::builder("chat_members")
+                .column("chatId", ColumnType::Uuid)
+                .column("userId", ColumnType::Text)
+                .policies(
+                    // Row-local select policy on purpose: the membership row
+                    // must survive on its own so the gate's final assertion
+                    // isolates the chat's cross-branch EXISTS arm.
+                    TablePolicies::new()
+                        .with_select(PolicyExpr::eq_session("userId", vec!["user_id".into()]))
+                        .with_insert(PolicyExpr::True),
+                ),
+        );
+    if with_doomed_table {
+        builder
+            .table(TableSchema::builder("chat_activities").column("kind", ColumnType::Text))
+            .build()
+    } else {
+        builder.build()
+    }
+}
+
+/// A POLICIED chat list must survive the crossing for its member.
+///
+/// The 2026-08-15 incident, fourth pass (defect 23): the app's chat list —
+/// `chat_members` with a parent ref-include of `chats`, `chats` readable only
+/// by its members — served every row without a session but dropped every
+/// OLD-branch row under the owner's session. Reads were taught to union over
+/// all queried branches (defects 19/20/22); policy was not: its EXISTS arm
+/// scanned only `branches.first()`, so a chat whose supporting membership
+/// row lives on the pre-migration branch failed the arm and vanished.
+///
+/// The mallory subscription is the fixture-discrimination AND the
+/// don't-weaken control: she has no membership on ANY branch, so if she is
+/// ever served the chat, policy evaluation was broadened past the sanctioned
+/// row universe rather than aligned with it.
+#[test]
+fn a_policied_chat_list_serves_the_old_branch_chat_to_its_member() {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        membership_policied_chat_schema(true),
+        "policied-chat-crossing",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    let alice = Session::new("alice");
+    let alice_ctx = WriteContext::from_session(alice.clone());
+    let chat_uuid = ObjectId::new();
+    let ((chat_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "chats",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(chat_uuid)),
+            ("title".to_string(), Value::Text("family chat".to_string())),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("the chat inserts under the old schema");
+    let ((member_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "chat_members",
+        HashMap::from([
+            ("chatId".to_string(), Value::Uuid(chat_uuid)),
+            ("userId".to_string(), Value::Text("alice".to_string())),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("the membership inserts under the old schema");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let list_query = |core: &mut TestCore| {
+        core.schema_manager_mut()
+            .query_manager_mut()
+            .query("chat_members")
+            .with_array("chat", |sub| {
+                sub.from("chats").correlate("id", "chat_members.chatId")
+            })
+            .build()
+    };
+    let subscribe = |core: &mut TestCore, session: &Session, query_id: u64| {
+        let client_id = ClientId::new();
+        core.add_client(client_id, Some(session.clone()));
+        core.sync_sender().take();
+        let query = list_query(core);
+        core.park_sync_message(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::QuerySubscription {
+                query_id: crate::sync_manager::QueryId(query_id),
+                query: Box::new(query),
+                session: Some(session.clone()),
+                required_tier: None,
+                propagation: crate::sync_manager::QueryPropagation::Full,
+                policy_context_tables: vec![],
+            },
+        });
+        core.batched_tick();
+        core.immediate_tick();
+        client_id
+    };
+
+    // Positive control: pre-migration the member is served the chat through
+    // her policied list subscription, so the channel observes include serving.
+    let pre_client = subscribe(&mut core, &alice, 61);
+    let pre_served = served_row_ids_for(&mut core, pre_client);
+    assert!(
+        pre_served.contains(&member_row_id) && pre_served.contains(&chat_row_id),
+        "pre-migration the member's policied list did not serve her chat; the \
+         channel proves nothing (served: {pre_served:?})"
+    );
+
+    // The deployment: same store, new identity-compatible schema, no lens.
+    let storage = core.into_storage();
+    assert!(
+        !storage
+            .scan_catalogue_entries()
+            .expect("catalogue readable")
+            .is_empty(),
+        "the old runtime persisted no catalogue entries; the crossing cannot even begin"
+    );
+    let mut core = recreate_runtime_rehydrated(
+        membership_policied_chat_schema(false),
+        "policied-chat-crossing",
+        storage,
+    );
+    core.immediate_tick();
+
+    // Negative control: a session with no membership on ANY branch is served
+    // no chat — before and after the fix.
+    let mallory = Session::new("mallory");
+    let mallory_client = subscribe(&mut core, &mallory, 62);
+    let mallory_served = served_row_ids_for(&mut core, mallory_client);
+    assert!(
+        !mallory_served.contains(&chat_row_id),
+        "mallory was served the members-only chat across the crossing — policy \
+         evaluation grants beyond the sanctioned branch universe (served: \
+         {mallory_served:?})"
+    );
+
+    // THE gate: after the crossing the member's session must still be served
+    // the old-branch chat — its supporting membership row lives on the OLD
+    // branch while the query's first branch is the NEW one.
+    let post_client = subscribe(&mut core, &alice, 63);
+    let post_served = served_row_ids_for(&mut core, post_client);
+    assert!(
+        post_served.contains(&member_row_id),
+        "the membership row itself vanished across the crossing — the plain \
+         read union regressed, this is upstream of the policy defect (served: \
+         {post_served:?})"
+    );
+    assert!(
+        post_served.contains(&chat_row_id),
+        "defect 23: the member's chat vanished from her policied list after the \
+         schema moved on — the SELECT policy's EXISTS arm consulted only the \
+         first queried branch and never saw the old-branch membership (served: \
+         {post_served:?})"
+    );
+}
+
+/// Structural twin of the schema pair above: the runtime schema carries NO
+/// policies (catalogue schemas are policy-stripped in production); the
+/// permissions live in a separate authorization schema, the app's real shape.
+fn membership_chat_structural_schema(with_doomed_table: bool) -> Schema {
+    let builder = SchemaBuilder::new()
+        .table(
+            TableSchema::builder("chats")
+                .column("id", ColumnType::Uuid)
+                .column("title", ColumnType::Text),
+        )
+        .table(
+            TableSchema::builder("chat_members")
+                .column("chatId", ColumnType::Uuid)
+                .column("userId", ColumnType::Text),
+        );
+    if with_doomed_table {
+        builder
+            .table(TableSchema::builder("chat_activities").column("kind", ColumnType::Text))
+            .build()
+    } else {
+        builder.build()
+    }
+}
+
+/// The permissions head: the same tables WITH policies.
+fn membership_chat_auth_schema() -> Schema {
+    membership_policied_chat_schema(false)
+}
+
+/// The incident's real door, runtime surface: policies come from an EXPLICIT
+/// authorization schema (the permissions head), not from the runtime schema —
+/// with-session visibility then flows through per-row authorization, which
+/// must transform each provenance row into the authorization schema's world
+/// (measured live 2026-08-15: no-session 12 memberships, with-session 2 —
+/// only the current-branch pair).
+///
+/// SURFACE CONTROL, not the red witness: this runtime harness ticks
+/// `SchemaManager::process`, whose `known_schemas` sync happens to heal the
+/// authorization context here, so this gate was green even before the fix.
+/// It pins that healed surface against regression. The red→green witness for
+/// the defect — the authorization context blind to the old generation on a
+/// surface that drives the QueryManager directly — is
+/// `manager_tests::policies::an_explicitly_authorized_session_still_sees_an_old_branch_row`.
+#[test]
+fn an_explicitly_authorized_chat_list_survives_the_crossing_for_its_member() {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        membership_chat_structural_schema(true),
+        "authorized-chat-crossing",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(membership_chat_auth_schema());
+    let alice = Session::new("alice");
+    let alice_ctx = WriteContext::from_session(alice.clone());
+    let chat_uuid = ObjectId::new();
+    let ((chat_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "chats",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(chat_uuid)),
+            ("title".to_string(), Value::Text("family chat".to_string())),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("the chat inserts under the old schema");
+    let ((member_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "chat_members",
+        HashMap::from([
+            ("chatId".to_string(), Value::Uuid(chat_uuid)),
+            ("userId".to_string(), Value::Text("alice".to_string())),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("the membership inserts under the old schema");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let list_query = |core: &mut TestCore| {
+        core.schema_manager_mut()
+            .query_manager_mut()
+            .query("chat_members")
+            .with_array("chat", |sub| {
+                sub.from("chats").correlate("id", "chat_members.chatId")
+            })
+            .build()
+    };
+    let visible_ids = |core: &mut TestCore, session: &Session| -> Vec<ObjectId> {
+        let query = list_query(core);
+        let sub = core
+            .schema_manager_mut()
+            .query_manager_mut()
+            .subscribe_with_session(query, Some(session.clone()), None)
+            .expect("subscription registers");
+        core.batched_tick();
+        core.immediate_tick();
+        let results = core
+            .schema_manager_mut()
+            .query_manager_mut()
+            .get_subscription_results(sub);
+        let mut ids = Vec::new();
+        for (id, values) in results {
+            ids.push(id);
+            // Surface every include-resolved chat row id as well.
+            for value in values {
+                if let Some(rows) = value.as_array() {
+                    if !rows.is_empty() {
+                        ids.push(chat_row_id);
+                    }
+                }
+            }
+        }
+        ids
+    };
+
+    // Positive control: pre-migration the member's explicitly-authorized list
+    // resolves the membership and its chat include.
+    let pre = visible_ids(&mut core, &alice);
+    assert!(
+        pre.contains(&member_row_id) && pre.contains(&chat_row_id),
+        "pre-migration the member's authorized list is broken; the channel proves \
+         nothing (visible: {pre:?})"
+    );
+
+    // The deployment: same store, new identity-compatible schema, no lens.
+    let storage = core.into_storage();
+    let mut core = recreate_runtime_rehydrated(
+        membership_chat_structural_schema(false),
+        "authorized-chat-crossing",
+        storage,
+    );
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(membership_chat_auth_schema());
+    core.immediate_tick();
+
+    // Negative control: no membership on ANY branch, nothing served.
+    let mallory = visible_ids(&mut core, &Session::new("mallory"));
+    assert!(
+        !mallory.contains(&member_row_id) && !mallory.contains(&chat_row_id),
+        "mallory sees the members-only rows across the crossing (visible: {mallory:?})"
+    );
+
+    // THE gate: the member still sees her OLD-branch membership and its chat.
+    let post = visible_ids(&mut core, &alice);
+    assert!(
+        post.contains(&member_row_id),
+        "defect 23 (authorization door): the member's own OLD-branch membership \
+         vanished under her session — per-row authorization could not transform \
+         the old-generation row into the authorization schema's world and failed \
+         closed (visible: {post:?})"
+    );
+    assert!(
+        post.contains(&chat_row_id),
+        "defect 23 (authorization door): the member's chat include came back \
+         empty under her session after the crossing (visible: {post:?})"
+    );
+}
