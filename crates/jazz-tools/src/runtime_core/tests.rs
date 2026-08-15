@@ -4823,3 +4823,199 @@ fn an_include_query_serves_the_parent_and_its_relations_across_the_migration() {
         );
     }
 }
+
+/// The policied variant of the include schema pair: every table owner-read,
+/// the mobile `users` shape (allowRead: own row only).
+fn policied_include_schema(with_extra_column: bool) -> Schema {
+    let owner_read = || {
+        TablePolicies::new()
+            .with_select(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]))
+            .with_insert(PolicyExpr::eq_session("owner_id", vec!["user_id".into()]))
+    };
+    let users = TableSchema::builder("users")
+        .column("id", ColumnType::Uuid)
+        .column("owner_id", ColumnType::Text)
+        .column("name", ColumnType::Text);
+    let users = if with_extra_column {
+        users.column("bio", ColumnType::Text)
+    } else {
+        users
+    };
+    SchemaBuilder::new()
+        .table(users.policies(owner_read()))
+        .table(
+            TableSchema::builder("user_emails")
+                .column("owner_id", ColumnType::Text)
+                .column("email", ColumnType::Text)
+                .fk_column("user_id", "users")
+                .policies(owner_read()),
+        )
+        .table(
+            TableSchema::builder("unique_names")
+                .column("owner_id", ColumnType::Text)
+                .column("handle", ColumnType::Text)
+                .fk_column("user_id", "users")
+                .policies(owner_read()),
+        )
+        .build()
+}
+
+/// A POLICIED include subscription must survive the crossing.
+///
+/// The flat select-policy gate and the policy-free include gate above are both
+/// green; this is their cross product — the mobile account query exactly:
+/// owner-read tables, a parent row with related rows, all written before the
+/// migration, subscribed with the owner's session after it. The mallory
+/// subscription is the fixture-discrimination control: if she is served the
+/// rows too, the policy never gated anything and green here proves nothing.
+#[test]
+fn a_policied_include_subscription_survives_the_crossing() {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        policied_include_schema(false),
+        "policied-include-crossing",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    let alice = Session::new("alice");
+    let alice_ctx = WriteContext::from_session(alice.clone());
+    let user_id = ObjectId::new();
+    let ((user_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(user_id)),
+            ("owner_id".to_string(), Value::Text("alice".to_string())),
+            ("name".to_string(), Value::Text("Alice".to_string())),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("the owner's users insert satisfies her policy");
+    let ((email_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "user_emails",
+        HashMap::from([
+            ("owner_id".to_string(), Value::Text("alice".to_string())),
+            ("user_id".to_string(), Value::Uuid(user_id)),
+            (
+                "email".to_string(),
+                Value::Text("alice@example.test".to_string()),
+            ),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("the owner's email insert satisfies her policy");
+    let ((name_row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "unique_names",
+        HashMap::from([
+            ("owner_id".to_string(), Value::Text("alice".to_string())),
+            ("user_id".to_string(), Value::Uuid(user_id)),
+            ("handle".to_string(), Value::Text("alice".to_string())),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("the owner's handle insert satisfies her policy");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let include_query = |core: &mut TestCore| {
+        core.schema_manager_mut()
+            .query_manager_mut()
+            .query("users")
+            .with_array("user_emails", |sub| {
+                sub.from("user_emails").correlate("user_id", "users.id")
+            })
+            .with_array("unique_names", |sub| {
+                sub.from("unique_names").correlate("user_id", "users.id")
+            })
+            .build()
+    };
+    let subscribe = |core: &mut TestCore, session: &Session, query_id: u64| {
+        let client_id = ClientId::new();
+        core.add_client(client_id, Some(session.clone()));
+        core.sync_sender().take();
+        let query = include_query(core);
+        core.park_sync_message(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::QuerySubscription {
+                query_id: crate::sync_manager::QueryId(query_id),
+                query: Box::new(query),
+                session: Some(session.clone()),
+                required_tier: None,
+                propagation: crate::sync_manager::QueryPropagation::Full,
+                policy_context_tables: vec![],
+            },
+        });
+        core.batched_tick();
+        core.immediate_tick();
+        client_id
+    };
+
+    // Positive control: pre-migration the owner is served all three rows.
+    let pre_client = subscribe(&mut core, &alice, 31);
+    let pre_served = served_row_ids_for(&mut core, pre_client);
+    for (label, id) in [
+        ("parent users row", user_row_id),
+        ("included user_emails row", email_row_id),
+        ("included unique_names row", name_row_id),
+    ] {
+        assert!(
+            pre_served.contains(&id),
+            "pre-migration the owner's policied include subscription did not serve the \
+             {label}; the channel proves nothing (served: {pre_served:?})"
+        );
+    }
+
+    // The deployment.
+    let storage = core.into_storage();
+    assert!(
+        !storage
+            .scan_catalogue_entries()
+            .expect("catalogue readable")
+            .is_empty(),
+        "the v1 runtime persisted no catalogue entries; the crossing cannot even begin"
+    );
+    let mut core = recreate_runtime_rehydrated(
+        policied_include_schema(true),
+        "policied-include-crossing",
+        storage,
+    );
+    let lens = crate::schema_manager::auto_lens::generate_lens(
+        &policied_include_schema(false),
+        &policied_include_schema(true),
+    );
+    core.publish_lens(&lens).expect("lens publishes");
+    core.immediate_tick();
+
+    // Fixture discrimination: mallory subscribes after the crossing and must be
+    // served NONE of the rows, or the policy never gated and green below is
+    // vacuous.
+    let mallory = Session::new("mallory");
+    let mallory_client = subscribe(&mut core, &mallory, 32);
+    let mallory_served = served_row_ids_for(&mut core, mallory_client);
+    assert!(
+        !mallory_served.contains(&user_row_id)
+            && !mallory_served.contains(&email_row_id)
+            && !mallory_served.contains(&name_row_id),
+        "mallory was served the owner's rows across the crossing — the policy gates \
+         nothing here (served: {mallory_served:?})"
+    );
+
+    // The owner after the crossing.
+    let post_client = subscribe(&mut core, &alice, 33);
+    let post_served = served_row_ids_for(&mut core, post_client);
+    for (label, id) in [
+        ("parent users row", user_row_id),
+        ("included user_emails row", email_row_id),
+        ("included unique_names row", name_row_id),
+    ] {
+        assert!(
+            post_served.contains(&id),
+            "the owner's {label} vanished from her policied include subscription after \
+             the schema moved on (served: {post_served:?})"
+        );
+    }
+}
