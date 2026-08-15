@@ -5705,3 +5705,412 @@ fn an_explicitly_authorized_chat_list_survives_the_crossing_for_its_member() {
          empty under her session after the crossing (visible: {post:?})"
     );
 }
+
+/// Structural schema for the NESTED-include incident shape (defect 24):
+/// `users` referenced from `chat_members.userId`, no policies here — the
+/// permissions live in the explicit authorization schema, the app's real door.
+fn nested_user_chat_structural_schema(with_doomed_table: bool) -> Schema {
+    let builder = SchemaBuilder::new()
+        .table(TableSchema::builder("users").column("name", ColumnType::Text))
+        .table(
+            TableSchema::builder("chats")
+                .column("id", ColumnType::Uuid)
+                .column("title", ColumnType::Text),
+        )
+        .table(
+            TableSchema::builder("chat_members")
+                .column("chatId", ColumnType::Uuid)
+                .fk_column("userId", "users"),
+        );
+    if with_doomed_table {
+        builder
+            .table(TableSchema::builder("chat_activities").column("kind", ColumnType::Text))
+            .build()
+    } else {
+        builder.build()
+    }
+}
+
+/// The permissions head for the nested-include incident shape: everything
+/// allowRead-always EXCEPT `users`, which is policied — a self arm, plus
+/// (when `co_membership_arm`) the app's readReferencing co-membership arm.
+fn nested_user_chat_auth_schema(co_membership_arm: bool) -> Schema {
+    use crate::query_manager::types::policy_expr;
+    let mut users_select = PolicyExpr::eq_session("name", vec!["user_id".into()]);
+    if co_membership_arm {
+        users_select = PolicyExpr::or(vec![
+            users_select,
+            policy_expr::allowed_to_read_referencing("chat_members", "userId"),
+        ]);
+    }
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("users")
+                .column("name", ColumnType::Text)
+                .policies(
+                    TablePolicies::new()
+                        .with_select(users_select)
+                        .with_insert(PolicyExpr::True),
+                ),
+        )
+        .table(
+            TableSchema::builder("chats")
+                .column("id", ColumnType::Uuid)
+                .column("title", ColumnType::Text)
+                .policies(
+                    TablePolicies::new()
+                        .with_select(PolicyExpr::True)
+                        .with_insert(PolicyExpr::True),
+                ),
+        )
+        .table(
+            TableSchema::builder("chat_members")
+                .column("chatId", ColumnType::Uuid)
+                .fk_column("userId", "users")
+                .policies(
+                    TablePolicies::new()
+                        .with_select(PolicyExpr::True)
+                        .with_insert(PolicyExpr::True),
+                ),
+        )
+        .build()
+}
+
+/// The app's chat-list shape, three include levels deep:
+/// `chat_members` (mine) → `chat` → its member set → each member's `user`.
+fn nested_user_list_query(core: &mut TestCore, my_user_id: ObjectId) -> Query {
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .query("chat_members")
+        .filter_eq("userId", Value::Uuid(my_user_id))
+        .with_array("chat", |sub| {
+            sub.from("chats")
+                .correlate("id", "chat_members.chatId")
+                .with_array("chat_membersViaChat", |sub| {
+                    sub.from("chat_members")
+                        .correlate("chatId", "chats.id")
+                        .with_array("user", |sub| {
+                            sub.from("users").correlate("id", "chat_members.userId")
+                        })
+                })
+        })
+        .build()
+}
+
+/// For one outer membership row's decoded values, walk chat → members → user
+/// and return each member element as (its `userId` column, its user-include
+/// length).
+fn member_user_includes(values: &[Value]) -> Vec<(Value, usize)> {
+    let mut out = Vec::new();
+    for value in values {
+        let Value::Array(chats) = value else { continue };
+        for chat in chats {
+            let Value::Row {
+                values: chat_values,
+                ..
+            } = chat
+            else {
+                continue;
+            };
+            for chat_value in chat_values {
+                let Value::Array(members) = chat_value else {
+                    continue;
+                };
+                for member in members {
+                    let Value::Row {
+                        values: member_values,
+                        ..
+                    } = member
+                    else {
+                        continue;
+                    };
+                    let user_id = member_values.get(1).cloned().unwrap_or(Value::Null);
+                    let users_len = member_values
+                        .iter()
+                        .filter_map(|value| match value {
+                            Value::Array(users) => Some(users.len()),
+                            _ => None,
+                        })
+                        .next_back()
+                        .unwrap_or(0);
+                    out.push((user_id, users_len));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Defect 24, face B: a co-member whose `users` row moved to the NEW world
+/// while the shared chat's family stayed OLD must not kill the outer
+/// membership row of everyone who shares a chat with them.
+///
+/// The 2026-08-15 incident, fifth pass. The app's list nests three include
+/// levels (membership → chat → member set → user); `users` is the first
+/// POLICIED table in the shape (self arm OR readReferencing co-membership).
+/// One member of two old-world chats had their `users` row touched after the
+/// migration, so its tip lives on the NEW branch while every supporting
+/// `chat_members` row lives on the OLD branch. Per-row authorization pinned
+/// the policy's branch universe to the row's OWN branch, the readReferencing
+/// arm never saw the old-world referencing rows, the user was denied — and
+/// the output filter killed the whole OUTER membership tuple, erasing the
+/// chat from the member's list (measured: 5 memberships without the user
+/// level, 3 with it).
+#[test]
+fn a_co_members_new_world_user_row_keeps_the_old_chat_in_the_list() {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        nested_user_chat_structural_schema(true),
+        "nested-user-crossing",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(nested_user_chat_auth_schema(true));
+    let alice = Session::new("alice");
+    let alice_ctx = WriteContext::from_session(alice.clone());
+
+    let ((alice_user_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([("name".to_string(), Value::Text("alice".to_string()))]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("alice's user row inserts under the old schema");
+    let ((bob_user_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([("name".to_string(), Value::Text("bob".to_string()))]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("bob's user row inserts under the old schema");
+    let chat_uuid = ObjectId::new();
+    let (_, _confirmation) = insert_and_wait_for_batch(
+        &mut core,
+        "chats",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(chat_uuid)),
+            ("title".to_string(), Value::Text("old chat".to_string())),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("the chat inserts under the old schema");
+    let ((alice_member_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "chat_members",
+        HashMap::from([
+            ("chatId".to_string(), Value::Uuid(chat_uuid)),
+            ("userId".to_string(), Value::Uuid(alice_user_id)),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("alice's membership inserts under the old schema");
+    let (_, _confirmation) = insert_and_wait_for_batch(
+        &mut core,
+        "chat_members",
+        HashMap::from([
+            ("chatId".to_string(), Value::Uuid(chat_uuid)),
+            ("userId".to_string(), Value::Uuid(bob_user_id)),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("bob's membership inserts under the old schema");
+    core.batched_tick();
+    core.immediate_tick();
+
+    // The deployment: same store, new identity-compatible schema, no lens.
+    let storage = core.into_storage();
+    let mut core = recreate_runtime_rehydrated(
+        nested_user_chat_structural_schema(false),
+        "nested-user-crossing",
+        storage,
+    );
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(nested_user_chat_auth_schema(true));
+    core.immediate_tick();
+
+    // The split: bob's user row is touched AFTER the migration — its tip
+    // moves to the NEW branch while his membership stays on the OLD one.
+    core.update(
+        bob_user_id,
+        vec![("name".to_string(), Value::Text("bob renamed".to_string()))],
+        None,
+    )
+    .expect("bob's post-migration touch applies");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let query = nested_user_list_query(&mut core, alice_user_id);
+    let sub = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .subscribe_with_session(query, Some(alice.clone()), None)
+        .expect("alice's nested list subscription registers");
+    core.batched_tick();
+    core.immediate_tick();
+    let results = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .get_subscription_results(sub);
+
+    // THE gate: the outer membership row survives its co-member's user row
+    // straddling the schema crossing.
+    let outer_ids: Vec<ObjectId> = results.iter().map(|(id, _)| *id).collect();
+    assert!(
+        outer_ids.contains(&alice_member_id) && results.len() == 1,
+        "defect 24: the nested user include's policy verdict killed the OUTER \
+         membership row — the chat vanished from the member's list (served \
+         outer rows: {outer_ids:?})"
+    );
+
+    // Both member elements resolve their user: alice through the self arm,
+    // bob through the co-membership arm across the crossing.
+    let members = member_user_includes(&results[0].1);
+    assert_eq!(
+        members.len(),
+        2,
+        "the chat's member set must serve both memberships (got {members:?})"
+    );
+    for (user_id, users_len) in &members {
+        assert_eq!(
+            *users_len, 1,
+            "a granted nested user include came back empty for member \
+             {user_id:?} (members: {members:?})"
+        );
+    }
+}
+
+/// Defect 24, face A: a nested include element whose row the session may NOT
+/// read is clipped at its OWN level — the outer row and every ancestor level
+/// are governed by their own tables' policies, not the leaf's.
+///
+/// No crossing here at all: one world, `users` readable only by the self
+/// arm. Bob's user row is legitimately denied to alice — that must empty
+/// bob's `user` include element, not erase alice's membership row.
+#[test]
+fn a_denied_nested_user_include_clips_its_element_not_the_outer_row() {
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        nested_user_chat_structural_schema(false),
+        "nested-user-clip",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .set_authorization_schema(nested_user_chat_auth_schema(false));
+    let alice = Session::new("alice");
+    let alice_ctx = WriteContext::from_session(alice.clone());
+
+    let ((alice_user_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([("name".to_string(), Value::Text("alice".to_string()))]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("alice's user row inserts");
+    let ((bob_user_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "users",
+        HashMap::from([("name".to_string(), Value::Text("bob".to_string()))]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("bob's user row inserts");
+    let chat_uuid = ObjectId::new();
+    let (_, _confirmation) = insert_and_wait_for_batch(
+        &mut core,
+        "chats",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(chat_uuid)),
+            ("title".to_string(), Value::Text("shared chat".to_string())),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("the chat inserts");
+    let ((alice_member_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "chat_members",
+        HashMap::from([
+            ("chatId".to_string(), Value::Uuid(chat_uuid)),
+            ("userId".to_string(), Value::Uuid(alice_user_id)),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("alice's membership inserts");
+    let (_, _confirmation) = insert_and_wait_for_batch(
+        &mut core,
+        "chat_members",
+        HashMap::from([
+            ("chatId".to_string(), Value::Uuid(chat_uuid)),
+            ("userId".to_string(), Value::Uuid(bob_user_id)),
+        ]),
+        Some(&alice_ctx),
+        DurabilityTier::Local,
+    )
+    .expect("bob's membership inserts");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let query = nested_user_list_query(&mut core, alice_user_id);
+    let sub = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .subscribe_with_session(query, Some(alice.clone()), None)
+        .expect("alice's nested list subscription registers");
+    core.batched_tick();
+    core.immediate_tick();
+    let results = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .get_subscription_results(sub);
+
+    // THE gate: the denied leaf clips its own element only.
+    let outer_ids: Vec<ObjectId> = results.iter().map(|(id, _)| *id).collect();
+    assert!(
+        outer_ids.contains(&alice_member_id) && results.len() == 1,
+        "defect 24 (clip face): a legitimately denied nested user element \
+         erased the OUTER membership row instead of clipping at its own level \
+         (served outer rows: {outer_ids:?})"
+    );
+
+    let members = member_user_includes(&results[0].1);
+    assert_eq!(
+        members.len(),
+        2,
+        "the always-readable member set must survive the leaf denial (got {members:?})"
+    );
+    let user_len_for = |user_id: ObjectId| -> Option<usize> {
+        members
+            .iter()
+            .find(|(id, _)| *id == Value::Uuid(user_id))
+            .map(|(_, len)| *len)
+    };
+    assert_eq!(
+        user_len_for(alice_user_id),
+        Some(1),
+        "alice's own user element must resolve through the self arm (members: {members:?})"
+    );
+    assert_eq!(
+        user_len_for(bob_user_id),
+        Some(0),
+        "bob's denied user element must be EMPTY, not populated and not \
+         fatal to any ancestor (members: {members:?})"
+    );
+
+    // The denial must actually clip the DATA: bob's row content may not
+    // appear anywhere in the served tree.
+    let serialized = format!("{results:?}");
+    assert!(
+        !serialized.contains("bob"),
+        "the denied user's content leaked into the served result: {serialized}"
+    );
+}

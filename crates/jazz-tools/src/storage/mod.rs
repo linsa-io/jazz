@@ -3591,7 +3591,7 @@ mod store_probe {
                         sub.from("chats").correlate("id", "chat_members.chatId")
                     })
                     .build(),
-                Some(session),
+                Some(session.clone()),
                 None,
             )
             .expect("session subscribe members+include");
@@ -3604,6 +3604,217 @@ mod store_probe {
                 .filter_map(|value| value.as_array().map(|rows| rows.len()))
                 .collect();
             println!("  member {id} include_counts={includes:?}");
+        }
+
+        // The app's EXACT list shape: userId + isBanned filters on top of the
+        // include, under the owner's session.
+        let user_id_text = std::env::var("JAZZ_PROBE_ROW_ID").expect("set JAZZ_PROBE_ROW_ID");
+        let sub3 = qm
+            .subscribe_with_session(
+                qm.query("chat_members")
+                    .filter_eq("userId", Value::Text(user_id_text.clone()))
+                    .filter_eq("isBanned", Value::Boolean(false))
+                    .with_array("chat", |sub| {
+                        sub.from("chats").correlate("id", "chat_members.chatId")
+                    })
+                    .build(),
+                Some(session),
+                None,
+            )
+            .expect("session subscribe app-shaped list");
+        qm.process(&mut storage);
+        let app_shaped = qm.get_subscription_results(sub3);
+        println!(
+            "app-shaped (userId+isBanned) memberships: {}",
+            app_shaped.len()
+        );
+        for (id, values) in &app_shaped {
+            let includes: Vec<usize> = values
+                .iter()
+                .filter_map(|value| value.as_array().map(|rows| rows.len()))
+                .collect();
+            println!("  member {id} include_counts={includes:?}");
+        }
+
+        // The FULL app shape: nested includes (chat -> its member set -> each
+        // member's user -> the user's handles; plus the joinable group call)
+        // and the $createdAt magic-column ordering — chats.ts verbatim.
+        let session2 = PolicySession::new(&user_id_text);
+        let sub4 = qm
+            .subscribe_with_session(
+                qm.query("chat_members")
+                    .filter_eq("userId", Value::Text(user_id_text.clone()))
+                    .filter_eq("isBanned", Value::Boolean(false))
+                    .order_by_desc("$createdAt")
+                    .with_array("chat", |sub| {
+                        sub.from("chats")
+                            .correlate("id", "chat_members.chatId")
+                            .with_array("chat_membersViaChat", |sub| {
+                                sub.from("chat_members")
+                                    .correlate("chatId", "chats.id")
+                                    .with_array("user", |sub| {
+                                        sub.from("users")
+                                            .correlate("id", "chat_members.userId")
+                                            .with_array("unique_namesViaUser", |sub| {
+                                                sub.from("unique_names")
+                                                    .correlate("userId", "users.id")
+                                            })
+                                    })
+                            })
+                            .with_array("callsViaChat", |sub| {
+                                sub.from("calls")
+                                    .correlate("chatId", "chats.id")
+                                    .filter_eq("callShape", Value::Text("group".into()))
+                                    .filter_eq("isEnded", Value::Boolean(false))
+                                    .limit(1)
+                            })
+                    })
+                    .build(),
+                Some(session2),
+                None,
+            )
+            .expect("session subscribe full app list shape");
+        qm.process(&mut storage);
+        let full_shape = qm.get_subscription_results(sub4);
+        println!("full-shape memberships: {}", full_shape.len());
+        for (id, values) in &full_shape {
+            let includes: Vec<usize> = values
+                .iter()
+                .filter_map(|value| value.as_array().map(|rows| rows.len()))
+                .collect();
+            println!("  member {id} include_counts={includes:?}");
+        }
+
+        // Bisect: which half of the full shape drops the old-branch rows?
+        // (a) simple include + the $createdAt ordering
+        let session3 = PolicySession::new(&user_id_text);
+        let sub5 = qm
+            .subscribe_with_session(
+                qm.query("chat_members")
+                    .filter_eq("userId", Value::Text(user_id_text.clone()))
+                    .filter_eq("isBanned", Value::Boolean(false))
+                    .order_by_desc("$createdAt")
+                    .with_array("chat", |sub| {
+                        sub.from("chats").correlate("id", "chat_members.chatId")
+                    })
+                    .build(),
+                Some(session3),
+                None,
+            )
+            .expect("session subscribe orderBy bisect");
+        qm.process(&mut storage);
+        println!(
+            "bisect orderBy+simple-include memberships: {}",
+            qm.get_subscription_results(sub5).len()
+        );
+
+        // (b) nested includes, NO ordering
+        let session4 = PolicySession::new(&user_id_text);
+        let sub6 = qm
+            .subscribe_with_session(
+                qm.query("chat_members")
+                    .filter_eq("userId", Value::Text(user_id_text.clone()))
+                    .filter_eq("isBanned", Value::Boolean(false))
+                    .with_array("chat", |sub| {
+                        sub.from("chats")
+                            .correlate("id", "chat_members.chatId")
+                            .with_array("chat_membersViaChat", |sub| {
+                                sub.from("chat_members")
+                                    .correlate("chatId", "chats.id")
+                                    .with_array("user", |sub| {
+                                        sub.from("users")
+                                            .correlate("id", "chat_members.userId")
+                                            .with_array("unique_namesViaUser", |sub| {
+                                                sub.from("unique_names")
+                                                    .correlate("userId", "users.id")
+                                            })
+                                    })
+                            })
+                            .with_array("callsViaChat", |sub| {
+                                sub.from("calls")
+                                    .correlate("chatId", "chats.id")
+                                    .filter_eq("callShape", Value::Text("group".into()))
+                                    .filter_eq("isEnded", Value::Boolean(false))
+                                    .limit(1)
+                            })
+                    })
+                    .build(),
+                Some(session4),
+                None,
+            )
+            .expect("session subscribe nested bisect");
+        qm.process(&mut storage);
+        println!(
+            "bisect nested-include no-orderBy memberships: {}",
+            qm.get_subscription_results(sub6).len()
+        );
+
+        // (c) chat + member set only; (d) chat + calls only;
+        // (e) chat + member set + user (no handles).
+        let variants: Vec<(&str, crate::query_manager::query::Query)> = vec![
+            (
+                "chat+membersViaChat",
+                qm.query("chat_members")
+                    .filter_eq("userId", Value::Text(user_id_text.clone()))
+                    .filter_eq("isBanned", Value::Boolean(false))
+                    .with_array("chat", |sub| {
+                        sub.from("chats")
+                            .correlate("id", "chat_members.chatId")
+                            .with_array("chat_membersViaChat", |sub| {
+                                sub.from("chat_members").correlate("chatId", "chats.id")
+                            })
+                    })
+                    .build(),
+            ),
+            (
+                "chat+callsViaChat",
+                qm.query("chat_members")
+                    .filter_eq("userId", Value::Text(user_id_text.clone()))
+                    .filter_eq("isBanned", Value::Boolean(false))
+                    .with_array("chat", |sub| {
+                        sub.from("chats")
+                            .correlate("id", "chat_members.chatId")
+                            .with_array("callsViaChat", |sub| {
+                                sub.from("calls")
+                                    .correlate("chatId", "chats.id")
+                                    .filter_eq("callShape", Value::Text("group".into()))
+                                    .filter_eq("isEnded", Value::Boolean(false))
+                                    .limit(1)
+                            })
+                    })
+                    .build(),
+            ),
+            (
+                "chat+members+user",
+                qm.query("chat_members")
+                    .filter_eq("userId", Value::Text(user_id_text.clone()))
+                    .filter_eq("isBanned", Value::Boolean(false))
+                    .with_array("chat", |sub| {
+                        sub.from("chats")
+                            .correlate("id", "chat_members.chatId")
+                            .with_array("chat_membersViaChat", |sub| {
+                                sub.from("chat_members")
+                                    .correlate("chatId", "chats.id")
+                                    .with_array("user", |sub| {
+                                        sub.from("users").correlate("id", "chat_members.userId")
+                                    })
+                            })
+                    })
+                    .build(),
+            ),
+        ];
+        for (label, query) in variants {
+            let session_v = PolicySession::new(&user_id_text);
+            let sub_v = qm
+                .subscribe_with_session(query, Some(session_v), None)
+                .expect("bisect variant subscribe");
+            qm.process(&mut storage);
+            let rows = qm.get_subscription_results(sub_v);
+            let ids: Vec<String> = rows
+                .iter()
+                .map(|(id, _)| id.to_string()[..8].to_string())
+                .collect();
+            println!("bisect {label}: {} {ids:?}", rows.len());
         }
     }
 

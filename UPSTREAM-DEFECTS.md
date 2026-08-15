@@ -1006,6 +1006,58 @@ policy to truncate.
 
 ---
 
+## 24. One denied nested-include row deletes the whole outer row from the result
+
+**Severity: silent data invisibility, compounding entry 23.** The output authorization
+filter (`authorized_tuples_from_graph_result`, merge-base
+`e84d84a6:crates/jazz-tools/src/query_manager/server_queries.rs:581`) required EVERY
+provenance row of a served tuple to pass select policy:
+`.all(|(object_id, branch)| verdict).then_some(tuple)` — one denied row anywhere in a
+nested include (three levels down in our case) discarded the entire outer row. Policy on
+a leaf became a veto on its ancestors.
+
+Second face, same evaluation: `evaluate_authorization_policy` (merge-base line 454)
+pinned the policy branch universe to the row's own branch, and its related-row loader to
+the same single branch. A `readReferencing` co-membership arm then fails for any row
+whose supporting rows live across the schema crossing — measured live: a user row whose
+tip had moved to the NEW generation was denied because its grounding `chat_members` rows
+live only in the OLD one, and that single denial (face 1) deleted two chats from the
+list's outer rows.
+
+Measured end to end on the incident store (session-scoped, the app's own list query):
+simple include serves 5 of 5 memberships; adding the first POLICIED nested level
+(member → user) drops to 3 — the production "my chats disappeared" number, reproduced in
+the probe with a one-element toggle. Bisect pinned it: ordering innocent, 2-level
+nesting innocent, the policied third level kills.
+
+Fix: (1) policy clips at its own level — a tuple's IDENTITY rows (outer row and join
+legs, whose data is flat in the served row) govern serving; a denied nested include row
+prunes exactly its element (array entry removed, singular ref nulled, subtree and
+provenance dropped), failing closed only if the tuple cannot be rebuilt. A denied JOIN
+leg still kills the joined row — its data is flat in the tuple, pinned by an existing
+lens-transform gate that went red under the naive version of this change. (2) The
+settlement/output evaluation receives the sanctioned read universe (current + activated
+generations from the entry-23-seeded authorization context) instead of the row's single
+branch; the authorization cache key carries a universe fingerprint so verdicts from a
+narrower universe are never replayed. Write-side authorization stays on the write's own
+branch. Gates: `a_co_members_new_world_user_row_keeps_the_old_chat_in_the_list` (the
+incident), `a_denied_nested_user_include_clips_its_element_not_the_outer_row` (clipping
+semantics + a no-leak assertion). Each face disarm/rearm falsified independently — each
+disarm reddens exactly its own gate. Probe: 3 → 5 of 5 on the full app shape. Suite:
+1528 passed / 0 failed.
+
+Attribution: UPSTREAM-INHERITED — both faces at the merge-base:
+`e84d84a6:crates/jazz-tools/src/query_manager/server_queries.rs:581` (the
+`.all(...).then_some(tuple)` whole-tuple kill) and `:454` (single-branch policy
+universe).
+Groove (codex/jazz-core-engine-swap): split. The branch-universe face is architected
+away (policy projected per version row, no query-time branch set). Whether a denied
+nested element kills its ancestors in groove's serving path is UNVERIFIED — the serving
+semantics there are new code; flagged as a review item for the groove line rather than
+asserted either way.
+
+---
+
 ## Groove line: verification summary (2026-08-15)
 
 Upstream's Thursday publishes are cut from the integration branch
@@ -1028,7 +1080,8 @@ Open PRs on the branch that overlap entries here: #1538 → 17; #1533, #1537 →
 #1523 → 19/20; #1535, #1520 → 1's class; #1201 → 20's twin on main; #1367, #1503 → 18 and
 6's RN half; #1200 is tier-adjacent.
 
-The risk verdict: 17 of the 22 live entries (entry 4 is withdrawn; 23 total) have mechanisms unrepresentable on the groove line,
+The risk verdict: 17 of the 23 live entries (entry 4 is withdrawn; 24 total) have mechanisms unrepresentable on the groove line,
+plus entry 24's branch-universe face (its outer-row-kill face is an unverified review item there),
 including 17, 19, 20 and 23 — the schema-crossing class. Still present: 6's RN half, the
 new O(table) policy scan flagged under entry 15, and 22's blind `id` readers (flat-join
 value refs and sort keys resolve a declared `id` column as the row id). Unknown: 2, 18,

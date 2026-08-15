@@ -1383,6 +1383,7 @@ impl QueryManager {
                 operation,
                 settlement_eval_cache: None,
                 content_schema_hash: None,
+                policy_branches: None,
             },
         )
     }

@@ -37,6 +37,38 @@ enum AuthorizedTuplesResult {
     PermissionsUnavailable,
 }
 
+/// The sanctioned branch universe read-path policy evaluation sees: the
+/// authorization context's whole same-lineage family (current + activated
+/// live generations), i.e. the same cross-branch universe plain reads serve
+/// (defects 19/22/23/24). Carries a fingerprint so cached verdicts computed
+/// under another universe are never served (the family can grow without the
+/// authorization schema hash or generation moving).
+pub(super) struct ReadPolicyBranchUniverse {
+    pub(super) branches: Vec<String>,
+    pub(super) fingerprint: u64,
+}
+
+impl ReadPolicyBranchUniverse {
+    pub(super) fn from_authorization_context(
+        auth_context: &crate::schema_manager::SchemaContext,
+    ) -> Self {
+        use std::hash::{Hash, Hasher};
+        let branches: Vec<String> = auth_context
+            .all_branch_names()
+            .into_iter()
+            .map(|branch| branch.as_str().to_string())
+            .collect();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for branch in &branches {
+            branch.hash(&mut hasher);
+        }
+        Self {
+            fingerprint: hasher.finish(),
+            branches,
+        }
+    }
+}
+
 pub(super) struct ResolvedSchemaRow {
     pub branch_name: BranchName,
     pub batch_id: BatchId,
@@ -75,6 +107,16 @@ pub(crate) struct AuthorizationPolicyRequest<'a> {
     /// policy reads garbage. Callers evaluating OLD content must pass the
     /// hash the row's locator names.
     pub(crate) content_schema_hash: Option<SchemaHash>,
+    /// The sanctioned branch universe policy CONTEXT arms (EXISTS /
+    /// readReferencing / INHERITS) evaluate against.
+    ///
+    /// `None` keeps the write default: the write's own branch. READ paths
+    /// must pass the same cross-branch family plain reads serve — after a
+    /// migration a row's supporting rows (a co-membership grounding a
+    /// readReferencing arm) can live on the other same-lineage world, and a
+    /// single-branch evaluation denies a row the session is entitled to
+    /// (defect 24, the defect 19/22/23 invariant family).
+    pub(crate) policy_branches: Option<&'a [String]>,
 }
 
 struct UpdatePermissionRequest<'a> {
@@ -483,15 +525,14 @@ impl QueryManager {
         &mut self,
         storage: &dyn Storage,
         object_id: ObjectId,
-        branch_name: BranchName,
+        branches: &[String],
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
         auth_context: &crate::schema_manager::SchemaContext,
     ) -> Option<LoadedRow> {
-        let branches = vec![branch_name.as_str().to_string()];
         let (table, row) = self.load_best_visible_row_batch(
             storage,
             object_id,
-            &branches,
+            branches,
             None,
             auth_context,
             source_branch_schema_map,
@@ -499,6 +540,11 @@ impl QueryManager {
         if row.is_hard_deleted() {
             return None;
         }
+
+        // The row's transform into the authorization schema must start from
+        // the branch it was actually FOUND on — with a multi-branch universe
+        // that is not necessarily the first candidate.
+        let found_branch = BranchName::new(row.branch.as_str());
 
         let tip_batch_id = row.batch_id;
         // Canonicalize so every authorization load of this (row, batch)
@@ -513,7 +559,7 @@ impl QueryManager {
             &table,
             &tip_content,
             tip_batch_id,
-            branch_name,
+            found_branch,
             source_branch_schema_map,
             auth_context,
             None,
@@ -522,7 +568,7 @@ impl QueryManager {
         Some(LoadedRow::new(
             transformed,
             tip_provenance,
-            [(object_id, branch_name)].into_iter().collect(),
+            [(object_id, found_branch)].into_iter().collect(),
             row.batch_id,
         ))
     }
@@ -546,6 +592,7 @@ impl QueryManager {
             operation,
             settlement_eval_cache,
             content_schema_hash,
+            policy_branches,
         } = request;
 
         let Some(table_schema) = auth_schema.get(&table_name) else {
@@ -564,14 +611,23 @@ impl QueryManager {
             return false;
         };
 
-        // Write authorization stays scoped to the write's own branch: the
-        // branch-set form exists for read paths, whose sanctioned universe is
-        // the query's full branch list.
-        let policy_branches = [branch_name.as_str().to_string()];
+        // Write authorization stays scoped to the write's own branch. Read
+        // paths pass their sanctioned universe explicitly (defect 24): a
+        // policy arm grounded in a supporting row must see every branch the
+        // query itself reads, or a cross-world family denies a row the
+        // session is entitled to.
+        let own_branch;
+        let policy_branches: &[String] = match policy_branches {
+            Some(universe) => universe,
+            None => {
+                own_branch = [branch_name.as_str().to_string()];
+                &own_branch
+            }
+        };
         let mut evaluator = PolicyContextEvaluator::new(
             auth_schema,
             session,
-            &policy_branches,
+            policy_branches,
             self.row_policy_mode,
         )
         .with_settlement_eval_cache(settlement_eval_cache);
@@ -581,7 +637,7 @@ impl QueryManager {
             self.load_row_for_authorization_context(
                 storage,
                 related_id,
-                branch_name,
+                policy_branches,
                 source_branch_schema_map,
                 auth_context,
             )
@@ -611,6 +667,7 @@ impl QueryManager {
         auth_schema: &Schema,
         auth_context: &crate::schema_manager::SchemaContext,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
+        universe: &ReadPolicyBranchUniverse,
     ) -> bool {
         // Settle-cost accounting: every per-row authorization decision the sync
         // scope needs, cached or not. The miss counter below is bumped only
@@ -628,6 +685,7 @@ impl QueryManager {
             schema_hash: auth_context.current_hash,
             auth_generation: self.authz_schema_generation,
             mode: self.row_policy_mode,
+            branch_universe: universe.fingerprint,
         };
         let session_key = AuthzSessionKey::for_session(session);
         if let Some(cached) = self
@@ -648,6 +706,7 @@ impl QueryManager {
                     auth_schema,
                     auth_context,
                     source_branch_schema_map,
+                    universe,
                 );
                 debug_assert_eq!(
                     fresh, cached,
@@ -669,6 +728,7 @@ impl QueryManager {
             auth_schema,
             auth_context,
             source_branch_schema_map,
+            universe,
         );
         if let Some(table) = table {
             self.authz_verdicts.store(
@@ -695,6 +755,7 @@ impl QueryManager {
         auth_schema: &Schema,
         auth_context: &crate::schema_manager::SchemaContext,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
+        universe: &ReadPolicyBranchUniverse,
     ) -> (bool, Option<TableName>) {
         let branches = vec![branch_name.as_str().to_string()];
         let Some((table, row)) = self.load_best_visible_row_batch(
@@ -744,6 +805,7 @@ impl QueryManager {
                 operation: Operation::Select,
                 settlement_eval_cache: Some(settlement_eval_cache),
                 content_schema_hash: None,
+                policy_branches: Some(&universe.branches),
             },
         );
         (verdict, Some(table_name))
@@ -779,37 +841,136 @@ impl QueryManager {
             return AuthorizedTuplesResult::Ready(graph.current_output_tuples());
         }
 
+        let universe = ReadPolicyBranchUniverse::from_authorization_context(&auth_context);
         let mut authorization_cache: HashMap<(ObjectId, BranchName), bool> = HashMap::new();
 
+        // Policy clips at its own level (defect 24): the verdicts of the
+        // tuple's IDENTITY rows — the outer row and every join leg, whose
+        // data is flat in the served row — govern whether the tuple is
+        // served; a denied NESTED include row prunes exactly its element
+        // (and the subtree inside it), never the ancestors that carry it.
         AuthorizedTuplesResult::Ready(
             graph
                 .current_output_tuples()
                 .into_iter()
                 .filter_map(|tuple| {
-                    tuple
-                        .provenance()
-                        .iter()
-                        .copied()
-                        .all(|(object_id, branch_name)| {
-                            *authorization_cache
-                                .entry((object_id, branch_name))
-                                .or_insert_with(|| {
-                                    self.provenance_row_matches_current_select_policy(
-                                        storage,
-                                        settlement_eval_cache,
-                                        object_id,
-                                        branch_name,
-                                        session,
-                                        &auth_schema,
-                                        &auth_context,
-                                        source_branch_schema_map,
-                                    )
-                                })
-                        })
-                        .then_some(tuple)
+                    let mut any_denied = false;
+                    let mut denied_ids: HashSet<ObjectId> = HashSet::new();
+                    let mut allowed_ids: HashSet<ObjectId> = HashSet::new();
+                    for (object_id, branch_name) in tuple.provenance().iter().copied() {
+                        let verdict = *authorization_cache
+                            .entry((object_id, branch_name))
+                            .or_insert_with(|| {
+                                self.provenance_row_matches_current_select_policy(
+                                    storage,
+                                    settlement_eval_cache,
+                                    object_id,
+                                    branch_name,
+                                    session,
+                                    &auth_schema,
+                                    &auth_context,
+                                    source_branch_schema_map,
+                                    &universe,
+                                )
+                            });
+                        if verdict {
+                            allowed_ids.insert(object_id);
+                        } else {
+                            any_denied = true;
+                            denied_ids.insert(object_id);
+                        }
+                    }
+                    if !any_denied {
+                        return Some(tuple);
+                    }
+                    // A row allowed on any contributing branch is served; only
+                    // rows denied on every branch they contributed from prune.
+                    denied_ids.retain(|id| !allowed_ids.contains(id));
+
+                    // Every identity row must be readable — its data cannot
+                    // be clipped out of the served row.
+                    if tuple.id_iter().any(|id| !allowed_ids.contains(&id)) {
+                        return None;
+                    }
+                    if denied_ids.is_empty() {
+                        return Some(tuple);
+                    }
+                    // Fail closed: a tuple whose denied elements cannot be
+                    // pruned is not served at all.
+                    Self::tuple_with_denied_includes_pruned(graph, &tuple, &denied_ids)
                 })
                 .collect(),
         )
+    }
+
+    /// Rebuild `tuple` with every include element whose row the session may
+    /// not read pruned out of its array (and a denied singular ref nulled),
+    /// dropping the pruned rows from the tuple's provenance. Returns `None`
+    /// when the tuple cannot be rebuilt — callers drop it, failing closed.
+    fn tuple_with_denied_includes_pruned(
+        graph: &super::graph::QueryGraph,
+        tuple: &super::types::Tuple,
+        denied_ids: &HashSet<ObjectId>,
+    ) -> Option<super::types::Tuple> {
+        use super::encoding::{decode_row, encode_row};
+        let flattened;
+        let single = if tuple.len() == 1 {
+            tuple
+        } else {
+            flattened = tuple
+                .flatten_with_descriptors(&graph.table_descriptors, &graph.combined_descriptor)?;
+            &flattened
+        };
+        let row = single.to_single_row()?;
+        let mut values = decode_row(&graph.combined_descriptor, &row.data).ok()?;
+        for value in values.iter_mut() {
+            Self::prune_denied_value(value, denied_ids);
+        }
+        let content = encode_row(&graph.combined_descriptor, &values).ok()?;
+        let provenance: super::types::TupleProvenance = tuple
+            .provenance()
+            .iter()
+            .copied()
+            .filter(|(object_id, _)| !denied_ids.contains(object_id))
+            .collect();
+        Some(super::types::Tuple::new_with_shadow_state(
+            vec![super::types::TupleElement::Row {
+                id: row.id,
+                content: content.into(),
+                batch_id: row.batch_id,
+                row_provenance: row.provenance.clone(),
+            }],
+            provenance,
+            tuple.batch_provenance().clone(),
+        ))
+    }
+
+    /// Remove denied include elements from a decoded value tree: a denied
+    /// element of an include array is dropped, a denied singular ref becomes
+    /// NULL, and the subtree inside a pruned element disappears with it.
+    fn prune_denied_value(value: &mut Value, denied_ids: &HashSet<ObjectId>) {
+        if let Value::Row { id: Some(id), .. } = value
+            && denied_ids.contains(id)
+        {
+            *value = Value::Null;
+            return;
+        }
+        match value {
+            Value::Array(elements) => {
+                elements.retain(|element| {
+                    !matches!(element, Value::Row { id: Some(id), .. } if denied_ids.contains(id))
+                });
+                for element in elements.iter_mut() {
+                    Self::prune_denied_value(element, denied_ids);
+                }
+            }
+            Value::Row { values, .. } => {
+                for inner in values.iter_mut() {
+                    Self::prune_denied_value(inner, denied_ids);
+                }
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn authorized_tuples_from_graph_with_cache(
@@ -860,35 +1021,48 @@ impl QueryManager {
             return Some(graph.sync_scope_object_ids());
         }
 
+        let universe = ReadPolicyBranchUniverse::from_authorization_context(&auth_context);
         let mut authorization_cache: HashMap<(ObjectId, BranchName), bool> = HashMap::new();
 
+        // Policy clips at its own level (defect 24): a tuple stays in scope
+        // when its IDENTITY rows (outer row and join legs) are readable — a
+        // denied nested include row leaves only itself out of the synced
+        // scope, not the ancestors carrying it.
         let authorized_scope_tuples = graph.filtered_sync_scope_tuples(|tuple| {
-            tuple
-                .provenance()
-                .iter()
-                .copied()
-                .all(|(object_id, branch_name)| {
-                    *authorization_cache
-                        .entry((object_id, branch_name))
-                        .or_insert_with(|| {
-                            self.provenance_row_matches_current_select_policy(
-                                storage,
-                                settlement_eval_cache,
-                                object_id,
-                                branch_name,
-                                session,
-                                &auth_schema,
-                                &auth_context,
-                                source_branch_schema_map,
-                            )
-                        })
-                })
+            let mut allowed_ids: HashSet<ObjectId> = HashSet::new();
+            for (object_id, branch_name) in tuple.provenance().iter().copied() {
+                let verdict = *authorization_cache
+                    .entry((object_id, branch_name))
+                    .or_insert_with(|| {
+                        self.provenance_row_matches_current_select_policy(
+                            storage,
+                            settlement_eval_cache,
+                            object_id,
+                            branch_name,
+                            session,
+                            &auth_schema,
+                            &auth_context,
+                            source_branch_schema_map,
+                            &universe,
+                        )
+                    });
+                if verdict {
+                    allowed_ids.insert(object_id);
+                }
+            }
+            !tuple.is_empty() && tuple.id_iter().all(|id| allowed_ids.contains(&id))
         });
 
         Some(
             authorized_scope_tuples
                 .into_iter()
                 .flat_map(|tuple| tuple.provenance().clone().into_iter())
+                .filter(|(object_id, branch_name)| {
+                    authorization_cache
+                        .get(&(*object_id, *branch_name))
+                        .copied()
+                        .unwrap_or(false)
+                })
                 .collect(),
         )
     }
@@ -2039,6 +2213,7 @@ impl QueryManager {
                     Operation::Delete => check.old_content_schema_hash,
                     _ => None,
                 },
+                policy_branches: None,
             },
         ) {
             let reason = format!(
@@ -2181,6 +2356,7 @@ impl QueryManager {
                     operation: Operation::Update,
                     settlement_eval_cache: None,
                     content_schema_hash: check.old_content_schema_hash,
+                    policy_branches: None,
                 },
             ) {
                 let reason = format!(
@@ -2234,6 +2410,7 @@ impl QueryManager {
                     operation: Operation::Update,
                     settlement_eval_cache: None,
                     content_schema_hash: None,
+                    policy_branches: None,
                 },
             ) {
                 let reason = format!(

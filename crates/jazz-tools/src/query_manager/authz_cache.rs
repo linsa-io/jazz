@@ -37,6 +37,11 @@ pub(super) struct AuthzMarker {
     /// without changing the data-schema hash, so the hash alone under-invalidates.
     pub auth_generation: u64,
     pub mode: RowPolicyMode,
+    /// Fingerprint of the sanctioned branch universe read-path policy arms
+    /// evaluate against (defect 24). Activating another generation of the
+    /// family changes what a readReferencing/EXISTS arm can see, so verdicts
+    /// computed under a different universe must not be served.
+    pub branch_universe: u64,
 }
 
 /// Cheap owned identity of a session for keying verdicts. Sessions are value objects
@@ -483,6 +488,7 @@ mod tests {
             schema_hash: SchemaHash::compute(&schema),
             auth_generation: 7,
             mode: RowPolicyMode::Enforcing,
+            branch_universe: 0,
         };
         let session = AuthzSessionKey::for_session(None);
         let branch = BranchName::new("main");
@@ -535,6 +541,7 @@ mod tests {
             schema_hash: SchemaHash::compute(&schema),
             auth_generation: 7,
             mode: RowPolicyMode::Enforcing,
+            branch_universe: 0,
         };
         let session = AuthzSessionKey::for_session(None);
         let branch = BranchName::new("main");
@@ -555,6 +562,7 @@ mod tests {
             schema_hash: marker.schema_hash,
             auth_generation: marker.auth_generation,
             mode: RowPolicyMode::PermissiveLocal,
+            branch_universe: marker.branch_universe,
         };
         assert_eq!(cache.get(other_marker, row, branch, session), None);
     }
