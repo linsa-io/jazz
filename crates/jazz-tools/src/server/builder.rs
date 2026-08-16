@@ -243,8 +243,19 @@ impl ServerBuilder {
                 Ok(schema_manager)
             }
             ServerSchemaMode::Fixed(schema) => {
-                SchemaManager::new(sync_manager, schema.clone(), self.app_id, "prod", "main")
-                    .map_err(|e| format!("failed to initialize schema manager: {e:?}"))
+                // Fixed pins the CURRENT schema; it does not mean "ignore what
+                // the store already records". A server built this way over a
+                // store spanning a migration must still read its catalogue, or
+                // its branch universe holds only the pinned generation and every
+                // row written under an earlier one is unreadable at every
+                // durability tier — the same hole the Dynamic arm above closes,
+                // and the one jazz-napi shipped to production.
+                let mut schema_manager =
+                    SchemaManager::new(sync_manager, schema.clone(), self.app_id, "prod", "main")
+                        .map_err(|e| format!("failed to initialize schema manager: {e:?}"))?;
+                rehydrate_schema_manager_from_catalogue(&mut schema_manager, storage, self.app_id)
+                    .map_err(|e| format!("failed to rehydrate schema manager: {e}"))?;
+                Ok(schema_manager)
             }
         }
     }

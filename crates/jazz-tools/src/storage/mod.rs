@@ -2254,6 +2254,35 @@ fn mark_visible_family_sweep_current<H: Storage + ?Sized>(
     storage.raw_table_put(VISIBLE_FAMILY_SWEEP_TABLE, table, generation_set.as_bytes())
 }
 
+/// Every schema generation this store holds a VISIBLE region for, sorted.
+///
+/// The universe a runtime actually reads is derived from the schema manager's
+/// `live_schemas` (`SchemaContext::all_branch_names`,
+/// schema_manager/context.rs:212) — never from the store. When the store holds
+/// a generation the manager never learned, that generation's rows are indexed,
+/// persisted, and unreachable at every durability tier. This is the store half
+/// of that comparison; `RuntimeCore::unknown_store_schema_generations` is the
+/// difference.
+///
+/// One header-prefix scan, the same one the split-family sweep already opens
+/// with — no per-row work.
+pub fn visible_schema_generations<H: Storage + ?Sized>(
+    storage: &H,
+) -> Result<Vec<SchemaHash>, StorageError> {
+    let mut generations = Vec::new();
+    for (raw_table_name, _) in storage.raw_table_scan_prefix(
+        RAW_TABLE_HEADER_TABLE,
+        &row_raw_table_header_kind_prefix(RowRawTableKind::Visible),
+    )? {
+        let row_raw_table_id = RowRawTableId::parse_raw_table_name(&raw_table_name)?;
+        if !generations.contains(&row_raw_table_id.schema_hash) {
+            generations.push(row_raw_table_id.schema_hash);
+        }
+    }
+    generations.sort_by_key(|schema_hash| schema_hash.0);
+    Ok(generations)
+}
+
 /// [`repair_split_visible_row_families`] over every logical table the store
 /// holds a visible region for. This is the startup entry point.
 pub fn repair_all_split_visible_row_families<H: Storage + ?Sized>(
@@ -4608,6 +4637,583 @@ mod store_probe {
                 println!("{name}: entries_for_row={count} newest_stamp_us={newest}");
             }
         }
+    }
+
+    /// The rpc-server's membership check, replayed against a copy of its own
+    /// replica: which predicate makes it come back empty. Env: JAZZ_PROBE_PATH,
+    /// JAZZ_PROBE_APP_ID, JAZZ_PROBE_SCHEMA_HASH, JAZZ_PROBE_ROW_ID (userId),
+    /// JAZZ_PROBE_CHAT_ID.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn probe_rpc_membership_query() {
+        use crate::query_manager::types::Schema;
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch =
+            std::env::temp_dir().join(format!("jazz-rpc-probe-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the replica for the probe");
+        let mut storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
+
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let hash_hex = std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+        let user_id = std::env::var("JAZZ_PROBE_ROW_ID").expect("set JAZZ_PROBE_ROW_ID");
+        let chat_id = std::env::var("JAZZ_PROBE_CHAT_ID").expect("set JAZZ_PROBE_CHAT_ID");
+
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target = crate::query_manager::types::SchemaHash::from_hex(&hash_hex)
+            .expect("valid schema hash");
+        let current = extractor
+            .context()
+            .live_schemas
+            .get(&target)
+            .or_else(|| extractor.context().pending_schemas.get(&target))
+            .cloned()
+            .expect("schema in catalogue");
+
+        let mut sm = SchemaManager::new(SyncManager::new(), current, app_id, "dev", "main")
+            .expect("phase-2 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(&mut sm, &storage, app_id)
+            .expect("phase-2 rehydrate");
+        let qm = sm.query_manager_mut();
+        println!("branches: {:?}", qm.all_query_branches());
+
+        let run = |qm: &mut crate::query_manager::manager::QueryManager,
+                   storage: &mut SqliteStorage,
+                   label: &str,
+                   query: crate::query_manager::query::Query| {
+            let sub = qm.subscribe(query).expect("subscribe");
+            qm.process(storage);
+            println!("{label}: {} rows", qm.get_subscription_results(sub).len());
+        };
+
+        run(
+            qm,
+            &mut storage,
+            "all chat_members",
+            qm.query("chat_members").build(),
+        );
+        run(
+            qm,
+            &mut storage,
+            "userId only",
+            qm.query("chat_members")
+                .filter_eq("userId", Value::Text(user_id.clone()))
+                .build(),
+        );
+        run(
+            qm,
+            &mut storage,
+            "userId + chatId",
+            qm.query("chat_members")
+                .filter_eq("userId", Value::Text(user_id.clone()))
+                .filter_eq("chatId", Value::Text(chat_id.clone()))
+                .build(),
+        );
+        // As the BACKEND principal — the session the rpc-server's facade uses.
+        for table in ["chat_members", "apple_identities", "unique_names", "users"] {
+            let session = crate::query_manager::session::Session::new("jazz:system");
+            let query = qm.query(table).build();
+            let sub = qm
+                .subscribe_with_session(query, Some(session), None)
+                .expect("backend-session subscribe");
+            qm.process(&mut storage);
+            println!(
+                "AS jazz:system, {table}: {} rows",
+                qm.get_subscription_results(sub).len()
+            );
+            let sub_none = qm
+                .subscribe(qm.query(table).build())
+                .expect("no-session subscribe");
+            qm.process(&mut storage);
+            println!(
+                "   no session,  {table}: {} rows",
+                qm.get_subscription_results(sub_none).len()
+            );
+        }
+
+        // The same check, but SESSION-SCOPED — the shape a policied runtime uses.
+        {
+            let session = crate::query_manager::session::Session::new(&user_id);
+            let query = qm
+                .query("chat_members")
+                .filter_eq("userId", Value::Text(user_id.clone()))
+                .filter_eq("chatId", Value::Text(chat_id.clone()))
+                .filter_eq("isBanned", Value::Boolean(false))
+                .build();
+            let sub = qm
+                .subscribe_with_session(query, Some(session), None)
+                .expect("session subscribe");
+            qm.process(&mut storage);
+            println!(
+                "WITH SESSION, the rpc's own check: {} rows",
+                qm.get_subscription_results(sub).len()
+            );
+        }
+        println!(
+            "permissions head present in this replica: {:?}",
+            sm.current_permissions().map(|p| p.head.version)
+        );
+        let qm = sm.query_manager_mut();
+
+        run(
+            qm,
+            &mut storage,
+            "userId + chatId + isBanned=false (the rpc's own check)",
+            qm.query("chat_members")
+                .filter_eq("userId", Value::Text(user_id))
+                .filter_eq("chatId", Value::Text(chat_id))
+                .filter_eq("isBanned", Value::Boolean(false))
+                .build(),
+        );
+    }
+
+    /// The same replayed membership check, but run at each DURABILITY TIER —
+    /// the only thing the live rpc-server adds over `probe_rpc_membership_query`
+    /// on the LOCAL path. Also dumps, per membership row, the stored
+    /// `confirmed_tier` and the authoritative batch fate the tier gate consults,
+    /// so "the tier gate hides it" can be told apart from "the row is absent".
+    /// Env: JAZZ_PROBE_PATH, JAZZ_PROBE_APP_ID, JAZZ_PROBE_SCHEMA_HASH,
+    /// JAZZ_PROBE_ROW_ID (userId), JAZZ_PROBE_CHAT_ID.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn probe_rpc_membership_tiered() {
+        use crate::query_manager::types::Schema;
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch =
+            std::env::temp_dir().join(format!("jazz-rpc-tier-probe-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the replica for the probe");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
+        let mut storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
+
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let hash_hex = std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+        let user_id = std::env::var("JAZZ_PROBE_ROW_ID").expect("set JAZZ_PROBE_ROW_ID");
+        let chat_id = std::env::var("JAZZ_PROBE_CHAT_ID").expect("set JAZZ_PROBE_CHAT_ID");
+
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target = crate::query_manager::types::SchemaHash::from_hex(&hash_hex)
+            .expect("valid schema hash");
+        let current = extractor
+            .context()
+            .live_schemas
+            .get(&target)
+            .or_else(|| extractor.context().pending_schemas.get(&target))
+            .cloned()
+            .expect("schema in catalogue");
+
+        let mut sm = SchemaManager::new(SyncManager::new(), current, app_id, "dev", "main")
+            .expect("phase-2 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(&mut sm, &storage, app_id)
+            .expect("phase-2 rehydrate");
+        let qm = sm.query_manager_mut();
+        let branches = qm.all_query_branches();
+        println!("branches: {branches:?}");
+
+        // Per-row tier forensics straight off the store.
+        for branch in &branches {
+            let rows = match storage.scan_visible_region("chat_members", branch) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    println!("scan {branch}: error {error}");
+                    continue;
+                }
+            };
+            println!("branch {branch}: {} visible chat_members rows", rows.len());
+            for row in &rows {
+                let fate = storage
+                    .load_authoritative_batch_fate(row.batch_id)
+                    .expect("load authoritative batch fate");
+                let effective = row_confirmed_tier_with_batch_fate(&storage, row)
+                    .expect("effective confirmed tier");
+                println!(
+                    "  row={} batch={:?} state={:?} stored_tier={:?} fate={:?} effective_tier={:?}",
+                    row.row_id,
+                    row.batch_id,
+                    row.state,
+                    row.confirmed_tier,
+                    fate.as_ref().map(|fate| format!("{fate:?}")),
+                    effective,
+                );
+                for tier in [
+                    DurabilityTier::Local,
+                    DurabilityTier::EdgeServer,
+                    DurabilityTier::GlobalServer,
+                ] {
+                    let served = storage
+                        .load_visible_query_row_for_tier("chat_members", branch, row.row_id, tier)
+                        .expect("tiered point read");
+                    println!(
+                        "    point read tier={tier:?} -> served={}",
+                        served.is_some()
+                    );
+                }
+            }
+        }
+
+        // The rpc's own predicate, once per tier the facade can ask for.
+        for tier in [
+            None,
+            Some(DurabilityTier::Local),
+            Some(DurabilityTier::EdgeServer),
+            Some(DurabilityTier::GlobalServer),
+        ] {
+            let session = crate::query_manager::session::Session::new(&user_id);
+            let query = qm
+                .query("chat_members")
+                .filter_eq("userId", Value::Text(user_id.clone()))
+                .filter_eq("chatId", Value::Text(chat_id.clone()))
+                .filter_eq("isBanned", Value::Boolean(false))
+                .build();
+            let sub = qm
+                .subscribe_with_session(query, Some(session), tier)
+                .expect("session subscribe");
+            qm.process(&mut storage);
+            println!(
+                "rpc check tier={tier:?} -> {} rows",
+                qm.get_subscription_results(sub).len()
+            );
+        }
+
+        // Which GENERATION actually holds the membership row: the same check
+        // pinned to one branch at a time. A hit only on the old branch means a
+        // reader restricted to the current generation answers "not a member".
+        for branch in &branches {
+            let query = qm
+                .query("chat_members")
+                .branch(branch.as_str())
+                .filter_eq("userId", Value::Text(user_id.clone()))
+                .filter_eq("chatId", Value::Text(chat_id.clone()))
+                .filter_eq("isBanned", Value::Boolean(false))
+                .build();
+            let sub = qm.subscribe(query).expect("branch-pinned subscribe");
+            qm.process(&mut storage);
+            let results = qm.get_subscription_results(sub);
+            println!(
+                "rpc check pinned to branch {branch} -> {} rows {:?}",
+                results.len(),
+                results
+                    .iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Store census: for every table named in JAZZ_PROBE_TABLES (comma
+    /// separated), print the raw-table families that hold it, the visible row
+    /// count per branch, and the count a plain no-session query serves. Run it
+    /// against a copy of the rpc replica AND a copy of the sync server's store
+    /// to see which side is missing what. Env: JAZZ_PROBE_PATH,
+    /// JAZZ_PROBE_APP_ID, JAZZ_PROBE_SCHEMA_HASH, JAZZ_PROBE_TABLES.
+    fn probe_table_census<S: Storage>(mut storage: S) {
+        use crate::query_manager::types::Schema;
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let hash_hex = std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+        let tables = std::env::var("JAZZ_PROBE_TABLES").expect("set JAZZ_PROBE_TABLES");
+
+        for (name, _header) in storage
+            .scan_raw_table_headers()
+            .expect("scan raw table headers")
+        {
+            if name.contains("rowtable") {
+                println!("raw family: {name}");
+            }
+        }
+
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target = crate::query_manager::types::SchemaHash::from_hex(&hash_hex)
+            .expect("valid schema hash");
+        let current = extractor
+            .context()
+            .live_schemas
+            .get(&target)
+            .or_else(|| extractor.context().pending_schemas.get(&target))
+            .cloned()
+            .expect("schema in catalogue");
+
+        // JAZZ_PROBE_NO_REHYDRATE=1 reproduces the boot shape jazz-napi had
+        // before crates/jazz-napi/src/lib.rs:624: `SchemaManager::new*` over the
+        // DECLARED schema and no catalogue rehydrate, versus
+        // jazz-rn/rust/src/lib.rs:734, jazz-wasm/src/runtime.rs:1364,
+        // jazz-tools/src/client.rs:127 and server/builder.rs:236, which all do.
+        let skip_rehydrate = std::env::var("JAZZ_PROBE_NO_REHYDRATE").is_ok();
+        let mut sm = SchemaManager::new(SyncManager::new(), current, app_id, "dev", "main")
+            .expect("phase-2 schema manager");
+        if skip_rehydrate {
+            println!("phase-2: NO catalogue rehydrate (jazz-napi boot shape)");
+        } else {
+            crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+                &mut sm, &storage, app_id,
+            )
+            .expect("phase-2 rehydrate");
+        }
+        println!(
+            "permissions head: {:?}",
+            sm.current_permissions().map(|p| p.head.version)
+        );
+        let qm = sm.query_manager_mut();
+        let branches = qm.all_query_branches();
+        println!("branches: {branches:?}");
+
+        for table in tables.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let mut per_branch = Vec::new();
+            for branch in &branches {
+                let count = storage
+                    .scan_visible_region(table, branch)
+                    .map(|rows| rows.len() as i64)
+                    .unwrap_or(-1);
+                per_branch.push(format!("{branch}={count}"));
+            }
+            let sub = qm
+                .subscribe(qm.query(table).build())
+                .expect("subscribe to table");
+            qm.process(&mut storage);
+            let served = qm.get_subscription_results(sub).len();
+            println!(
+                "table {table}: query_serves={served} visible_per_branch=[{}]",
+                per_branch.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_table_census_rocksdb() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+        probe_table_census(storage);
+    }
+
+    /// How much of the store is the SAME row id on two generations' branches,
+    /// and how much of that disagrees.
+    ///
+    /// The honest size of the surprise when a runtime's universe widens from one
+    /// branch to two. A blind server's `upsert` could not find a row on the only
+    /// branch it could see, so it fell through to `insert` with the same object
+    /// id on the CURRENT branch — leaving one row id with a visible head under
+    /// both generations. Widening makes both visible; the union collapses them
+    /// by id and the newest wins, so the row served is right. What this measures
+    /// is how often the loser DISAGREES with the winner, and how often the older
+    /// copy would win — the two numbers worth knowing before shipping.
+    ///
+    /// Env: JAZZ_PROBE_PATH, JAZZ_PROBE_APP_ID, JAZZ_PROBE_SCHEMA_HASH,
+    /// JAZZ_PROBE_TABLES.
+    fn probe_cross_branch_duplicates<S: Storage>(storage: S) {
+        use crate::query_manager::types::Schema;
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let hash_hex = std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+        let tables = std::env::var("JAZZ_PROBE_TABLES").expect("set JAZZ_PROBE_TABLES");
+
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target = crate::query_manager::types::SchemaHash::from_hex(&hash_hex)
+            .expect("valid schema hash");
+        let current = extractor
+            .context()
+            .live_schemas
+            .get(&target)
+            .or_else(|| extractor.context().pending_schemas.get(&target))
+            .cloned()
+            .expect("schema in catalogue");
+
+        let mut sm = SchemaManager::new(SyncManager::new(), current, app_id, "dev", "main")
+            .expect("phase-2 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(&mut sm, &storage, app_id)
+            .expect("phase-2 rehydrate");
+        let branches = sm.query_manager_mut().all_query_branches();
+        println!("branches: {branches:?}");
+        if branches.len() < 2 {
+            println!("single-generation store — nothing to cross-check");
+            return;
+        }
+
+        let mut total_shared = 0usize;
+        let mut total_disagreeing = 0usize;
+        let mut total_older_wins = 0usize;
+        for table in tables.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            // Mirror the resolver exactly, or the answer is about a different
+            // question than the one being asked. `load_best_visible_row_batch_from_storage_with_locator`
+            // (query_manager/manager.rs:2804-2817) skips non-visible heads and
+            // compares the TUPLE `(updated_at, batch_id)` — dropping either would
+            // both under- and over-count which copy actually gets served.
+            let per_branch: Vec<HashMap<ObjectId, (u64, BatchId, Vec<u8>)>> = branches
+                .iter()
+                .map(|branch| {
+                    storage
+                        .scan_visible_region(table, branch)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|row| row.state.is_visible())
+                        .map(|row| {
+                            (
+                                row.row_id,
+                                (row.updated_at, row.batch_id, row.data.to_vec()),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let (current_branch, older_branches) = per_branch.split_first().expect("two branches");
+            let mut shared = 0usize;
+            let mut disagreeing = 0usize;
+            let mut older_wins = 0usize;
+            let mut only_older = 0usize;
+            for older in older_branches {
+                for (row_id, (older_updated_at, older_batch_id, older_content)) in older {
+                    let Some((current_updated_at, current_batch_id, current_content)) =
+                        current_branch.get(row_id)
+                    else {
+                        only_older += 1;
+                        continue;
+                    };
+                    shared += 1;
+                    // NOTE: `data` is encoded under each generation's own row
+                    // descriptor. For an identity crossing — every shared table
+                    // byte-identical, which is what lets the older generation
+                    // activate at all — the encodings are comparable. Under a
+                    // lens crossing they are not, and this count would be noise.
+                    if older_content != current_content {
+                        disagreeing += 1;
+                    }
+                    if (*older_updated_at, *older_batch_id)
+                        > (*current_updated_at, *current_batch_id)
+                    {
+                        older_wins += 1;
+                    }
+                }
+            }
+            total_shared += shared;
+            total_disagreeing += disagreeing;
+            total_older_wins += older_wins;
+            println!(
+                "table {table}: current_only={} older_only={only_older} shared={shared} \
+                 disagreeing={disagreeing} older_would_win={older_wins}",
+                current_branch.len() - shared
+            );
+        }
+        println!(
+            "TOTAL shared={total_shared} disagreeing={total_disagreeing} \
+             older_would_win={total_older_wins}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn probe_cross_branch_duplicates_sqlite() {
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch = std::env::temp_dir().join(format!(
+            "jazz-duplicates-probe-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the replica for the probe");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                let to = scratch.with_file_name(format!(
+                    "{}{sidecar}",
+                    scratch.file_name().unwrap().to_string_lossy()
+                ));
+                std::fs::copy(&from, &to).expect("copy sidecar");
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the copied replica");
+        probe_cross_branch_duplicates(storage);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn probe_table_census_sqlite() {
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch =
+            std::env::temp_dir().join(format!("jazz-census-probe-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the replica for the probe");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
+        probe_table_census(storage);
     }
 
     /// Presence forensics: print every `users` row's `onlineTimeUpdatedAtMs`

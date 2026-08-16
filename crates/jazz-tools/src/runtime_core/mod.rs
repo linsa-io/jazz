@@ -318,6 +318,10 @@ pub struct RuntimeCore<S: Storage, Sch: Scheduler> {
     storage_flush_retry_scheduled: bool,
     /// Last storage flush error recorded by a durability barrier.
     storage_flush_error: Option<StorageError>,
+    /// Schema generations this store holds visible rows under that the schema
+    /// manager did not know at construction — see
+    /// [`RuntimeCore::unknown_store_schema_generations`].
+    unknown_store_schema_generations: Vec<SchemaHash>,
     /// Transport handle for WebSocket sync.
     pub(crate) transport: Option<crate::transport_manager::TransportHandle>,
     /// True when an inbound catalogue sync changed local catalogue state and
@@ -460,6 +464,148 @@ fn recover_pending_mutation_error_events<S: Storage>(
     events
 }
 
+/// Schema generations the store holds visible rows under that this schema
+/// manager cannot enumerate — see
+/// [`RuntimeCore::unknown_store_schema_generations`].
+///
+/// Reading the catalogue before construction is a per-binding obligation
+/// (`rehydrate_schema_manager_from_catalogue`), honoured by jazz-rn, jazz-wasm,
+/// the tokio client and the server builder, and — until this was written — not
+/// by jazz-napi. Nothing failed when it was skipped: the runtime came up, every
+/// read succeeded, and it simply answered "no such row" for everything written
+/// before the last migration. This is what makes the next omission audible.
+fn detect_unknown_store_schema_generations<S: Storage>(
+    storage: &S,
+    schema_manager: &SchemaManager,
+) -> Vec<SchemaHash> {
+    let stored = match crate::storage::visible_schema_generations(storage) {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "could not enumerate the store's schema generations; skipping the \
+                 branch-universe coverage check"
+            );
+            return Vec::new();
+        }
+    };
+
+    // A server-mode manager has no current schema at all: its context is
+    // `SchemaContext::empty()` (`SchemaManager::new_server`), and
+    // `process_catalogue_schema` files learned generations only in
+    // `known_schemas` while `is_initialized` is false. Its universe is not
+    // derived from `live_schemas` the way a client's is, so comparing against
+    // `live_schemas` would report EVERY generation as missing — an ERROR on
+    // every sync-server boot, accusing the one binding that does call the
+    // rehydrate. There is nothing to diagnose here.
+    if !schema_manager.has_current_schema() {
+        return Vec::new();
+    }
+
+    let context = schema_manager.context();
+    let unknown: Vec<SchemaHash> = stored
+        .into_iter()
+        // Against `live_schemas`, NOT `is_schema_known`: the branch universe is
+        // current + live (`all_branch_names`), and a generation parked in
+        // `pending_schemas` is also in `known_schemas` — treating "known" as
+        // covered would make the unactivatable case below unreachable while its
+        // rows stay just as unreadable.
+        .filter(|schema_hash| {
+            *schema_hash != context.current_hash && !context.live_schemas.contains_key(schema_hash)
+        })
+        .collect();
+
+    // Four different faults land here and their remedies have nothing in
+    // common, so name the one that actually applies rather than blaming the
+    // binding for all of them.
+    let mut unread = Vec::new();
+    let mut unactivatable = Vec::new();
+    let mut schemaless = Vec::new();
+    let mut foreign_app = Vec::new();
+    for schema_hash in &unknown {
+        let rendered = schema_hash.to_string();
+        let stored_entry = storage
+            .load_catalogue_entry(schema_hash.to_object_id())
+            .ok()
+            .flatten();
+        let entry_app_id = stored_entry.as_ref().and_then(|entry| {
+            entry
+                .metadata
+                .get(crate::metadata::MetadataKey::AppId.as_str())
+                .cloned()
+        });
+        if entry_app_id
+            .as_deref()
+            .is_some_and(|app_id| app_id != schema_manager.app_id().uuid().to_string())
+        {
+            // The entry is on disk under a DIFFERENT app id, so the rehydrate
+            // filtered it out (`entry_matches_app`) and returned Ok having
+            // matched nothing. The binding is fine; the app id it was handed is
+            // not the one the store was written under.
+            foreign_app.push(rendered);
+        } else if context.pending_schemas.contains_key(schema_hash) {
+            // The catalogue was read and holds this generation, but nothing
+            // activates it: no non-draft lens path, and not identity-compatible
+            // with the current schema (`SchemaContext::try_activate_pending`).
+            unactivatable.push(rendered);
+        } else if stored_entry.is_some() {
+            // The entry is right there on disk, under this app id, and the
+            // manager knows nothing about it — the catalogue was not read, or a
+            // per-entry decode failed inside the rehydrate (which warns and
+            // continues). This is the jazz-napi shape that blinded the
+            // rpc-server.
+            unread.push(rendered);
+        } else {
+            // Rows for a generation whose schema never arrived: inbound batches
+            // are applied to the branch named on the wire, so a peer can create
+            // a visible family here for a schema this store has no entry for.
+            schemaless.push(rendered);
+        }
+    }
+
+    if !foreign_app.is_empty() {
+        tracing::error!(
+            generations = ?foreign_app,
+            app_id = %schema_manager.app_id(),
+            "this store holds visible rows under schema generations whose catalogue entries \
+             carry a DIFFERENT app id, so the catalogue read matched nothing and returned \
+             successfully. Check the app id this runtime was constructed with against the one \
+             the store was written under — not the binding's rehydrate call."
+        );
+    }
+    if !unread.is_empty() {
+        tracing::error!(
+            generations = ?unread,
+            current_generation = %context.current_hash,
+            "this store's own catalogue records schema generations this runtime did not \
+             load; every row under them is unreadable at every durability tier. Either the \
+             binding skipped rehydrate_schema_manager_from_catalogue before constructing the \
+             runtime, or the rehydrate failed to decode these entries (it warns and continues)."
+        );
+    }
+    if !unactivatable.is_empty() {
+        tracing::warn!(
+            generations = ?unactivatable,
+            current_generation = %context.current_hash,
+            "this store holds visible rows under schema generations that were read from the \
+             catalogue but cannot be activated — no lens path to the current schema and not \
+             identity-compatible with it. Their rows stay unreadable until a lens is \
+             published; this clears itself if one arrives over sync."
+        );
+    }
+    if !schemaless.is_empty() {
+        tracing::warn!(
+            generations = ?schemaless,
+            current_generation = %context.current_hash,
+            "this store holds visible rows under schema generations it has no catalogue entry \
+             for at all — rows arrived over sync ahead of their schema. Their rows stay \
+             unreadable until the catalogue entry arrives."
+        );
+    }
+
+    unknown
+}
+
 fn should_recover_pending_mutation_error_events(schema_manager: &SchemaManager) -> bool {
     schema_manager
         .query_manager()
@@ -496,6 +642,8 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                  may still serve a stale head for a split row"
             ),
         }
+        let unknown_store_schema_generations =
+            detect_unknown_store_schema_generations(&storage, &schema_manager);
         let acknowledged_rejected_batches: HashSet<BatchId> = storage
             .scan_acknowledged_rejected_batch_fates()
             .map(|batch_ids| batch_ids.into_iter().collect())
@@ -514,6 +662,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             storage_write_pending_flush: false,
             storage_flush_retry_scheduled: false,
             storage_flush_error: None,
+            unknown_store_schema_generations,
             transport: None,
             transport_catalogue_state_hash_dirty: false,
             sync_sender: None,
@@ -632,6 +781,28 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     /// Get reference to the Storage.
     pub fn storage(&self) -> &S {
         &self.storage
+    }
+
+    /// Schema generations this store held visible rows under that the schema
+    /// manager did not know **at construction time**.
+    ///
+    /// A BOOT SNAPSHOT, not a live query: it is computed once in
+    /// [`RuntimeCore::new`] and never revised, so a generation that activates
+    /// later — a lens arriving over sync — stays listed here. Read it as "what
+    /// this runtime came up unable to enumerate", which is the question worth
+    /// asking, because that is when a binding's omission is diagnosable.
+    ///
+    /// Non-empty means every row written under those generations was unreadable
+    /// at startup — the branch universe comes from `live_schemas`
+    /// (`SchemaContext::all_branch_names`, schema_manager/context.rs:212), and a
+    /// durability tier cannot rescue a row outside it (the scope filter only
+    /// ever REMOVES tuples, `QueryManager::filter_synced_query_scope_tuples`).
+    ///
+    /// The four causes are distinguished in the logs
+    /// (`detect_unknown_store_schema_generations`), not here — this list does
+    /// not say WHY, only that coverage was incomplete.
+    pub fn unknown_store_schema_generations(&self) -> &[SchemaHash] {
+        &self.unknown_store_schema_generations
     }
 
     /// Flush the storage to persistent medium.

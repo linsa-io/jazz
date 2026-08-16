@@ -739,6 +739,14 @@ impl QueryManager {
         self.authz_verdicts.hit_count()
     }
 
+    /// How many times the authorization schema has been replaced. Each bump
+    /// clears the authorization cache and marks EVERY subscription for
+    /// recompilation, so this counter is the cost signal for a redundant
+    /// permissions-head apply. Exposed for tests and diagnostics.
+    pub fn authz_schema_generation(&self) -> u64 {
+        self.authz_schema_generation
+    }
+
     pub fn set_authorization_schema(&mut self, schema: Schema) {
         self.authorization_schema = Some(Arc::new(schema));
         self.authz_schema_generation += 1;

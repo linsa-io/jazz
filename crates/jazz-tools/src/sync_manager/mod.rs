@@ -232,6 +232,26 @@ pub struct SyncManager {
     pub(super) pending_row_visibility_changes: Vec<RowVisibilityChange>,
     /// Catalogue/system entry updates awaiting SchemaManager processing.
     pub(super) pending_catalogue_updates: Vec<CatalogueEntry>,
+    /// Digest of every catalogue entry this node has already handed to the
+    /// schema layer, keyed by object id.
+    ///
+    /// Deliberately NOT the same question as "does storage hold these bytes"
+    /// (`catalogue_entries` plus the storage fallback, both consulted by
+    /// `persist_catalogue_entry`). Storage is written before a restart; the
+    /// in-memory schema layer is rebuilt after it. Conflating the two is what
+    /// made a generation already on disk unlearnable by a running process — the
+    /// entry came back over the wire byte-identical, "storage unchanged" was the
+    /// answer, and `pending_catalogue_updates` never saw it.
+    ///
+    /// It is also NOT seeded by the connect-replay paths
+    /// (`queue_catalogue_sync_to_client_from_storage`,
+    /// `queue_catalogue_sync_to_server_from_storage`), which populate
+    /// `catalogue_entries` wholesale from storage; seeding it there would
+    /// restore exactly the bug.
+    ///
+    /// Bounded by the number of catalogue objects — schemas, permissions
+    /// bundles, lenses — not by traffic.
+    pub(super) handed_to_schema_layer: HashMap<ObjectId, [u8; 32]>,
 
     pub(super) next_pending_id: u64,
 
@@ -408,6 +428,7 @@ impl SyncManager {
             pending_query_unsubscriptions: Vec::new(),
             pending_row_visibility_changes: Vec::new(),
             pending_catalogue_updates: Vec::new(),
+            handed_to_schema_layer: HashMap::new(),
             next_pending_id: 0,
             my_tiers: HashSet::new(),
             row_batch_interest: HashMap::new(),

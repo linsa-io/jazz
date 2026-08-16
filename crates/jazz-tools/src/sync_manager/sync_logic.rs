@@ -8,6 +8,41 @@ use std::collections::HashMap;
 
 type RowSyncData = (SharedString, HashMap<String, String>, StoredRowBatch);
 
+/// The two independent facts about taking in a catalogue entry.
+///
+/// They used to be one `bool`. That is how a schema generation could sit on
+/// disk and stay unknown to the process running over it: "storage already holds
+/// these bytes" was read as "the schema layer has already been told about
+/// them", and after the first restart following a migration it never was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CatalogueEntryIntake {
+    /// Storage now holds bytes it did not hold before. Gates forwarding onward:
+    /// a restart must not re-broadcast a catalogue nobody changed.
+    pub(super) storage_changed: bool,
+    /// The schema layer has not been handed this exact entry yet. Gates the push
+    /// into `pending_catalogue_updates`.
+    pub(super) needs_schema_layer: bool,
+}
+
+/// Stable digest over everything `CatalogueEntry`'s own equality compares.
+/// Metadata is a `HashMap`, so its keys are sorted before hashing — two nodes
+/// must agree on the digest of identical entries.
+fn catalogue_digest(entry: &CatalogueEntry) -> [u8; 32] {
+    let mut keys: Vec<&String> = entry.metadata.keys().collect();
+    keys.sort();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(entry.object_id.to_string().as_bytes());
+    for key in keys {
+        hasher.update(key.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(entry.metadata[key].as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(&entry.content);
+    *hasher.finalize().as_bytes()
+}
+
 /// Decide whether a stored row is still eligible for upstream row replay.
 ///
 /// A rejected fate is terminal for the row submission, while a missing fate
@@ -152,8 +187,8 @@ impl SyncManager {
     }
 
     pub fn upsert_catalogue_entry<H: Storage>(&mut self, storage: &mut H, entry: CatalogueEntry) {
-        let changed = self.persist_catalogue_entry(storage, entry.clone());
-        if !changed {
+        let intake = self.persist_catalogue_entry(storage, entry.clone());
+        if !intake.storage_changed {
             return;
         }
 
@@ -165,7 +200,10 @@ impl SyncManager {
         &mut self,
         storage: &mut H,
         entry: CatalogueEntry,
-    ) -> bool {
+    ) -> CatalogueEntryIntake {
+        let needs_schema_layer =
+            self.handed_to_schema_layer.get(&entry.object_id) != Some(&catalogue_digest(&entry));
+
         let existing = self
             .catalogue_entries
             .get(&entry.object_id)
@@ -174,7 +212,10 @@ impl SyncManager {
 
         if existing.as_ref() == Some(&entry) {
             self.catalogue_entries.insert(entry.object_id, entry);
-            return false;
+            return CatalogueEntryIntake {
+                storage_changed: false,
+                needs_schema_layer,
+            };
         }
 
         if let Err(error) = storage.upsert_catalogue_entry(&entry) {
@@ -186,7 +227,18 @@ impl SyncManager {
         }
 
         self.catalogue_entries.insert(entry.object_id, entry);
-        true
+        CatalogueEntryIntake {
+            storage_changed: true,
+            needs_schema_layer,
+        }
+    }
+
+    /// Record that this exact entry has been handed to the schema layer, so a
+    /// peer re-offering it on every connect does not re-enter
+    /// `process_catalogue_update` forever.
+    pub(super) fn mark_handed_to_schema_layer(&mut self, entry: &CatalogueEntry) {
+        self.handed_to_schema_layer
+            .insert(entry.object_id, catalogue_digest(entry));
     }
 
     fn queue_catalogue_entry_to_server(&mut self, server_id: ServerId, entry: CatalogueEntry) {

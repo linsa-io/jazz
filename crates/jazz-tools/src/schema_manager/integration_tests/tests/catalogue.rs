@@ -1224,3 +1224,277 @@ fn e2e_server_learns_schema_via_catalogue_sync() {
         "Server should send the note to client after query subscription"
     );
 }
+
+/// A permissions head that arrives again, byte-identical to the one already
+/// applied, must not be applied a second time.
+///
+/// This is not tidiness. `apply_permissions_head` ends in
+/// `QueryManager::set_authorization_schema` (query_manager/manager.rs:750),
+/// which bumps the authz generation, clears the authorization context cache
+/// AND marks EVERY local and server subscription for recompilation
+/// (`mark_subscriptions_for_recompile`, :884). On an rpc-server holding one
+/// subscription per connected device, a redundant apply rebuilds all of their
+/// graphs.
+///
+/// The existing guard rejects only a STRICTLY older head
+/// (`current_head.version > head.version`, `process_catalogue_permissions_head`);
+/// an equal head falls through and re-applies, and the legacy path
+/// (`process_catalogue_permissions_legacy`) has no version guard at all.
+///
+/// That is load-bearing for the cold-boot generation fix: once the catalogue is
+/// re-fed to the schema layer — at boot by
+/// `rehydrate_schema_manager_from_catalogue`, and over the wire once the
+/// SyncManager stops swallowing entries whose bytes it has already persisted —
+/// the same head legitimately arrives more than once, on every peer connect.
+#[test]
+fn catalogue_same_permissions_head_push_is_noop() {
+    let schema = SchemaBuilder::new()
+        .table(
+            TableSchema::builder("users")
+                .column("id", ColumnType::Uuid)
+                .column("name", ColumnType::Text),
+        )
+        .build();
+    let schema_hash = SchemaHash::compute(&schema);
+
+    let mut manager =
+        SchemaManager::new(SyncManager::new(), schema, test_app_id(), "dev", "main").unwrap();
+    let mut storage = MemoryStorage::new();
+
+    manager
+        .publish_permissions_bundle(&mut storage, schema_hash, HashMap::new(), None)
+        .expect("publishing the first permissions bundle should succeed");
+
+    let applied_generation = manager.query_manager().authz_schema_generation();
+    assert!(
+        applied_generation > 0,
+        "publishing a bundle should have applied it"
+    );
+
+    // The exact bytes a peer re-sends on connect: whatever the store holds.
+    let head_object_id = SchemaManager::permissions_head_object_id_for(test_app_id());
+    let head_entry = storage
+        .load_catalogue_entry(head_object_id)
+        .expect("loading the persisted head entry should succeed")
+        .expect("publishing a bundle should have persisted a head entry");
+
+    manager
+        .process_catalogue_update(
+            head_entry.object_id,
+            &head_entry.metadata,
+            &head_entry.content,
+        )
+        .expect("re-processing the persisted head should succeed");
+
+    assert_eq!(
+        manager.query_manager().authz_schema_generation(),
+        applied_generation,
+        "a permissions head identical to the one already applied must not be \
+         re-applied — each apply clears the authorization cache and marks every \
+         subscription for recompilation (query_manager/manager.rs:750-757)",
+    );
+}
+
+/// A generation whose catalogue entry is ALREADY in this node's storage, but
+/// absent from its in-memory schema manager, must still be learned when a peer
+/// re-sends it.
+///
+/// `SyncManager::persist_catalogue_entry` (sync_manager/sync_logic.rs:199-234)
+/// answers exactly one question — "did storage change?" — and that single bool
+/// gates two unrelated things: forwarding the entry onward, and handing it to
+/// the schema layer through `pending_catalogue_updates` (inbox.rs:2027, :2628).
+/// For an entry whose bytes are already on disk the answer is "no", so the
+/// schema layer never sees it, the generation stays unknown to the running
+/// process, its branch never enters the query universe
+/// (`SchemaContext::all_branch_names`, context.rs:212) and every row under it
+/// is unreadable at every durability tier.
+///
+/// MEASURED (rpc-server, 2026-08-16): on every restart after the 2026-08-07
+/// migration the server served only the current generation — users 2 of 22,
+/// chat_members 4 of 11, chats 2 of 4 — and every membership check 403'd.
+///
+/// The connect replay in this fixture is load-bearing, not decoration:
+/// `add_client_with_storage` (sync_manager/mod.rs:771) seeds
+/// `SyncManager::catalogue_entries` from storage wholesale, so by the time the
+/// peer's copy arrives the entry is already in the SyncManager's own map. A fix
+/// that keys on "new to the SyncManager" therefore cures nothing in the
+/// production topology; the question that has to be asked is "has the SCHEMA
+/// LAYER been handed this entry?".
+///
+/// MemoryStorage is adequate here because the assertion is on the branch
+/// universe, a schema-layer fact. Serving rows across generations is pinned
+/// separately, on SqliteStorage, by
+/// runtime_core/tests/cold_boot_generation_universe.rs.
+#[test]
+fn catalogue_entry_already_in_storage_is_still_handed_to_the_schema_layer() {
+    let notes = || {
+        TableSchema::builder("notes")
+            .column("id", ColumnType::Uuid)
+            .column("content", ColumnType::Text)
+    };
+    let v1 = SchemaBuilder::new().table(notes()).build();
+    // Generation B: an added table moves the schema hash and therefore the
+    // composed branch name — the shape of the production migration.
+    let v2 = SchemaBuilder::new()
+        .table(notes())
+        .table(TableSchema::builder("tags").column("label", ColumnType::Text))
+        .build();
+    let v2_hash = SchemaHash::compute(&v2);
+
+    // The peer that published generation B.
+    let mut publisher =
+        SchemaManager::new(SyncManager::new(), v2.clone(), test_app_id(), "dev", "main").unwrap();
+    let mut io_publisher = MemoryStorage::new();
+    let v2_object_id = publisher.persist_schema(&mut io_publisher);
+    let v2_entry = io_publisher
+        .load_catalogue_entry(v2_object_id)
+        .expect("loading the published schema entry should succeed")
+        .expect("persist_schema should have written a catalogue entry");
+
+    // The node under test, immediately after a restart: generation B's entry is
+    // on its disk — it persisted it before the restart — but the manager it just
+    // constructed knows only the declared schema.
+    let mut io_server = MemoryStorage::new();
+    io_server
+        .upsert_catalogue_entry(&v2_entry)
+        .expect("seeding the node's storage should succeed");
+    let mut server =
+        SchemaManager::new(SyncManager::new(), v1, test_app_id(), "dev", "main").unwrap();
+    assert!(
+        !server.context().is_live(&v2_hash),
+        "the fixture is only meaningful if the manager starts out ignorant of generation B"
+    );
+
+    let client_id = ClientId::new();
+    server
+        .query_manager_mut()
+        .sync_manager_mut()
+        .add_client_with_storage(&io_server, client_id);
+    server
+        .query_manager_mut()
+        .sync_manager_mut()
+        .set_client_role(client_id, ClientRole::Admin);
+    server.query_manager_mut().sync_manager_mut().take_outbox();
+
+    // The peer re-sends generation B, byte-identical to what storage holds.
+    server
+        .query_manager_mut()
+        .sync_manager_mut()
+        .push_inbox(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::CatalogueEntryUpdated {
+                entry: v2_entry.clone(),
+            },
+        });
+    server.process(&mut io_server);
+
+    assert!(
+        server.context().is_live(&v2_hash),
+        "a catalogue entry that arrives over the wire must reach the schema layer \
+         even when this node's storage already holds those exact bytes — otherwise \
+         the generation is on disk and unreadable forever (`SyncManager::persist_catalogue_entry`)"
+    );
+    assert_eq!(
+        server.all_branches().len(),
+        2,
+        "learning generation B must widen the query universe to both branches"
+    );
+
+    // Anti-storm half: having been handed it once, the node must not hand the
+    // same entry to the schema layer again on every subsequent peer connect —
+    // each redundant permissions-head apply rebuilds every subscription's graph
+    // (query_manager/manager.rs:750-757).
+    server
+        .query_manager_mut()
+        .sync_manager_mut()
+        .push_inbox(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::CatalogueEntryUpdated { entry: v2_entry },
+        });
+    server.query_manager_mut().process(&mut io_server);
+    assert!(
+        server
+            .query_manager_mut()
+            .take_pending_catalogue_updates()
+            .is_empty(),
+        "a re-send of an entry the schema layer has already been handed must not \
+         be handed to it a second time"
+    );
+}
+
+/// The production sequence the guard is really for: publish locally, then have a
+/// peer echo the entry straight back through the SyncManager.
+///
+/// `catalogue_same_permissions_head_push_is_noop` calls
+/// `process_catalogue_update` directly, so it proves the guard and nothing about
+/// the path that reaches it. This runs the whole path:
+/// `publish_permissions_bundle` → `persist_current_permissions` →
+/// `SyncManager::upsert_catalogue_entry` (which deliberately does NOT record the
+/// entry as handed to the schema layer — the schema layer is where it came from)
+/// → a client connect, which replays the catalogue out of storage → that client
+/// offering the same entry back → `SchemaManager::process`.
+///
+/// Every device reconnect replays this. A bump here is a full authorization
+/// rebuild plus a recompile of every subscription the process holds, once per
+/// reconnect, on a server that holds one per connected device.
+#[test]
+fn a_locally_published_head_echoed_back_by_a_peer_does_not_rebuild_authorization() {
+    let schema = SchemaBuilder::new()
+        .table(
+            TableSchema::builder("users")
+                .column("id", ColumnType::Uuid)
+                .column("name", ColumnType::Text),
+        )
+        .build();
+    let schema_hash = SchemaHash::compute(&schema);
+
+    let mut server =
+        SchemaManager::new(SyncManager::new(), schema, test_app_id(), "dev", "main").unwrap();
+    let mut io_server = MemoryStorage::new();
+
+    server
+        .publish_permissions_bundle(&mut io_server, schema_hash, HashMap::new(), None)
+        .expect("publishing the permissions bundle should succeed");
+    let applied_generation = server.query_manager().authz_schema_generation();
+    assert!(
+        applied_generation > 0,
+        "publishing a bundle should have applied it"
+    );
+
+    let client_id = ClientId::new();
+    server
+        .query_manager_mut()
+        .sync_manager_mut()
+        .add_client_with_storage(&io_server, client_id);
+    server
+        .query_manager_mut()
+        .sync_manager_mut()
+        .set_client_role(client_id, ClientRole::Admin);
+    server.query_manager_mut().sync_manager_mut().take_outbox();
+
+    let head_entry = io_server
+        .load_catalogue_entry(SchemaManager::permissions_head_object_id_for(test_app_id()))
+        .expect("loading the persisted head entry should succeed")
+        .expect("publishing a bundle should have persisted a head entry");
+
+    for reconnect in 1..=2 {
+        server
+            .query_manager_mut()
+            .sync_manager_mut()
+            .push_inbox(InboxEntry {
+                source: Source::Client(client_id),
+                payload: SyncPayload::CatalogueEntryUpdated {
+                    entry: head_entry.clone(),
+                },
+            });
+        server.process(&mut io_server);
+
+        assert_eq!(
+            server.query_manager().authz_schema_generation(),
+            applied_generation,
+            "reconnect {reconnect}: a peer echoing back the head this node published must not \
+             rebuild the authorization schema — that clears the authz cache and marks every \
+             subscription for recompilation (query_manager/manager.rs:750-757)",
+        );
+    }
+}

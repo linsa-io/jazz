@@ -2131,6 +2131,7 @@ mod accepted_batch_downgrade;
 mod authz_cache_runtime;
 mod basic;
 mod batched_tick_parked_drain;
+mod cold_boot_generation_universe;
 mod cross_generation_local_write;
 mod cross_generation_policy;
 mod delivery_confirmation;

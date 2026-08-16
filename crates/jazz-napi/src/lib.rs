@@ -55,7 +55,7 @@ use jazz_tools::runtime_core::{
     MutationErrorCallback, ReadDurabilityOptions, RuntimeCore, Scheduler, SubscriptionDelta,
     SubscriptionHandle,
 };
-use jazz_tools::schema_manager::{AppId, SchemaManager};
+use jazz_tools::schema_manager::{AppId, SchemaManager, rehydrate_schema_manager_from_catalogue};
 use jazz_tools::server::{
     JazzServer as CoreJazzServer, ServerBuilder, ServerDataDir, StorageBackend,
     TestJwtIssuer as JazzTestJwtIssuer, TestJwtOptions,
@@ -574,11 +574,19 @@ fn build_napi_runtime(
         sync_manager = sync_manager.with_durability_tiers(node_tiers);
     }
 
+    // One binding, used by both the manager and the rehydrate below.
+    // `rehydrate_schema_manager_from_catalogue` keeps only entries whose AppId
+    // metadata equals this value, and a mismatch is silent — it returns Ok
+    // having matched nothing. The derivation is deterministic, so a second call
+    // would agree; binding it once is what keeps that true if either side's
+    // fallback ever changes.
+    let app_id_obj = AppId::from_string(&app_id).unwrap_or_else(|_| AppId::from_name(&app_id));
+
     // Create schema manager
-    let schema_manager = SchemaManager::new_with_policy_mode(
+    let mut schema_manager = SchemaManager::new_with_policy_mode(
         sync_manager,
         schema,
-        AppId::from_string(&app_id).unwrap_or_else(|_| AppId::from_name(&app_id)),
+        app_id_obj,
         &jazz_env,
         &user_branch,
         if runtime_schema.loaded_policy_bundle {
@@ -588,6 +596,40 @@ fn build_napi_runtime(
         },
     )
     .map_err(|e| napi::Error::from_reason(format!("Failed to create SchemaManager: {:?}", e)))?;
+
+    // Load the schema generations, permissions bundle and lenses this store has
+    // already persisted, BEFORE the runtime is built over it.
+    //
+    // The branch universe every read is scoped to comes from the manager's
+    // `live_schemas` (`SchemaContext::all_branch_names`), never from the store,
+    // and `RuntimeCore::new` does not read the catalogue for anyone — closing
+    // that gap is each binding's own job (jazz-rn/rust/src/lib.rs:734,
+    // jazz-wasm/src/runtime.rs:1364, jazz-tools/src/client.rs:127 and :150,
+    // jazz-tools/src/server/builder.rs:236). This binding used to skip it, so a
+    // node runtime came up knowing only the schema it was handed: every row
+    // written under an earlier generation was indexed, persisted, and
+    // unreadable at every durability tier. MEASURED on the rpc-server
+    // (2026-08-16, store spanning the 2026-08-07 migration): users 2 of 22,
+    // chat_members 4 of 11, chats 2 of 4 — and every chat-membership check 403'd.
+    //
+    // Nor did sync heal it: a peer re-sending the catalogue sends bytes this
+    // store already holds, so only the first boot after a migration learned the
+    // generation and every restart after that did not.
+    //
+    // Warn-don't-fail, as jazz-rn does: a store whose catalogue cannot be
+    // scanned is still worth serving for the current generation. The silent
+    // half of this failure — a scan that succeeds and matches nothing — is
+    // caught after construction by `unknown_store_schema_generations`.
+    if let Err(error) =
+        rehydrate_schema_manager_from_catalogue(&mut schema_manager, &*storage, app_id_obj)
+    {
+        tracing::error!(
+            app_id = %app_id_obj,
+            %error,
+            "failed to rehydrate the schema manager from catalogue storage; rows written \
+             under earlier schema generations will be unreadable"
+        );
+    }
 
     // Create components
     let scheduler = NapiScheduler::new();
@@ -1420,8 +1462,138 @@ pub fn verify_local_first_identity_proof_napi(
 #[cfg(test)]
 mod tests {
     use jazz_tools::query_manager::types::{
-        ColumnType, Schema, SchemaBuilder, TableName, TableSchema, Value,
+        ColumnType, ComposedBranchName, Schema, SchemaBuilder, TableName, TableSchema, Value,
     };
+
+    use super::NapiRuntime;
+
+    /// THE GATE for this binding.
+    ///
+    /// A runtime this binding constructs over a store whose catalogue already
+    /// records an older schema generation must be able to read that generation.
+    ///
+    /// It could not. `build_napi_runtime` went from `SchemaManager::new*`
+    /// straight into `RuntimeCore::new`, and the core reads the catalogue for
+    /// nobody — every other binding does it itself before construction
+    /// (jazz-rn/rust/src/lib.rs:734, jazz-wasm/src/runtime.rs:1364,
+    /// jazz-tools/src/client.rs:127 and :150, server/builder.rs:236). So a node
+    /// runtime's branch universe held only the schema it was handed
+    /// (`SchemaContext::all_branch_names`), and every row written before the
+    /// last migration was unreadable at every durability tier.
+    ///
+    /// MEASURED on the rpc-server's own replica (2026-08-16), a store spanning
+    /// the 2026-08-07 migration: this construction served users 2 of 22,
+    /// chat_members 4 of 11, chats 2 of 4, messages 17 of 416 — and every
+    /// chat-membership check answered 403. Sync could not heal it either: the
+    /// catalogue a peer re-sends is byte-identical to what the store already
+    /// holds, so only the FIRST boot after a migration learned the generation.
+    ///
+    /// The fixture is the migration itself: generation A boots and persists its
+    /// catalogue entry, then the same store comes up under generation B.
+    #[test]
+    fn a_runtime_reads_the_schema_generations_its_own_store_records() {
+        let docs = || {
+            TableSchema::builder("docs")
+                .column("owner", ColumnType::Text)
+                .column("body", ColumnType::Text)
+        };
+        let generation_a = SchemaBuilder::new().table(docs()).build();
+        // An added table moves the schema hash, and therefore the composed
+        // branch name — the shape of the production migration.
+        let generation_b = SchemaBuilder::new()
+            .table(docs())
+            .table(TableSchema::builder("tags").column("label", ColumnType::Text))
+            .build();
+
+        let dir = std::env::temp_dir().join(format!(
+            "jazz-napi-cold-boot-gate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("runtime.sqlite");
+        let path_arg = path.to_string_lossy().into_owned();
+        let app_id = "cold-boot-generation-gate".to_string();
+
+        let branch_of = |schema: &Schema| {
+            ComposedBranchName::from_schema("dev", schema, "main")
+                .to_branch_name()
+                .to_string()
+        };
+
+        {
+            let runtime = NapiRuntime::new(
+                serde_json::to_string(&generation_a).expect("serialize generation A"),
+                app_id.clone(),
+                "dev".to_string(),
+                "main".to_string(),
+                path_arg.clone(),
+                None,
+            )
+            .expect("generation A runtime should construct");
+            // A row under generation A, so the store actually holds a visible
+            // raw-table family for it. Without one, `visible_schema_generations`
+            // has nothing to enumerate and the `unknown` assertion below would
+            // pass no matter what.
+            {
+                let mut core = runtime.core.lock().expect("lock");
+                core.insert_with_id(
+                    "docs",
+                    std::collections::HashMap::from([
+                        (
+                            "owner".to_string(),
+                            jazz_tools::query_manager::types::Value::Text("alice".to_string()),
+                        ),
+                        (
+                            "body".to_string(),
+                            jazz_tools::query_manager::types::Value::Text("draft".to_string()),
+                        ),
+                    ]),
+                    None,
+                    None,
+                )
+                .expect("the row inserts under generation A");
+            }
+            runtime.flush().expect("generation A should reach the disk");
+        }
+
+        let runtime = NapiRuntime::new(
+            serde_json::to_string(&generation_b).expect("serialize generation B"),
+            app_id,
+            "dev".to_string(),
+            "main".to_string(),
+            path_arg,
+            None,
+        )
+        .expect("generation B runtime should construct");
+
+        let (universe, unknown) = {
+            let core = runtime.core.lock().expect("lock");
+            (
+                core.schema_manager().query_manager().all_query_branches(),
+                core.unknown_store_schema_generations().to_vec(),
+            )
+        };
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            universe.contains(&branch_of(&generation_a)),
+            "a runtime this binding constructs must include generation A's branch {} in its \
+             query universe — its own catalogue records that generation. Universe was {universe:?}. \
+             Every read is scoped to this list, so a missing branch makes the rows under it \
+             unreadable at every durability tier.",
+            branch_of(&generation_a)
+        );
+        assert!(
+            universe.contains(&branch_of(&generation_b)),
+            "the current generation's branch must still be there; universe was {universe:?}"
+        );
+        assert!(
+            unknown.is_empty(),
+            "and the runtime must not be reporting generations it cannot enumerate: {unknown:?}"
+        );
+    }
 
     #[test]
     fn schema_json_roundtrip_preserves_enum_fk_and_defaults() {

@@ -1361,6 +1361,9 @@ impl SchemaManager {
         {
             return Ok(());
         }
+        if self.permissions_head_already_applied(&head) {
+            return Ok(());
+        }
         self.current_permissions_head = Some(head);
         // Defer flipping row_policy_mode to Enforcing until apply succeeds —
         // apply_permissions_head calls set_authorization_schema which sets it.
@@ -1373,6 +1376,29 @@ impl SchemaManager {
         }
 
         Ok(())
+    }
+
+    /// Is this exact head the one already in force?
+    ///
+    /// The version comparison above rejects a STRICTLY older head, so an equal
+    /// one used to fall through and re-apply. Re-applying is not free:
+    /// `apply_permissions_head` ends in `QueryManager::set_authorization_schema`
+    /// (query_manager/manager.rs:750), which clears the authorization cache and
+    /// marks EVERY local and server subscription for recompilation — on an
+    /// rpc-server that is one graph rebuild per connected device.
+    ///
+    /// This matters because the catalogue is legitimately re-offered: at boot by
+    /// `rehydrate_schema_manager_from_catalogue`, and on every peer connect once
+    /// the SyncManager stops swallowing entries whose bytes it already holds
+    /// (`SyncManager::persist_catalogue_entry`).
+    ///
+    /// `pending_permissions_head` is the "applied?" witness: it is cleared when
+    /// the apply succeeds and holds the head when it did not, so a head that
+    /// merely arrived but could not be applied — its bundle or schema missing —
+    /// is correctly retried rather than skipped.
+    fn permissions_head_already_applied(&self, head: &PermissionsHeadState) -> bool {
+        self.current_permissions_head.as_ref() == Some(head)
+            && self.pending_permissions_head.is_none()
     }
 
     fn process_catalogue_permissions_legacy(
@@ -1410,6 +1436,20 @@ impl SchemaManager {
             parent_bundle_object_id: None,
             bundle_object_id: object_id,
         };
+        // Same reasoning as the head path above, and this one had no version
+        // guard at all: THE SAME legacy entry re-offered on every peer connect
+        // would re-apply forever. The bundle insert above is keyed by object id
+        // and is idempotent on its own.
+        //
+        // Scope, so nobody reads more into this than it does: each legacy entry
+        // synthesises its own head at version 1 keyed by its own object id, so N
+        // DISTINCT legacy entries are N unequal heads and this guard never fires
+        // between them — each still applies, and which one ends up in force
+        // depends on `scan_catalogue_entries` iteration order. That ordering
+        // hazard predates this guard and is untouched by it.
+        if self.permissions_head_already_applied(&head) {
+            return Ok(());
+        }
         self.query_manager.require_authorization_schema();
         self.current_permissions_head = Some(head);
         if self.apply_permissions_head(head) {

@@ -2021,8 +2021,12 @@ impl SyncManager {
                     object_type = ?entry.object_type(),
                     "server→CatalogueEntryUpdated"
                 );
-                if self.persist_catalogue_entry(storage, entry.clone()) {
+                let intake = self.persist_catalogue_entry(storage, entry.clone());
+                if intake.needs_schema_layer {
+                    self.mark_handed_to_schema_layer(&entry);
                     self.pending_catalogue_updates.push(entry.clone());
+                }
+                if intake.storage_changed {
                     self.forward_catalogue_entry_to_clients(entry, None);
                 }
             }
@@ -2618,8 +2622,12 @@ impl SyncManager {
     ) {
         match payload {
             SyncPayload::CatalogueEntryUpdated { entry } => {
-                if self.persist_catalogue_entry(storage, entry.clone()) {
+                let intake = self.persist_catalogue_entry(storage, entry.clone());
+                if intake.needs_schema_layer {
+                    self.mark_handed_to_schema_layer(&entry);
                     self.pending_catalogue_updates.push(entry.clone());
+                }
+                if intake.storage_changed {
                     self.forward_catalogue_entry_to_servers(entry.clone());
                     self.forward_catalogue_entry_to_clients(entry, Some(client_id));
                 }
