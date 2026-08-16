@@ -453,15 +453,20 @@ fn push_query_subscription(
 /// member, the server has nothing new to learn: it should short-circuit the
 /// permission check and re-emit the cached settlement so the client can
 /// reconcile.
+mod adversarial_cross_generation;
 mod basic;
 mod client_lifecycle;
+mod cross_generation_oracle;
+mod cross_generation_visible_split;
 mod delivered_row_reseal;
 mod dropped_payload;
 mod forwarding_recursion;
 mod frontier_pruning;
 mod missing_answer_bound;
 mod permissions;
+mod policied_row_repeat_submissions;
 mod query_scope;
+mod round2_cross_generation_review;
 mod server_sync;
 mod settlements;
 mod subscriptions;

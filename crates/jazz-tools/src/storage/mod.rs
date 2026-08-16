@@ -46,8 +46,8 @@ use crate::digest::Digest32;
 use crate::metadata::MetadataKey;
 use crate::object::{BranchName, ObjectId};
 use crate::query_manager::types::{
-    ColumnDescriptor, ColumnType, ComposedBranchName, RowDescriptor, SchemaHash, SharedString,
-    Value,
+    ColumnDescriptor, ColumnName, ColumnType, ComposedBranchName, RowDescriptor, SchemaHash,
+    SharedString, Value,
 };
 use crate::row_format::{decode_row, encode_row};
 use crate::row_histories::{
@@ -166,6 +166,9 @@ const RAW_TABLE_HEADER_TABLE: &str = "__raw_table_header";
 const BRANCH_ORD_BY_NAME_TABLE: &str = "__branch_ord_by_name";
 const BRANCH_NAME_BY_ORD_TABLE: &str = "__branch_name_by_ord";
 const BRANCH_ORD_META_TABLE: &str = "__branch_ord_meta";
+/// Which generation-set each table was last successfully swept for. Turns the
+/// defect-27 repair from a per-boot tax into a once-per-deployment one.
+const VISIBLE_FAMILY_SWEEP_TABLE: &str = "__visible_family_sweep";
 const BRANCH_ORD_NEXT_ORD_KEY: &str = "next_ord";
 pub(crate) const STORE_MANIFEST_KEY: &str = "__jazz_store_manifest";
 const STORE_MANIFEST_MAGIC: &[u8; 10] = b"JAZZSTORE1";
@@ -177,6 +180,7 @@ const CATALOGUE_STORAGE_FORMAT_V1: i32 = 1;
 const BRANCH_ORD_BY_NAME_FORMAT_V1: i32 = 1;
 const BRANCH_NAME_BY_ORD_FORMAT_V1: i32 = 1;
 const BRANCH_ORD_META_FORMAT_V1: i32 = 1;
+const VISIBLE_FAMILY_SWEEP_FORMAT_V1: i32 = 1;
 const SEALED_BATCH_SUBMISSION_FORMAT_V2: i32 = 2;
 const AUTHORITATIVE_BATCH_SETTLEMENT_FORMAT_V2: i32 = 2;
 const ACKNOWLEDGED_REJECTED_BATCH_FORMAT_V1: i32 = 1;
@@ -191,6 +195,7 @@ const STORAGE_KIND_HISTORY_ROW_BATCH_TABLE_LOCATOR: &str = "history_row_batch_ta
 const STORAGE_KIND_BRANCH_ORD_BY_NAME: &str = "branch_ord_by_name";
 const STORAGE_KIND_BRANCH_NAME_BY_ORD: &str = "branch_name_by_ord";
 const STORAGE_KIND_BRANCH_ORD_META: &str = "branch_ord_meta";
+const STORAGE_KIND_VISIBLE_FAMILY_SWEEP: &str = "visible_family_sweep";
 const STORAGE_KIND_LOCAL_BATCH_RECORD: &str = "local_batch_record";
 const STORAGE_KIND_LOCAL_BATCH_ROW_INDEX: &str = "local_batch_row_index";
 const STORAGE_KIND_AUTHORITATIVE_BATCH_SETTLEMENT: &str = "authoritative_batch_settlement";
@@ -1124,6 +1129,7 @@ fn supported_storage_format_version(storage_kind: &str) -> Result<i32, StorageEr
         STORAGE_KIND_BRANCH_ORD_BY_NAME => Ok(BRANCH_ORD_BY_NAME_FORMAT_V1),
         STORAGE_KIND_BRANCH_NAME_BY_ORD => Ok(BRANCH_NAME_BY_ORD_FORMAT_V1),
         STORAGE_KIND_BRANCH_ORD_META => Ok(BRANCH_ORD_META_FORMAT_V1),
+        STORAGE_KIND_VISIBLE_FAMILY_SWEEP => Ok(VISIBLE_FAMILY_SWEEP_FORMAT_V1),
         STORAGE_KIND_LOCAL_BATCH_RECORD => Ok(LOCAL_BATCH_RECORD_FORMAT_V3),
         STORAGE_KIND_LOCAL_BATCH_ROW_INDEX => Ok(LOCAL_BATCH_ROW_INDEX_FORMAT_V1),
         STORAGE_KIND_SEALED_BATCH_SUBMISSION => Ok(SEALED_BATCH_SUBMISSION_FORMAT_V2),
@@ -1288,11 +1294,30 @@ pub(crate) fn prepared_row_write_context_from_table_context(
     }
 }
 
+/// The caller has already written `__row_locator` itself, so it — and only it —
+/// knows whether that write MOVED the row between schema generations. It must
+/// say so: `needs_exact_locator` is what makes the apply record an exact visible
+/// locator and realign the row's family, and hardcoding it to `false` here is
+/// how the local write path forked heads across generations (defect 27).
 pub(crate) fn prepared_row_write_context_for_known_exact_locator(
     table_name: &str,
     schema_hash: SchemaHash,
     user_descriptor: Arc<RowDescriptor>,
 ) -> Result<PreparedRowWriteContext, StorageError> {
+    // `false` = "this write did not land in a family other than the one the row
+    // was already in". On this path the caller stamps `__row_locator` at the
+    // branch's schema hash immediately before, so relative to the pointer it just
+    // wrote the statement holds.
+    //
+    // A round-2 review argued this hardcoding hides a local-write twin of defect
+    // 27. It does not, and the reason is worth recording: a generation change on
+    // this path also moves the write to a NEW BRANCH, and `(row, new-branch)` has
+    // no prior head anywhere to fork from. Computing the flag honestly here was
+    // tried and MEASURED as dead weight — with it forced back to `false` the
+    // entire suite is byte-identical, including the oracle, which drives this
+    // writer on 30% of its steps. It was removed rather than shipped
+    // unfalsifiable. The invariant it was meant to protect is pinned directly
+    // instead, by `runtime_core::tests::cross_generation_local_write`.
     prepared_row_write_context_for_descriptor(table_name, schema_hash, user_descriptor, false)
 }
 
@@ -1385,6 +1410,883 @@ fn row_raw_table_header(id: &RowRawTableId, user_descriptor: &RowDescriptor) -> 
 
 fn row_raw_table_header_prefix(kind: RowRawTableKind, table: &str) -> String {
     format!("rowtable:{}:{}:", kind.as_str(), table)
+}
+
+/// The header-table prefix for a KIND, across every logical table — what the
+/// startup sweep enumerates tables from.
+fn row_raw_table_header_kind_prefix(kind: RowRawTableKind) -> String {
+    format!("rowtable:{}:", kind.as_str())
+}
+
+/// Move a `(branch, row)` visible head out of the schema-generation family it
+/// has left, without touching either locator.
+///
+/// A cross-generation write lands its bytes in the family the write resolved to
+/// and stamps the authoritative `__visible_row_table_locator` there — but the
+/// previous family's entry survives. One `(row, branch)` then has TWO visible
+/// heads: the read ladder has to guess between them, and
+/// `scan_visible_row_bytes_with_storage` (which iterates every family) returns
+/// the row twice (defect 27, production 2026-08-16 — presence heartbeats landed
+/// in the new family every 10s while every reader served the old family's copy,
+/// frozen at the last server restart).
+///
+/// Deliberately NOT `delete_visible_region_row`: that one also clears the exact
+/// visible locator, which is the very pointer the write just stamped at the
+/// live family.
+///
+/// Returns whether a stale head was actually removed.
+pub(crate) fn drop_stale_visible_row_family_entry<H: Storage + ?Sized>(
+    storage: &mut H,
+    table: &str,
+    branch: &str,
+    row_id: ObjectId,
+    stale_schema_hash: SchemaHash,
+    live_schema_hash: Option<SchemaHash>,
+) -> Result<bool, StorageError> {
+    let stale_raw_table = visible_row_raw_table_id(table, stale_schema_hash);
+    let key = key_codec::visible_row_raw_table_key(branch, row_id);
+    let Some(stale_bytes) = storage.raw_table_get(stale_raw_table.raw_table_name(), &key)? else {
+        return Ok(false);
+    };
+
+    // The index is NOT family-scoped, so the head being dropped has live index
+    // entries pointing at it. Retire them before the bytes go, while they can
+    // still be decoded. See `retire_index_entries_for_dropped_visible_head` for
+    // what trusts the index without re-reading the row.
+    // Descriptor sourced the way the READ path sources it, and degrading rather
+    // than failing: a fossil generation whose catalogue entry is gone still reads,
+    // so it must still be writable and deletable. Losing the retirement leaves
+    // stale index entries — bad — but wedging every write to the row is worse, and
+    // the sweep is what such a store is waiting for.
+    match stored_bytes_descriptor_for_family(storage, table, stale_schema_hash) {
+        Some(stale_descriptor) => {
+            let surviving = match live_schema_hash {
+                Some(live_schema_hash) => {
+                    let live_raw_table = visible_row_raw_table_id(table, live_schema_hash);
+                    match storage.raw_table_get(live_raw_table.raw_table_name(), &key)? {
+                        Some(bytes) => {
+                            stored_bytes_descriptor_for_family(storage, table, live_schema_hash)
+                                .map(|descriptor| (descriptor, bytes))
+                        }
+                        None => None,
+                    }
+                }
+                None => None,
+            };
+            retire_index_entries_for_dropped_visible_head(
+                storage,
+                table,
+                branch,
+                row_id,
+                (stale_descriptor.as_ref(), &stale_bytes),
+                surviving
+                    .as_ref()
+                    .map(|(descriptor, bytes)| (descriptor.as_ref(), bytes.as_slice())),
+            )?;
+        }
+        None => tracing::warn!(
+            table,
+            branch,
+            %row_id,
+            stale_schema = %stale_schema_hash.short(),
+            "dropping a visible head whose generation has no resolvable descriptor; \
+             its index entries cannot be retired and may outlive it"
+        ),
+    }
+
+    storage.raw_table_delete(stale_raw_table.raw_table_name(), &key)?;
+    Ok(true)
+}
+
+/// The exact visible-row locator naming one schema generation's family.
+pub(crate) fn visible_row_table_locator_for(
+    table: &str,
+    schema_hash: SchemaHash,
+) -> ExactRowTableLocator {
+    let row_raw_table_id = visible_row_raw_table_id(table, schema_hash);
+    ExactRowTableLocator {
+        row_raw_table: SharedString::from(row_raw_table_id.raw_table_name().to_string()),
+        table_name: row_raw_table_id.table_name.clone(),
+        schema_hash,
+    }
+}
+
+/// Which schema-generation families PHYSICALLY hold `(branch, row)`'s visible
+/// head right now.
+///
+/// Measured, never inferred from a locator. Both locators are exactly the things
+/// that go stale in this defect family, so any repair that consults one to
+/// decide what to repair can only launder the corruption. Bounded by the handful
+/// of generations a store ever holds.
+pub(crate) fn visible_row_families_holding<H: Storage + ?Sized>(
+    storage: &H,
+    table: &str,
+    branch: &str,
+    row_id: ObjectId,
+) -> Result<Vec<SchemaHash>, StorageError> {
+    let key = key_codec::visible_row_raw_table_key(branch, row_id);
+    let mut holders = Vec::new();
+    for row_raw_table_id in row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)? {
+        if storage
+            .raw_table_get(row_raw_table_id.raw_table_name(), &key)?
+            .is_some()
+        {
+            holders.push(row_raw_table_id.schema_hash);
+        }
+    }
+    Ok(holders)
+}
+
+/// Every raw table that PHYSICALLY holds `(branch, row)`'s visible head, as raw
+/// table names ready to delete from.
+///
+/// This is what a delete must use. Resolving a single locator and deleting there
+/// removes one head out of however many exist, and — because the delete also
+/// clears the authoritative locator — hands the read ladder straight to the
+/// derived `__row_locator`, which still names a surviving fossil family. The
+/// deleted row is then served again, permanently: a row with one head is not
+/// "split" any more, so no repair pass ever revisits it.
+pub(crate) fn visible_row_raw_tables_holding<H: Storage + ?Sized>(
+    storage: &H,
+    table: &str,
+    branch: &str,
+    row_id: ObjectId,
+) -> Result<Vec<String>, StorageError> {
+    Ok(
+        visible_row_families_holding(storage, table, branch, row_id)?
+            .into_iter()
+            .map(|schema_hash| {
+                visible_row_raw_table_id(table, schema_hash)
+                    .raw_table_name()
+                    .to_string()
+            })
+            .collect(),
+    )
+}
+
+/// The index entries a row's own column values justify, as `(column, value)`.
+///
+/// Mirrors `QueryManager::index_mutations_for_*` on the three rules that decide
+/// what an indexed row owns (`query_manager/indices.rs`): `Bytea` is never
+/// indexed, `Value::Null` is never indexed, and a `references` column of type
+/// `Array { element: Uuid }` owns one entry per element IN ADDITION to the
+/// whole-array entry.
+///
+/// NOT pinned against `QueryManager`'s own implementation: the equivalence is
+/// asserted against a hand-written model in
+/// `a_moved_head_retires_its_own_index_entries_and_only_its_own`, which covers
+/// each rule but would not catch this copy DRIFTING from
+/// `query_manager/indices.rs` if the rules there change. Such drift would put a
+/// REBAC grant on the wrong side, so a real pin is worth writing; the two were
+/// hand-diffed and agree as of 2026-08-16.
+///
+/// Deliberately ignores the catalogue's `indexed_columns`: an entry for a column
+/// that was never indexed simply does not exist, so removing it is a no-op, and
+/// not consulting the list makes this correct even when `indexed_columns` has
+/// changed since the row was written — which, on a repair path for rows written
+/// under a previous schema generation, is the normal case.
+fn column_index_entries_for_row_bytes(
+    descriptor: &RowDescriptor,
+    data: &[u8],
+) -> Vec<(ColumnName, Value)> {
+    let mut entries = Vec::new();
+    for (column_index, column) in descriptor.columns.iter().enumerate() {
+        if matches!(column.column_type, ColumnType::Bytea) {
+            continue;
+        }
+        let Ok(value) = crate::row_format::decode_column(descriptor, data, column_index) else {
+            continue;
+        };
+        if value == Value::Null {
+            continue;
+        }
+        let is_uuid_array_reference = column.references.is_some()
+            && matches!(
+                &column.column_type,
+                ColumnType::Array { element } if matches!(element.as_ref(), ColumnType::Uuid)
+            );
+        if is_uuid_array_reference && let Value::Array(elements) = &value {
+            for element in elements {
+                if matches!(element, Value::Uuid(_)) {
+                    entries.push((column.name, element.clone()));
+                }
+            }
+        }
+        entries.push((column.name, value));
+    }
+    entries
+}
+
+/// Remove one index entry, covering the signed-zero split that `index_remove`
+/// does not: `Value::Double(0.0)` and `Value::Double(-0.0)` encode to DIFFERENT
+/// key segments, and the lookup path probes both while the removal path probes
+/// one. Dropping only one leaves a live entry pointing at bytes we just deleted.
+fn remove_index_entry_including_signed_zero<H: Storage + ?Sized>(
+    storage: &mut H,
+    table: &str,
+    column: &str,
+    branch: &str,
+    value: &Value,
+    row_id: ObjectId,
+) -> Result<(), StorageError> {
+    storage.index_remove(table, column, branch, value, row_id)?;
+    if let Value::Double(double) = value
+        && *double == 0.0
+    {
+        let mirrored = Value::Double(if double.is_sign_negative() { 0.0 } else { -0.0 });
+        storage.index_remove(table, column, branch, &mirrored, row_id)?;
+    }
+    Ok(())
+}
+
+/// The descriptor to decode a family's stored bytes with, sourced the way the
+/// READ path sources it.
+///
+/// `load_user_descriptor_for_schema_hash` consults the CATALOGUE and errors when
+/// the entry is absent. The read ladder does not: `resolved_row_table_from_id`
+/// prefers the descriptor embedded in the raw table HEADER and only falls back to
+/// the catalogue. A store whose fossil generation's catalogue entry is gone
+/// therefore still reads fine, and it must still be writable and deletable — the
+/// repair paths below exist to clean such stores up, so erroring there turns a
+/// silent fork into a wedged write, which is a worse trade.
+///
+/// Returns `None` when neither source has it: the caller then skips index
+/// retirement for that head with a warn rather than failing the write. Using the
+/// same source as the scan also removes a real asymmetry — these bytes were
+/// previously decoded with a possibly different descriptor than the one the scan
+/// hands the same family.
+fn stored_bytes_descriptor_for_family<H: Storage + ?Sized>(
+    storage: &H,
+    table: &str,
+    schema_hash: SchemaHash,
+) -> Option<Arc<RowDescriptor>> {
+    // Header first (this is what `resolved_row_table_from_id` prefers, and it
+    // carries its own catalogue fallback), then the catalogue on its own for a
+    // family whose header was never registered. Only when NEITHER source has it
+    // do we give up — and then by skipping the retirement, never by failing the
+    // write.
+    let row_raw_table_id = visible_row_raw_table_id(table, schema_hash);
+    match resolved_row_table_from_id(storage, row_raw_table_id) {
+        Ok(Some(resolved)) => return Some(resolved.user_descriptor),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            table,
+            schema = %schema_hash.short(),
+            %error,
+            "raw-table header descriptor unavailable for a schema-generation family; \
+             falling back to the catalogue"
+        ),
+    }
+    match load_history_user_descriptor_for_schema_hash(storage, table, schema_hash) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            tracing::warn!(
+                table,
+                schema = %schema_hash.short(),
+                %error,
+                "could not resolve a descriptor for a schema-generation family; \
+                 skipping its index retirement"
+            );
+            None
+        }
+    }
+}
+
+/// Retire the index entries that ONLY a dropped visible head justified.
+///
+/// Index raw tables are `idx:<table>:<column>:<branch>` — they carry NO schema
+/// hash (`key_codec::index_raw_table`), so both generations' heads write into the
+/// same index. Dropping one family's head therefore leaves that head's values
+/// indexed with nothing behind them, and three consumers trust the index without
+/// re-reading the row:
+///
+///   * a fully-covered indexed predicate drops its residual filter entirely
+///     (`graph/compile.rs`, `build_remaining_predicate_from_disjuncts` returns
+///     `Predicate::True`), so a stale entry is a phantom QUERY RESULT;
+///   * `row_is_indexed_on_branch` / `row_is_deleted_on_branch` are pure index
+///     reads (`query_manager/writes.rs`);
+///   * REBAC edge traversal takes `index_lookup` directly when the referencing
+///     column is an indexed scalar `Uuid`, and only the NON-indexed fallback
+///     re-verifies with `declared_edge_references_target` — so a stale entry
+///     there GRANTS ACCESS through an edge that no longer exists.
+///
+/// `surviving` is the head that remains, if any. Entries both heads justify are
+/// kept; only the difference is removed. When nothing survives, the implicit
+/// `_id` / `_id_deleted` entries go too — but while a head remains they must
+/// stay, or the surviving row becomes invisible to every `_id` scan.
+fn retire_index_entries_for_dropped_visible_head<H: Storage + ?Sized>(
+    storage: &mut H,
+    table: &str,
+    branch: &str,
+    row_id: ObjectId,
+    dropped: (&RowDescriptor, &[u8]),
+    surviving: Option<(&RowDescriptor, &[u8])>,
+) -> Result<usize, StorageError> {
+    let dropped_entries = column_index_entries_for_row_bytes(dropped.0, dropped.1);
+    let surviving_entries = surviving
+        .map(|(descriptor, bytes)| column_index_entries_for_row_bytes(descriptor, bytes))
+        .unwrap_or_default();
+
+    let mut retired = 0usize;
+    for (column, value) in &dropped_entries {
+        if surviving_entries
+            .iter()
+            .any(|(kept_column, kept_value)| kept_column == column && kept_value == value)
+        {
+            continue;
+        }
+        remove_index_entry_including_signed_zero(
+            storage,
+            table,
+            column.as_str(),
+            branch,
+            value,
+            row_id,
+        )?;
+        retired += 1;
+    }
+
+    if surviving.is_none() {
+        for implicit in ["_id", "_id_deleted"] {
+            storage.index_remove(table, implicit, branch, &Value::Uuid(row_id), row_id)?;
+            retired += 1;
+        }
+    }
+    Ok(retired)
+}
+
+/// Retire the index entries owned by the EXTRA heads of a row that is about to be
+/// deleted while it is still split.
+///
+/// A caller deleting a row builds its index removals from the one version the
+/// point read served (`index_mutations_for_hard_delete_on_branch` and friends
+/// take a single `old_data`). On a split row the other family's head holds
+/// DIFFERENT values, and those entries survive the delete pointing at nothing.
+///
+/// Only the column entries: `_id` / `_id_deleted` are the caller's business —
+/// a soft delete deliberately inserts `_id_deleted` — and touching them here
+/// would undo that.
+///
+/// Costs nothing on a healthy store: a row held by one family cannot have extra
+/// heads, and returns immediately.
+pub(crate) fn retire_index_entries_for_extra_visible_heads<H: Storage + ?Sized>(
+    storage: &mut H,
+    table: &str,
+    branch: &str,
+    row_id: ObjectId,
+) -> Result<(), StorageError> {
+    let holders = visible_row_families_holding(storage, table, branch, row_id)?;
+    if holders.len() < 2 {
+        return Ok(());
+    }
+    let key = key_codec::visible_row_raw_table_key(branch, row_id);
+    for schema_hash in holders {
+        let raw_table = visible_row_raw_table_id(table, schema_hash);
+        let Some(bytes) = storage.raw_table_get(raw_table.raw_table_name(), &key)? else {
+            continue;
+        };
+        let Some(descriptor) = stored_bytes_descriptor_for_family(storage, table, schema_hash)
+        else {
+            continue;
+        };
+        for (column, value) in column_index_entries_for_row_bytes(descriptor.as_ref(), &bytes) {
+            remove_index_entry_including_signed_zero(
+                storage,
+                table,
+                column.as_str(),
+                branch,
+                &value,
+                row_id,
+            )?;
+        }
+    }
+    tracing::warn!(
+        table,
+        branch,
+        %row_id,
+        "deleted a row that was still split across schema generations (defect 27); \
+         retired every family's index entries"
+    );
+    Ok(())
+}
+
+/// After ANY visible write, make the family it landed in the only one holding
+/// that `(branch, row)`.
+///
+/// The main write path is not the only writer that puts visible bytes into a
+/// caller-chosen family. Four others do, and each was measured (round-2 review)
+/// to be able to fork a head:
+///
+///   * `patch_exact_row_batch_for_schema_hash` (`storage_trait.rs`, from
+///     `runtime_core/ticks.rs`) writes into a schema hash taken from the rejected
+///     batch's HISTORY locator — "where this batch's history lives" is not "where
+///     this row's visible head lives";
+///   * `patch_row_region_rows_by_batch_with_storage` resolves the family from
+///     `__row_locator`, which is keyed by row id ALONE while heads are keyed by
+///     `(branch, row)`, so a row live on two branches writes one branch's head
+///     into the other branch's family;
+///   * `restore_local_rejected_delete_row` and
+///     `restore_permission_rejected_delete_row` both rebuild from
+///     `scan_history_row_batches`, which carries NO branch filter, and write the
+///     winner through `__row_locator`'s family.
+///
+/// All four are add-only — visible keys carry no batch id, so a write into a
+/// second family ADDS a head — and none of them realigns. Rather than patch four
+/// call sites and hope there is no fifth, the invariant is enforced where the
+/// bytes actually land.
+///
+/// Free on a store that has never deployed a second schema: one header prefix
+/// scan for the whole batch, then nothing.
+pub(crate) fn enforce_single_visible_family_after_write<H: Storage + ?Sized>(
+    storage: &mut H,
+    table: &str,
+    written: &[OwnedVisibleRowBytes],
+) -> Result<(), StorageError> {
+    if written.is_empty() {
+        return Ok(());
+    }
+    // The head MOVE is only possible where more than one family exists, so it is
+    // gated on that — one header prefix scan for the whole batch. The POINTER
+    // alignment is not: defect 20's guarantee is that after a successful apply
+    // `__row_locator` names the family the write resolved to, however many
+    // families the store has. `needs_exact_locator` is precisely "this write
+    // resolved somewhere other than the locator names", so it gates the pointer
+    // work the same way it gated the old post-apply pass.
+    let multi_generation =
+        row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)?.len() > 1;
+
+    for row in written {
+        let live_schema_hash = row.row_raw_table_id.schema_hash;
+
+        let mut moved_a_head = false;
+        if multi_generation {
+            for stale_schema_hash in
+                visible_row_families_holding(storage, table, &row.branch, row.row_id)?
+                    .into_iter()
+                    .filter(|schema_hash| *schema_hash != live_schema_hash)
+            {
+                if drop_stale_visible_row_family_entry(
+                    storage,
+                    table,
+                    &row.branch,
+                    row.row_id,
+                    stale_schema_hash,
+                    Some(live_schema_hash),
+                )? {
+                    moved_a_head = true;
+                    tracing::warn!(
+                        table,
+                        branch = %row.branch,
+                        row_id = %row.row_id,
+                        stale_schema = %stale_schema_hash.short(),
+                        live_schema = %live_schema_hash.short(),
+                        "a visible write landed in a different generation than the row's \
+                         head; moved the head instead of forking it (defect 27)"
+                    );
+                }
+            }
+        }
+
+        // Align when the write resolved somewhere other than the locator named,
+        // and ALSO whenever a head actually moved: a write can resolve to exactly
+        // the family `__row_locator` names (so `needs_exact_locator` is false)
+        // and still have moved the head out of a DIFFERENT family, leaving the
+        // authoritative locator — which the read ladder consults first — pointing
+        // at the fossil it just deleted.
+        if !row.needs_exact_locator && !moved_a_head {
+            continue;
+        }
+        // Both pointers follow the head, or the read ladder's derived step and
+        // `old_content_schema_hash` aim at a family that does not hold the row.
+        let stored_locator = storage.load_row_locator(row.row_id)?;
+        if stored_locator
+            .as_ref()
+            .and_then(|locator| locator.origin_schema_hash)
+            != Some(live_schema_hash)
+        {
+            storage.put_row_locator(
+                row.row_id,
+                Some(&RowLocator {
+                    table: stored_locator
+                        .as_ref()
+                        .map(|locator| locator.table.clone())
+                        .unwrap_or_else(|| SharedString::from(table.to_string())),
+                    origin_schema_hash: Some(live_schema_hash),
+                }),
+            )?;
+        }
+        // The read ladder consults this one FIRST and nothing else in the engine
+        // ever corrects it, so a stale one would freeze reads on a fossil.
+        let live = visible_row_table_locator_for(table, live_schema_hash);
+        if storage
+            .load_visible_row_table_locator(&row.branch, row.row_id)?
+            .as_ref()
+            != Some(&live)
+        {
+            storage.put_visible_row_table_locator(&row.branch, row.row_id, Some(&live))?;
+        }
+    }
+    Ok(())
+}
+
+/// What a [`repair_split_visible_row_families`] pass touched. All zeroes means
+/// the store was already healthy.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VisibleFamilySplitRepair {
+    /// `(branch, row)` pairs that held a visible head in more than one
+    /// schema-generation family.
+    pub split_rows: usize,
+    /// Stale heads deleted.
+    pub dropped_heads: usize,
+    /// Rows whose surviving head was rewritten from history.
+    pub rebuilt_rows: usize,
+    /// Split rows left alone because they had no history to rebuild from.
+    pub unresolved_rows: usize,
+    /// WHICH rows were repaired, as `(table, branch, row_id)`. Four integers
+    /// tell nobody which row to go and check afterwards — and after a repair
+    /// that also retired index entries, the identities are the only way to
+    /// audit what the store looked like before.
+    pub repaired: Vec<(String, String, ObjectId)>,
+    /// Rows left in a split state, same shape. These are the ones still capable
+    /// of serving a stale read.
+    pub unresolved: Vec<(String, String, ObjectId)>,
+    /// Tables whose repair FAILED, with the error. The sweep continues past a
+    /// failing table rather than abandoning every table after it — a partial
+    /// silent sweep leaves exactly the half-repaired state the defect needs.
+    pub failed_tables: Vec<(String, String)>,
+}
+
+impl VisibleFamilySplitRepair {
+    pub fn is_noop(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.split_rows += other.split_rows;
+        self.dropped_heads += other.dropped_heads;
+        self.rebuilt_rows += other.rebuilt_rows;
+        self.unresolved_rows += other.unresolved_rows;
+        self.repaired.extend(other.repaired);
+        self.unresolved.extend(other.unresolved);
+        self.failed_tables.extend(other.failed_tables);
+    }
+}
+
+/// Heal a store that already carries defect 27's damage: one `(row, branch)`
+/// with a visible head in two schema-generation families, reads frozen on the
+/// stale one.
+///
+/// The write path stops NEW splits (`row_histories::mutations`), but it cannot
+/// undo the ones a running deployment already made — nothing on the write path
+/// ever visits a row again unless a write arrives for it, and the stale head
+/// outlives every restart. This is the sweep that does.
+///
+/// The winner is recomputed from `scan_history_row_batches`, which is
+/// sibling-complete across families (`storage_trait.rs`,
+/// `resolved_row_tables_for_table`), through the same
+/// `VisibleRowEntry::rebuild_with_descriptor` the write path uses — defect 21's
+/// rule, not a timestamp comparison between the two heads. Comparing the heads
+/// is exactly the reasoning that made the stale one look defensible.
+///
+/// Idempotent, and bounded: on a store with fewer than two families for the
+/// table it costs one header prefix scan and stops.
+pub fn repair_split_visible_row_families<H: Storage + ?Sized>(
+    storage: &mut H,
+    table: &str,
+) -> Result<VisibleFamilySplitRepair, StorageError> {
+    let mut report = VisibleFamilySplitRepair::default();
+    let families = row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)?;
+    if families.len() < 2 {
+        return Ok(report);
+    }
+    // Already swept for exactly this generation-set: nothing new can have split
+    // since, because a split needs a family that did not exist then. Two point
+    // reads instead of a full key scan of every family.
+    let generation_set = visible_family_generation_set(storage, table)?;
+    if visible_family_sweep_is_current(storage, table, &generation_set)? {
+        return Ok(report);
+    }
+
+    let mut heads: BTreeMap<(String, ObjectId), Vec<SchemaHash>> = BTreeMap::new();
+    for family in &families {
+        // Keys only: this runs at every startup once a store has more than one
+        // generation, and the values are megabytes we would only drop.
+        for key in storage.raw_table_scan_prefix_keys(family.raw_table_name(), "")? {
+            let (branch, row_id) = key_codec::decode_visible_row_raw_table_key(&key)?;
+            heads
+                .entry((branch, row_id))
+                .or_default()
+                .push(family.schema_hash);
+        }
+    }
+
+    for ((branch, row_id), family_hashes) in heads {
+        if family_hashes.len() < 2 {
+            continue;
+        }
+        report.split_rows += 1;
+
+        let history_rows = storage
+            .scan_history_row_batches(table, row_id)?
+            .into_iter()
+            .filter(|row| row.branch.as_str() == branch)
+            .collect::<Vec<_>>();
+        let Some(newest) = history_rows
+            .iter()
+            .max_by_key(|row| (row.updated_at, row.batch_id()))
+            .cloned()
+        else {
+            // Two heads and no history to arbitrate between them. Dropping one
+            // would be a coin flip, so say so and leave the row alone.
+            tracing::warn!(
+                table,
+                branch,
+                %row_id,
+                families = family_hashes.len(),
+                "split visible head has no history to rebuild from; left untouched"
+            );
+            report.unresolved_rows += 1;
+            report
+                .unresolved
+                .push((table.to_string(), branch.clone(), row_id));
+            continue;
+        };
+
+        // The generation a batch belongs to is read off the family its HISTORY
+        // bytes physically live in — never off `__row_locator`, which is the
+        // poisoned input this sweep exists to repair, and never off
+        // `resolve_history_row_write_context`, whose first ladder step is that
+        // same locator (`required_history_user_descriptor_and_schema_hash_for_row`).
+        // History is safe to ask because its keys carry the batch id, so a batch
+        // exists in exactly one family and a wrong guess misses instead of
+        // answering wrongly.
+        let family_of = |storage: &H, batch_id: BatchId| -> Result<_, StorageError> {
+            load_history_row_batch_row_bytes_with_storage(storage, table, &branch, row_id, batch_id)
+        };
+
+        let Some(newest_bytes) = family_of(storage, newest.batch_id())? else {
+            tracing::warn!(
+                table,
+                branch,
+                %row_id,
+                "split visible head's newest batch is not in any history family; left untouched"
+            );
+            report.unresolved_rows += 1;
+            report
+                .unresolved
+                .push((table.to_string(), branch.clone(), row_id));
+            continue;
+        };
+        let entry = crate::row_histories::VisibleRowEntry::rebuild_with_descriptor(
+            newest_bytes.user_descriptor.as_ref(),
+            &history_rows,
+        )
+        .map_err(|err| StorageError::IoError(format!("rebuild split visible head: {err}")))?;
+
+        // The surviving head belongs in the WINNER's own generation — the winner
+        // is not always the newest row, and not always the newest generation.
+        let live_schema_hash = match entry.as_ref() {
+            Some(entry) => match family_of(storage, entry.current_row.batch_id())? {
+                Some(winner_bytes) => winner_bytes.row_raw_table_id.schema_hash,
+                None => newest_bytes.row_raw_table_id.schema_hash,
+            },
+            None => newest_bytes.row_raw_table_id.schema_hash,
+        };
+
+        for stale_schema_hash in family_hashes
+            .iter()
+            .copied()
+            .filter(|schema_hash| *schema_hash != live_schema_hash)
+        {
+            // Retires this head's index entries too — the index is not
+            // family-scoped, so a dropped head leaves live entries behind that
+            // queries, `_id` probes and REBAC edge traversal all trust.
+            if drop_stale_visible_row_family_entry(
+                storage,
+                table,
+                branch.as_str(),
+                row_id,
+                stale_schema_hash,
+                Some(live_schema_hash),
+            )? {
+                report.dropped_heads += 1;
+            }
+        }
+
+        // Stamp the derived locator BEFORE rewriting the head, so the write
+        // below sees an already-aligned store and the two locators cannot
+        // disagree afterwards.
+        storage.put_row_locator(
+            row_id,
+            Some(&RowLocator {
+                table: SharedString::from(table.to_string()),
+                origin_schema_hash: Some(live_schema_hash),
+            }),
+        )?;
+
+        let live = visible_row_raw_table_id(table, live_schema_hash);
+        match entry {
+            Some(entry) => {
+                storage.upsert_visible_region_rows(table, std::slice::from_ref(&entry))?;
+                storage.put_visible_row_table_locator(
+                    &branch,
+                    row_id,
+                    Some(&ExactRowTableLocator {
+                        row_raw_table: SharedString::from(live.raw_table_name().to_string()),
+                        table_name: live.table_name.clone(),
+                        schema_hash: live_schema_hash,
+                    }),
+                )?;
+                report.rebuilt_rows += 1;
+                // Recorded only now that the pass has actually arbitrated and
+                // rewritten the head. Pushing on entry made every unresolved row
+                // appear in BOTH lists, which is precisely the case an auditor
+                // reads this report to find.
+                report
+                    .repaired
+                    .push((table.to_string(), branch.clone(), row_id));
+            }
+            None => {
+                // Nothing in the history is visible any more (every version
+                // rejected or superseded): the row has no head at all, which is
+                // the state `delete_visible_region_row` leaves behind. Nothing
+                // survives, so the implicit `_id` / `_id_deleted` entries go too.
+                if drop_stale_visible_row_family_entry(
+                    storage,
+                    table,
+                    branch.as_str(),
+                    row_id,
+                    live_schema_hash,
+                    None,
+                )? {
+                    report.dropped_heads += 1;
+                }
+                storage.put_visible_row_table_locator(&branch, row_id, None)?;
+            }
+        }
+    }
+
+    // Only claim cleanliness the pass actually established.
+    if report.unresolved_rows == 0 {
+        mark_visible_family_sweep_current(storage, table, &generation_set)?;
+    }
+
+    if !report.is_noop() {
+        tracing::warn!(
+            table,
+            families = families.len(),
+            split_rows = report.split_rows,
+            dropped_heads = report.dropped_heads,
+            rebuilt_rows = report.rebuilt_rows,
+            unresolved_rows = report.unresolved_rows,
+            repaired = ?report.repaired,
+            unresolved = ?report.unresolved,
+            "repaired visible heads split across schema generations (defect 27)"
+        );
+    }
+    Ok(report)
+}
+
+/// The generation-set a table currently has, as the marker value: every visible
+/// family's schema hash, sorted, joined. A new deployment registers a new family
+/// and changes this string, which is what re-arms the sweep.
+fn visible_family_generation_set<H: Storage + ?Sized>(
+    storage: &H,
+    table: &str,
+) -> Result<String, StorageError> {
+    let mut hashes: Vec<String> =
+        row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)?
+            .into_iter()
+            .map(|row_raw_table_id| row_raw_table_id.schema_hash.to_string())
+            .collect();
+    hashes.sort();
+    Ok(hashes.join(","))
+}
+
+/// Has this exact generation-set already been swept clean?
+///
+/// Without this the sweep is a permanent boot tax: it scans the KEYS of every
+/// family of every multi-generation table on EVERY start, which measures
+/// (release, rocksdb, healthy two-generation store) 32 ms at 50k rows, 144 ms at
+/// 200k and 807 ms at 1M — roughly 800 ns/row, plus a transient map linear in
+/// row count, paid forever to find nothing. The damage it repairs is created by
+/// a deployment, so a marker naming the generation-set it was last completed for
+/// is the honest bound: it re-arms exactly when a new family appears.
+fn visible_family_sweep_is_current<H: Storage + ?Sized>(
+    storage: &H,
+    table: &str,
+    generation_set: &str,
+) -> Result<bool, StorageError> {
+    match storage.raw_table_get(VISIBLE_FAMILY_SWEEP_TABLE, table)? {
+        Some(bytes) => {
+            ensure_system_raw_table_header_validated_once(
+                storage,
+                VISIBLE_FAMILY_SWEEP_TABLE,
+                STORAGE_KIND_VISIBLE_FAMILY_SWEEP,
+                VISIBLE_FAMILY_SWEEP_FORMAT_V1,
+            )?;
+            Ok(std::str::from_utf8(&bytes)
+                .map_err(|err| StorageError::IoError(format!("sweep marker utf8: {err}")))?
+                == generation_set)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Record that `table` is swept clean for this generation-set.
+///
+/// Only called after a pass that completed WITHOUT leaving anything unresolved
+/// and without failing: a pass that could not arbitrate some row must stay
+/// re-armed, or the marker would promise a cleanliness the store does not have.
+fn mark_visible_family_sweep_current<H: Storage + ?Sized>(
+    storage: &mut H,
+    table: &str,
+    generation_set: &str,
+) -> Result<(), StorageError> {
+    ensure_raw_table_header(
+        storage,
+        VISIBLE_FAMILY_SWEEP_TABLE,
+        &RawTableHeader::system(
+            STORAGE_KIND_VISIBLE_FAMILY_SWEEP,
+            VISIBLE_FAMILY_SWEEP_FORMAT_V1,
+        ),
+    )?;
+    storage.raw_table_put(VISIBLE_FAMILY_SWEEP_TABLE, table, generation_set.as_bytes())
+}
+
+/// [`repair_split_visible_row_families`] over every logical table the store
+/// holds a visible region for. This is the startup entry point.
+pub fn repair_all_split_visible_row_families<H: Storage + ?Sized>(
+    storage: &mut H,
+) -> Result<VisibleFamilySplitRepair, StorageError> {
+    let mut tables = BTreeSet::new();
+    for (raw_table_name, _) in storage.raw_table_scan_prefix(
+        RAW_TABLE_HEADER_TABLE,
+        &row_raw_table_header_kind_prefix(RowRawTableKind::Visible),
+    )? {
+        let row_raw_table_id = RowRawTableId::parse_raw_table_name(&raw_table_name)?;
+        tables.insert(row_raw_table_id.table_name.to_string());
+    }
+
+    let mut report = VisibleFamilySplitRepair::default();
+    for table in tables {
+        // Isolated per table. A `?` here would abandon every LATER table on the
+        // first failure, and the caller logs this at warn — so one bad table
+        // would silently leave the rest of the store unswept, which is exactly
+        // the half-repaired state a resurrecting delete needs.
+        match repair_split_visible_row_families(storage, &table) {
+            Ok(table_report) => report.merge(table_report),
+            Err(error) => {
+                tracing::error!(
+                    table,
+                    %error,
+                    "visible-family split repair FAILED for this table; continuing with the rest"
+                );
+                report.failed_tables.push((table, error.to_string()));
+            }
+        }
+    }
+    Ok(report)
 }
 
 fn validate_row_raw_table_header(
@@ -1648,66 +2550,6 @@ fn common_case_exact_visible_row_table_locator<H: Storage + ?Sized>(
         table_name: row_raw_table_id.table_name.clone(),
         schema_hash,
     }))
-}
-
-fn exact_visible_row_table_locator_for_delete<H: Storage + ?Sized>(
-    storage: &H,
-    table: &str,
-    branch: &str,
-    row_id: ObjectId,
-) -> Result<Option<ExactRowTableLocator>, StorageError> {
-    if let Some(locator) = storage.load_visible_row_table_locator(branch, row_id)? {
-        if locator.table_name.as_str() != table {
-            return Err(StorageError::IoError(format!(
-                "visible row locator table mismatch for {branch}/{row_id:?}: expected {table}, got {}",
-                locator.table_name
-            )));
-        }
-        return Ok(Some(locator));
-    }
-
-    if let Some(locator) = common_case_exact_visible_row_table_locator(storage, row_id)? {
-        if locator.table_name.as_str() == table {
-            // Trust the locator only if the row is actually there — a poisoned
-            // store's bytes may sit in a sibling raw table (defect 20), and a
-            // delete issued against the locator-named table would miss them,
-            // leaving an undeletable row that the read fallback then serves
-            // forever.
-            let key = key_codec::visible_row_raw_table_key(branch, row_id);
-            if storage
-                .raw_table_get(locator.row_raw_table.as_str(), &key)?
-                .is_some()
-            {
-                return Ok(Some(locator));
-            }
-        } else {
-            return Ok(None);
-        }
-    }
-
-    // Sibling probe: find the raw table that physically holds the row.
-    let key = key_codec::visible_row_raw_table_key(branch, row_id);
-    for row_raw_table_id in row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)? {
-        if storage
-            .raw_table_get(row_raw_table_id.raw_table_name(), &key)?
-            .is_some()
-        {
-            tracing::info!(
-                table,
-                branch,
-                %row_id,
-                raw_table = %row_raw_table_id.raw_table_name(),
-                "delete target recovered from a sibling raw table the locator did not name"
-            );
-            return Ok(Some(ExactRowTableLocator {
-                row_raw_table: row_raw_table_id.raw_table_name().to_string().into(),
-                table_name: row_raw_table_id.table_name.clone(),
-                schema_hash: row_raw_table_id.schema_hash,
-            }));
-        }
-    }
-
-    Ok(None)
 }
 
 fn sealed_batch_submission_storage_descriptor_with_branch_ords() -> RowDescriptor {
@@ -2068,6 +2910,48 @@ pub(crate) fn encode_visible_row_bytes_with_context(
     })
 }
 
+/// The write context for the family that PHYSICALLY holds an EXISTING batch's
+/// history bytes, falling back to the normal resolution when none holds it.
+///
+/// Re-writing a batch has to put it back where it already is. Resolving the
+/// family from `__row_locator` instead writes a SECOND copy into another
+/// generation — and `scan_history_row_batches` is sibling-complete, so the row
+/// then carries two versions of ONE batch with different states, and the visible
+/// resolution picks whichever of them is visible. A batch patched to `Rejected`
+/// goes on being served from its other copy. Defect 27's history-side twin,
+/// found by the differential oracle at
+/// `sync_manager::tests::cross_generation_oracle`.
+///
+/// Safe to ask: history keys carry the batch id, so a batch lives in exactly one
+/// family and this point read either finds it or proves the batch is new.
+pub(crate) fn existing_history_row_write_context<H: Storage + ?Sized>(
+    storage: &H,
+    table: &str,
+    branch: &str,
+    row_id: ObjectId,
+    batch_id: BatchId,
+    row: &StoredRowBatch,
+) -> Result<PreparedRowWriteContext, StorageError> {
+    let Some(existing) =
+        load_history_row_batch_row_bytes_with_storage(storage, table, branch, row_id, batch_id)?
+    else {
+        return resolve_history_row_write_context(storage, table, row);
+    };
+    // Only the FAMILY is taken from the existing bytes; the descriptor still
+    // comes from the catalogue, exactly as `resolve_history_row_write_context`
+    // would build it. Nothing about how a row encodes changes when the family
+    // was never in doubt — this only stops a rewrite from landing in a family
+    // the batch is not already in.
+    let schema_hash = existing.row_raw_table_id.schema_hash;
+    prepared_row_write_context_for_schema_hash_and_descriptor(
+        storage,
+        table,
+        schema_hash,
+        row_id,
+        load_user_descriptor_for_schema_hash(storage, table, schema_hash)?,
+    )
+}
+
 pub(crate) fn encode_history_row_bytes_for_storage<H: Storage + ?Sized>(
     storage: &H,
     table: &str,
@@ -2169,6 +3053,7 @@ pub(super) fn scan_visible_row_bytes_with_storage<H: Storage + ?Sized>(
     branch: &str,
 ) -> Result<Vec<OwnedVisibleRowBytes>, StorageError> {
     let row_raw_table_ids = row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)?;
+    let families_scanned = row_raw_table_ids.len();
     let prefix = key_codec::visible_row_raw_table_prefix(branch);
     let mut rows = Vec::new();
     for row_raw_table_id in row_raw_table_ids {
@@ -2193,7 +3078,93 @@ pub(super) fn scan_visible_row_bytes_with_storage<H: Storage + ?Sized>(
             });
         }
     }
+
+    // A split row physically exists in two families, so the loop above emits it
+    // TWICE, with two different contents — a phantom duplicate carrying stale
+    // bytes, in every scan-driven query. The point-read ladder does nothing for
+    // this surface: it is reached only by `load_visible_region_row_bytes`.
+    //
+    // Collapse duplicates onto whatever the point read would have served, so the
+    // two surfaces cannot disagree. Only paid when a duplicate really exists;
+    // a store with one family per table cannot produce one, and short-circuits.
+    if families_scanned > 1 {
+        retain_point_read_winner_per_row(
+            storage,
+            table,
+            branch,
+            &mut rows,
+            |row| row.row_id,
+            |row| row.row_raw_table.as_str(),
+        )?;
+    }
     Ok(rows)
+}
+
+/// Collapse `(branch, row)` duplicates produced by a store that is still split,
+/// keeping the version the point-read ladder serves.
+///
+/// Generic over the scan surface: `scan_visible_row_bytes_with_storage` and
+/// `Storage::scan_visible_region` are two separate iterations over the same
+/// families, and BOTH emit a split row twice. Sharing the collapse is what keeps
+/// them from disagreeing with each other as well as with the point read.
+pub(crate) fn retain_point_read_winner_per_row<H: Storage + ?Sized, T>(
+    storage: &H,
+    table: &str,
+    branch: &str,
+    rows: &mut Vec<T>,
+    row_id_of: impl Fn(&T) -> ObjectId,
+    raw_table_of: impl Fn(&T) -> &str,
+) -> Result<(), StorageError> {
+    // A two-generation store with no duplicates left — which is every store after
+    // the sweep, production included — must not pay for an ordered set over every
+    // scanned row on every scan. `HashSet`, and the second set stays unallocated
+    // until a duplicate is actually seen.
+    let mut seen: HashSet<ObjectId> = HashSet::with_capacity(rows.len());
+    let mut duplicated: HashSet<ObjectId> = HashSet::new();
+    for row in rows.iter() {
+        if !seen.insert(row_id_of(row)) {
+            duplicated.insert(row_id_of(row));
+        }
+    }
+    if duplicated.is_empty() {
+        return Ok(());
+    }
+
+    // For each duplicated row, ask the point read which family wins, and keep
+    // only that one. `load_visible_region_row_bytes_with_storage` IS the ladder,
+    // so the scan cannot drift from the point read by construction.
+    let mut winning_raw_table: HashMap<ObjectId, Option<String>> = HashMap::new();
+    for row_id in &duplicated {
+        let winner = load_visible_region_row_bytes_with_storage(storage, table, branch, *row_id)?
+            .map(|row| row.row_raw_table);
+        tracing::warn!(
+            table,
+            branch,
+            %row_id,
+            winner = winner.as_deref().unwrap_or("<none>"),
+            "visible scan saw one row in more than one schema-generation family \
+             (defect 27); collapsing onto the point read's answer"
+        );
+        winning_raw_table.insert(*row_id, winner);
+    }
+
+    let mut kept: HashSet<ObjectId> = HashSet::new();
+    rows.retain(|row| {
+        let row_id = row_id_of(row);
+        if !duplicated.contains(&row_id) {
+            return true;
+        }
+        match winning_raw_table.get(&row_id) {
+            // The ladder picked a family: keep exactly that copy.
+            Some(Some(winner)) => raw_table_of(row) == winner.as_str(),
+            // The ladder served nothing at all (no locator resolves, no probe
+            // hits). Keep the first copy rather than dropping the row from the
+            // scan entirely — a phantom duplicate is a bug, a vanished row is
+            // worse.
+            _ => kept.insert(row_id),
+        }
+    });
+    Ok(())
 }
 
 pub(super) fn load_history_row_batch_row_bytes_with_storage<H: Storage + ?Sized>(
@@ -2291,28 +3262,29 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
     row_id: ObjectId,
 ) -> Result<Option<OwnedVisibleRowBytes>, StorageError> {
     let key = key_codec::visible_row_raw_table_key(branch, row_id);
-    if let Some(locator) = common_case_exact_visible_row_table_locator(storage, row_id)? {
-        let row_raw_table = locator.row_raw_table.to_string();
-        if let Some(bytes) = storage.raw_table_get(&row_raw_table, &key)? {
-            let resolved = resolved_row_table_from_locator(storage, &locator)?
-                .expect("common-case locator-resolved visible row table must exist");
-            return Ok(Some(OwnedVisibleRowBytes {
-                row_raw_table_id: RowRawTableId {
-                    kind: RowRawTableKind::Visible,
-                    table_name: locator.table_name.clone(),
-                    schema_hash: locator.schema_hash,
-                    raw_table_name: locator.row_raw_table.clone(),
-                },
-                row_raw_table,
-                user_descriptor: resolved.user_descriptor,
-                branch: branch.to_string(),
-                row_id,
-                needs_exact_locator: false,
-                bytes,
-            }));
-        }
-    }
 
+    // The AUTHORITATIVE per-(branch, row) locator first. Every write that puts a
+    // visible head into a family other than the one `__row_locator` names stamps
+    // this pointer at the family it wrote (`storage_trait.rs`,
+    // `apply_encoded_row_mutation`), so it is the only locator kept current by
+    // the write path itself.
+    //
+    // It used to come SECOND, behind the locator DERIVED from
+    // `__row_locator.origin_schema_hash` below — which the inbound sync path
+    // never rewrote, so after a schema deployment it named the generation the
+    // row was born in forever. The derived step hit that fossil and returned,
+    // and the authoritative step never ran (defect 27, production 2026-08-16:
+    // `"row locator aligned to the schema hash the write resolved"` occurrences
+    // = 0, defect-20 sibling-scan hits = 0 — step one always hit).
+    //
+    // Cost: this table is only written on a cross-generation write, so the
+    // common case pays one extra point read that MISSES. Measured on sqlite
+    // (release, 2000 rows, 20k reads, none of them carrying an exact locator —
+    // `sync_manager::tests::cross_generation_visible_split::visible_read_ladder_cost`):
+    // 393 ns/op against 4230 ns/op for the whole visible read, i.e. 9.3%. Paid on
+    // every visible read; correctness first, and the alternative — leaving a
+    // pointer nothing keeps current in front of one that is — is what this
+    // defect is.
     if let Some(locator) = storage.load_visible_row_table_locator(branch, row_id)? {
         let resolved = resolved_row_table_from_locator(storage, &locator)?
             .expect("locator-resolved row table must exist");
@@ -2330,6 +3302,30 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
                 branch: branch.to_string(),
                 row_id,
                 needs_exact_locator: true,
+                bytes,
+            }));
+        }
+    }
+
+    // The common case: no exact locator was ever needed for this row, so the
+    // family derived from `__row_locator` is the only one it has ever lived in.
+    if let Some(locator) = common_case_exact_visible_row_table_locator(storage, row_id)? {
+        let row_raw_table = locator.row_raw_table.to_string();
+        if let Some(bytes) = storage.raw_table_get(&row_raw_table, &key)? {
+            let resolved = resolved_row_table_from_locator(storage, &locator)?
+                .expect("common-case locator-resolved visible row table must exist");
+            return Ok(Some(OwnedVisibleRowBytes {
+                row_raw_table_id: RowRawTableId {
+                    kind: RowRawTableKind::Visible,
+                    table_name: locator.table_name.clone(),
+                    schema_hash: locator.schema_hash,
+                    raw_table_name: locator.row_raw_table.clone(),
+                },
+                row_raw_table,
+                user_descriptor: resolved.user_descriptor,
+                branch: branch.to_string(),
+                row_id,
+                needs_exact_locator: false,
                 bytes,
             }));
         }
@@ -3491,6 +4487,187 @@ mod store_probe {
         probe_incident_store(storage);
     }
 
+    /// Does this store hold any terminal `Rejected` fate? A rejected ancestor
+    /// silences a row's outbound sync forever (defect 28), so the question
+    /// "is there one at all" decides whether that mechanism is live here.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn probe_rejected_fates() {
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch =
+            std::env::temp_dir().join(format!("jazz-fate-probe-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the store for the probe");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
+        let fates = storage
+            .scan_authoritative_batch_fates()
+            .expect("scan authoritative batch fates");
+        let mut missing = 0usize;
+        let mut rejected = Vec::new();
+        let mut durable = 0usize;
+        let mut accepted = 0usize;
+        for fate in &fates {
+            match fate {
+                crate::batch_fate::BatchFate::Missing { .. } => missing += 1,
+                crate::batch_fate::BatchFate::Rejected {
+                    batch_id,
+                    code,
+                    reason,
+                } => rejected.push((*batch_id, code.clone(), reason.clone())),
+                crate::batch_fate::BatchFate::DurableDirect { .. } => durable += 1,
+                crate::batch_fate::BatchFate::AcceptedTransaction { .. } => accepted += 1,
+            }
+        }
+        println!(
+            "fates: total={} durable_direct={durable} accepted_transaction={accepted} missing={missing} rejected={}",
+            fates.len(),
+            rejected.len()
+        );
+        for (batch_id, code, reason) in rejected.iter().take(10) {
+            println!("  REJECTED {batch_id:?} code={code} reason={reason}");
+        }
+
+        // Which tier confirmed them, newest first: a beat the client never
+        // pushed can only be Local-confirmed.
+        let mut tiers: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut with_time: Vec<(u64, String)> = Vec::new();
+        for fate in &fates {
+            let tier = fate
+                .confirmed_tier()
+                .map(|tier| format!("{tier:?}"))
+                .unwrap_or_else(|| "none".to_string());
+            *tiers.entry(tier.clone()).or_default() += 1;
+            let batch_id = fate.batch_id();
+            let bytes = batch_id.as_bytes();
+            let ms = u64::from(bytes[0]) << 40
+                | u64::from(bytes[1]) << 32
+                | u64::from(bytes[2]) << 24
+                | u64::from(bytes[3]) << 16
+                | u64::from(bytes[4]) << 8
+                | u64::from(bytes[5]);
+            with_time.push((ms, tier));
+        }
+        println!("confirmed tiers: {tiers:?}");
+        with_time.sort_by_key(|entry| entry.0);
+        for (ms, tier) in with_time.iter().rev().take(6) {
+            println!("  newest fate ms={ms} tier={tier}");
+        }
+    }
+
+    /// Raw-table forensics: for every raw table holding the probed row, print
+    /// the newest version stamp actually stored. Distinguishes "the write never
+    /// arrived" from "it arrived but reads do not serve it".
+    #[test]
+    #[ignore]
+    fn probe_raw_row_versions() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+        let row_hex = std::env::var("JAZZ_PROBE_ROW_ID")
+            .expect("set JAZZ_PROBE_ROW_ID")
+            .replace('-', "");
+        for (name, _header) in storage
+            .scan_raw_table_headers()
+            .expect("scan raw table headers")
+        {
+            if !name.contains("users") {
+                continue;
+            }
+            let mut newest: u64 = 0;
+            let mut count = 0usize;
+            for (key, value) in storage
+                .raw_table_scan_prefix(&name, "")
+                .expect("scan raw table")
+            {
+                if !key.contains(&row_hex) {
+                    continue;
+                }
+                count += 1;
+                if value.len() >= 0x18
+                    && let Ok(stamp_bytes) = <[u8; 8]>::try_from(&value[0x10..0x18])
+                {
+                    newest = newest.max(u64::from_le_bytes(stamp_bytes));
+                }
+            }
+            if count > 0 {
+                println!("{name}: entries_for_row={count} newest_stamp_us={newest}");
+            }
+        }
+    }
+
+    /// Presence forensics: print every `users` row's `onlineTimeUpdatedAtMs`
+    /// as the store holds it. Run against a COPY of the sync server's store to
+    /// tell "the server applied the heartbeat" from "the client wrote it
+    /// locally and the server never took it" (defect 26).
+    #[test]
+    #[ignore]
+    fn probe_presence_timestamps() {
+        use crate::query_manager::types::Schema;
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let mut storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let current_hash_hex =
+            std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target_hash = crate::query_manager::types::SchemaHash::from_hex(&current_hash_hex)
+            .expect("valid schema hash");
+        let current_schema = extractor
+            .context()
+            .live_schemas
+            .get(&target_hash)
+            .or_else(|| extractor.context().pending_schemas.get(&target_hash))
+            .cloned()
+            .expect("the app's schema must be in the catalogue");
+
+        let mut sm = SchemaManager::new(SyncManager::new(), current_schema, app_id, "dev", "main")
+            .expect("phase-2 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(&mut sm, &storage, app_id)
+            .expect("phase-2 rehydrate");
+        let qm = sm.query_manager_mut();
+        let sub = qm.subscribe(qm.query("users").build()).expect("subscribe");
+        qm.process(&mut storage);
+        for (id, values) in qm.get_subscription_results(sub) {
+            let stamps: Vec<String> = values
+                .iter()
+                .filter_map(|value| match value {
+                    Value::Timestamp(ts) => Some(format!("{ts:?}")),
+                    _ => None,
+                })
+                .collect();
+            println!("users {id} timestamps={stamps:?}");
+        }
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     #[ignore]
@@ -4556,16 +5733,21 @@ mod split_locator_tests {
              read fallback regressed"
         );
 
-        // And the delete resolver must name the raw table that physically
-        // holds the row, or the recovered row becomes an undeletable ghost.
-        let delete_locator =
-            exact_visible_row_table_locator_for_delete(&storage, "users", branch.as_str(), row_id)
-                .expect("delete resolution succeeds");
-        let delete_locator = delete_locator.expect("the delete target must be found");
+        // And the delete must reach the raw table that physically holds the
+        // row, or the recovered row becomes an undeletable ghost. Defect 27
+        // replaced the single-locator resolver with a measurement: a delete goes
+        // to every family that actually holds the row, so a lying locator can
+        // neither misdirect it nor hide a second head from it.
+        let holders = visible_row_raw_tables_holding(&storage, "users", branch.as_str(), row_id)
+            .expect("holder measurement succeeds");
         assert_eq!(
-            delete_locator.schema_hash, schema_hash,
-            "the delete resolver must name the raw table holding the bytes, not the \
-             locator's lie"
+            holders,
+            vec![
+                visible_row_raw_table_id("users", schema_hash)
+                    .raw_table_name()
+                    .to_string()
+            ],
+            "the delete must target the raw table holding the bytes, not the locator's lie"
         );
 
         let _ = std::fs::remove_file(&path);

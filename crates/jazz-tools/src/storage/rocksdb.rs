@@ -595,23 +595,44 @@ impl Storage for RocksDBStorage {
         })
     }
 
+    /// The write path dedups locator persists against `visible_row_table_locators`
+    /// (see `apply_encoded_row_mutation`), so a direct write to this pointer must
+    /// invalidate that cache or the next write will see its own value already
+    /// cached and skip a persist the store actually needs. Defect 27's realign
+    /// and repair sweep both write it directly.
+    fn put_visible_row_table_locator(
+        &mut self,
+        branch: &str,
+        row_id: ObjectId,
+        locator: Option<&super::ExactRowTableLocator>,
+    ) -> Result<(), StorageError> {
+        let cache_key = (branch.to_string(), row_id);
+        self.with_inner_mut(|inner| {
+            inner.visible_row_table_locators.remove(&cache_key);
+            Ok(())
+        })?;
+        super::storage_trait::put_visible_row_table_locator_default(self, branch, row_id, locator)
+    }
+
     fn delete_visible_region_row(
         &mut self,
         table: &str,
         branch: &str,
         row_id: ObjectId,
     ) -> Result<(), StorageError> {
+        // Evict the cached locator (it is a pointer, not a head), then delete
+        // from every family that MEASURABLY holds the row. The cache is no longer
+        // what decides where to delete: it named one family, and reaching one
+        // family is exactly how a row survives its own delete.
         let cache_key = (branch.to_string(), row_id);
-        let locator = self
-            .with_inner_mut(|inner| Ok(inner.visible_row_table_locators.remove(&cache_key)))?
-            .or(super::exact_visible_row_table_locator_for_delete(
-                self, table, branch, row_id,
-            )?);
+        self.with_inner_mut(|inner| Ok(inner.visible_row_table_locators.remove(&cache_key)))?;
+        super::retire_index_entries_for_extra_visible_heads(self, table, branch, row_id)?;
+        let raw_tables = super::visible_row_raw_tables_holding(self, table, branch, row_id)?;
         self.with_inner_mut(|inner| {
             let txn = RefCell::new(inner.db.transaction());
             let key = super::key_codec::visible_row_raw_table_key(branch, row_id);
-            if let Some(locator) = locator.as_ref() {
-                raw_table_delete_core(locator.row_raw_table.as_str(), &key, |storage_key| {
+            for raw_table in &raw_tables {
+                raw_table_delete_core(raw_table.as_str(), &key, |storage_key| {
                     Self::delete_on_txn_cell(&txn, storage_key)
                 })?;
             }

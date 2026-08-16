@@ -1216,6 +1216,225 @@ or drops there was not checked.
 
 ---
 
+## 27. Every write lands in the new schema generation, every read serves the old one — one row, two visible heads
+
+The sync server's store, measured live (2026-08-16, fresh copy of the running rocksdb)
+for the incident user's `users` row `c24432b4-c5d0-5d58-a636-de2d99b6d932`:
+
+```text
+rowtable:visible:users:53710882…  this_row=[dev-53710882-main, dev-b32dae47-main]
+rowtable:visible:users:b32dae47…  this_row=[dev-b32dae47-main]
+__row_locator                     -> 53710882…   (the FOSSIL generation)
+__visible_row_table_locator
+  branch dev-53710882-main        -> None
+  branch dev-b32dae47-main        -> b32dae47…   (PRESENT, and CORRECT)
+```
+
+One `(row, branch)` — `dev-b32dae47-main` — with two visible heads, both live. Every 10s
+heartbeat IS applied, into the current generation, while every reader serves the old one.
+Nothing converges: no write ever revisits the fossil, and a restart does not clear it.
+
+Two details from the measurement shape the fix. The authoritative
+`__visible_row_table_locator` SURVIVED the damage and names the live family — the inbound
+cross-generation write stamps it and nothing un-stamps it — so inverting the read ladder's
+precedence is what makes this row read correctly again, **at the first restart, before any
+repair pass finishes**; the sweep's job is then to remove the duplicate head, which is what
+the scan surface, the delete path and the index all trip over. And the fossil family holds
+heads for TWO branches while the live family holds only the current one, so the split is
+per `(row, branch)`, not per row: `dev-b32dae47-main` has two heads, `dev-53710882-main`
+has one and is not split. Every repair here keys on the branch for that reason.
+
+**Mechanism.** Visible raw-table keys are `<branch>:<row_uuid>` with NO batch id, so
+writing a row into a second family ADDS a head rather than replacing one. (History keys do
+carry the batch id, which is why histories cannot fork this way — a wrong family misses
+instead of answering wrongly.) Three things then have to line up, and did:
+
+1. The inbound path (`sync_manager/inbox.rs`) builds its write context from the metadata
+   the SENDER attached, so a client on the new schema writes into the new family — but it
+   never rewrites `__row_locator`, which still names the generation the row was born in.
+2. `storage::load_visible_region_row_bytes_with_storage` consulted the locator DERIVED
+   from `__row_locator` FIRST and returned on its hit. The exact per-`(branch,row)`
+   `__visible_row_table_locator` — the pointer the write path actually keeps current — and
+   defect 20's sibling scan were only reached on a MISS. The stale sibling always hit, so
+   neither ever ran. That is why the server's logs showed zero sibling-scan repairs: step
+   one never missed.
+3. Nothing on any path DELETED the head the row left behind.
+
+**Attribution.** Both halves are upstream at merge-base `e84d84a69`: the read ladder was
+already derived-locator-first there, and `ensure_object_metadata` wrote `__row_locator`
+only when absent, so a row that changed generation kept its birth pointer forever. Our own
+defect-20 fix `5edb72663` then half-cured it into looking healed — it added the sibling
+scan and locator alignment on `apply_row_batch`, which repairs a row the ladder MISSES.
+This row is never missed, so the cure never fires. A half-cure that turns a loud failure
+(row unreadable, defect 20) into a silent one (row readable, wrong, forever) is worse than
+no cure, and it is why this went unnoticed for two engine releases.
+
+**Adjacent surfaces, all of them family-blind.** The split is not only a read-precedence
+bug, and fixing the ladder alone would have left three:
+
+- **Delete.** `Storage::delete_visible_region_row` resolved ONE family and deleted there,
+  then cleared the authoritative locator — which dropped the reader onto the derived
+  pointer still naming the surviving fossil. A deleted row was served again, permanently:
+  a row with one remaining head is not "split", so no repair pass revisits it.
+- **Scan.** `scan_visible_region` and `scan_visible_row_bytes_with_storage` iterate every
+  family and did not dedupe, so a split row appeared TWICE in every scan-driven query,
+  with two different contents.
+- **Index.** Index raw tables are `idx:<table>:<column>:<branch>` with no schema hash
+  (`key_codec::index_raw_table`), so both generations write into the SAME index and
+  dropping a head leaves its values indexed with nothing behind them. Three consumers
+  trust the index without re-reading the row: a fully-covered indexed predicate drops its
+  residual filter entirely (`graph/compile.rs`, `Predicate::True`), `row_is_indexed_on_branch`
+  / `row_is_deleted_on_branch` are pure index reads, and REBAC edge traversal takes
+  `index_lookup` directly for an indexed scalar `Uuid` column while only the NON-indexed
+  fallback re-verifies against row content — so a stale entry there GRANTS ACCESS across
+  an edge that no longer exists.
+
+**FIXED (2026-08-16), adversarially reviewed.** One principle: the family a row's head is
+in is a measured fact, never a pointer's claim. (1) The visible read ladder consults the
+authoritative `__visible_row_table_locator` before the derived one, and probes it rather
+than trusting it. (2) Every visible write, wherever it comes from, passes
+`storage::enforce_single_visible_family_after_write`: it measures which families hold
+`(branch, row)` at the moment the bytes land (`storage::visible_row_families_holding`),
+deletes every non-live head, and points both locators at the survivor. That placement is
+load-bearing — the main write path is not the only writer that picks its family from a
+locator. Four others do (`patch_exact_row_batch_for_schema_hash` from batch rejection,
+`patch_row_region_rows_by_batch_with_storage`, and the two rejected-delete restores), each
+verified able to fork a head: `__row_locator` is keyed by ROW ID alone while heads are
+keyed by `(branch, row)`, and `scan_history_row_batches` carries no branch filter, so a row
+live on two branches has its branches' heads written into each other's families. (3) A delete reaches every family that measurably holds the row, not the one a
+locator names. (4) Both scan surfaces collapse duplicates onto whatever the point read
+serves, so the two surfaces cannot disagree. (5) Dropping a head retires exactly the index
+entries only that head justified — keeping the ones the survivor still justifies, and
+keeping `_id` while any head remains. (6) A startup sweep
+(`storage::repair_all_split_visible_row_families`, wired into `RuntimeCore::new`, which
+the sync server, node, web and jazz-rn all reach) heals stores already damaged, recomputing
+the winner from sibling-complete history through defect 21's rule rather than by comparing
+the two heads — comparing them is exactly the reasoning that made the fossil look
+defensible. The sweep records a per-table marker naming the generation-set it completed
+for, so it re-arms on the next deployment instead of taxing every boot. Measured on a
+healthy two-generation rocksdb store, FIRST boot after a deployment: 32 ms at 50k rows,
+144 ms at 200k, 807 ms at 1M (~800 ns/row). Steady state, every boot after that one, with
+the marker in place: **54.6 µs at 50k rows and 75.5 µs at 200k** — two point reads, flat in
+row count. The first-boot figure is the one to size a deployment window against; the steady
+state is what the fix actually costs.
+
+Two findings the randomized oracle produced that no hand-written gate did: patching a
+batch's state wrote the patched row into the family `__row_locator` named, leaving the
+original in ITS family with its old state — so a batch patched to `Rejected` kept being
+served; and a no-op apply dragged `__row_locator` off the head, harmless before the ladder
+inversion and fatal after it.
+
+DEPENDENCY (ordering, not optional). Two ways this fix can be defeated by a neighbour that
+does not have it.
+
+**A rollback re-arms nothing.** The startup sweep records a per-table marker naming the
+generation-set it completed for, so it does not re-scan on every boot. That marker is keyed
+on the SET of registered families, not on a version or a timestamp. So: a fixed engine
+sweeps a table clean and writes the marker for generation-set `{A,B}`; an OLDER engine then
+opens the same store — a rollback, a pinned binding, a stale worker — and forks a head; the
+fixed engine boots again, sees the generation-set unchanged, finds the marker current and
+**never sweeps that table again**. The read ladder still saves the READ while the
+authoritative locator survives, but the duplicate head, its index entries and the delete
+path all stay live. Recovery is one line: delete the table's row from the
+`__visible_family_sweep` raw table and restart. `the_sweep_marker_re_arms_when_a_new_generation_appears`
+pins exactly this behaviour — it damages the store behind the marker's back and asserts the
+pass is skipped — so the trade is deliberate and gated, not accidental.
+
+**Servers must be upgraded before clients.** `metadata_from_row_locator` transmits
+`origin_schema_hash` from the sender's `__row_locator`. A client carrying this fix has had
+that pointer REALIGNED to the family its head is really in — that is the point of it. It
+then tells the server "generation B" for a row an OLD server still holds in generation A.
+The old server has no chokepoint, writes into B on the strength of the metadata, leaves its
+A head in place, and forks — the exact defect, now induced on the authority by a corrected
+client. Same conclusion as entry 28 and for a related reason: **upgrade servers first.**
+
+Known residue, stated rather than implied: a store already HALF-DELETED by an older engine
+(one head dropped, one surviving) is not distinguishable from a healthy single-head row
+without a per-row history read, so the sweep does not attempt it — the source is fixed, the
+pre-existing instances are not. The four locator-aimed writers listed above are cured at the
+chokepoint rather than individually — none of them was given its own gate, so a fifth such
+writer would be caught by the invariant but is not separately proven absent. And a separate
+finding surfaced by this work, NOT fixed here: `Storage::index_remove` does not cover the
+signed-zero split at all — `Value::Double(0.0)` and `-0.0` encode to different key segments
+while the lookup path probes both — so an ordinary UPDATE or DELETE that moves a row off a
+zero-valued double leaks an index entry. The retirement path in this fix works around it
+locally; the underlying asymmetry is still live on every other write path and wants its own
+entry.
+
+Groove (codex/jazz-core-engine-swap): not verified for this entry. The class is
+schema-generation crossing, which the groove line rearchitects; whether its row storage is
+family-scoped at all was not checked.
+
+---
+
+## 28. One rejected ancestor silences a row's outbound sync forever, without a word
+
+**Severity: permanent, silent outbound sync loss per row; self-sustaining.** One terminal
+`Rejected` anywhere in a row's ancestry severed that row's client→server sync for good.
+The local store advanced forever, every later write parented on the last, and nothing left
+the device. Nothing was logged at any level — the row simply stopped existing upstream,
+which is what kept this invisible.
+
+`queue_row_to_server_with_missing_parents` (`sync_manager/forwarding.rs`) walks a row's
+ancestors to queue whatever the server is not known to hold. On finding a parent whose
+authoritative fate `is_rejected()`, it did `return;` — abandoning the ENTIRE walk,
+including the tip row the function was called with, so the fresh write was never enqueued.
+Both call sites are affected (`forward_row_batch_to_servers_with_storage` and the full
+replay in `queue_full_sync_to_server_from_storage`), so neither a new write nor a reconnect
+replay could break out.
+
+How a rejection enters the ancestry: `runtime_core/ticks.rs::apply_received_batch_fate`
+persists any server-sent fate, `Rejected` included, and
+`query_manager/server_queries.rs` denies with "schema unavailable for branch …" on a
+schema-resolution timeout — exactly what a cross-generation deployment manufactures. The
+rejection then outlives the condition that caused it, permanently. The only escape was
+`force_row_batch_to_servers`, reached only if something else already knew the row was
+missing.
+
+Fix: `return` → `continue`. A terminal rejection prunes the DESCENT only. Withholding the
+rejected ancestor itself stays right — the authority denied it, resending earns the same
+denial — but its descendants are fresh writes the authority has never judged. Every
+withhold is now announced at `warn!(target: "jazz::sync", …)` naming the server, row,
+branch, the batch being withheld from, the rejected ancestor, and the rejection code and
+reason. The structural hole is closed with `TipMustBeQueued`, a `#[cfg(debug_assertions)]`
+drop guard that panics if the function leaves without enqueueing its own argument — a drop
+guard rather than a post-loop assertion deliberately: the exit that caused this defect was
+a `return` from inside the walk, which jumps over anything placed after the loop.
+Disarming proved the post-loop form dead and the drop-guard form live.
+
+DEPENDENCY (deployment ordering, not optional): sending a child without its rejected parent
+is safe only against an authority that PARKS such a child — `inbox.rs`
+`park_failed_row_batch` plus `request_missing_ancestor`, shipped in entry 26's fix. Against
+an older server the child is dropped with no repair protocol, and because the client records
+delivery at QUEUE time (`record_delivery`), the frontier then over-claims and the row
+degrades into entry 26's wedge. **Servers must be upgraded before clients carrying this
+fix.** Upstream's `return` was defensible on the day it was written, when no authority
+parked; it is not defensible now.
+
+Gates (`sync_manager/tests/policied_row_repeat_submissions.rs`):
+`a_fresh_beat_is_queued_even_when_an_ancestor_was_rejected_and_the_frontier_is_empty`,
+`the_same_beat_is_queued_when_the_frontier_already_covers_its_parent`, and
+`a_rejected_ancestor_is_withheld_loudly_and_leaves_other_rows_alone` (the rejected ancestor
+stays withheld, a DIFFERENT row on the same connection is untouched, and the warn fires
+naming the poisoned row while never naming the neighbour). Controls: the identical history
+with no rejected ancestor stays green on both sides of the fix. Falsified three ways:
+restoring the pristine upstream file reddens all three at their enqueue assertions;
+restoring only the `return` while keeping the guard reddens all three inside the guard,
+naming the abandoned row; removing only the warn reddens the third gate alone. Suite: 1558
+passed / 0 failed.
+
+Attribution: UPSTREAM-INHERITED, precisely dated. `74717db243` (2026-07-14) added the
+rejected-parent check; `f6d4412b9a` (2026-07-15, "fix: withhold children of rejected
+parents") is a ONE-LINE `continue;` → `return;` in this exact function. Both are ancestors
+of merge-base `e84d84a6` (verified with `git merge-base --is-ancestor`). Our fix restores
+the pre-`f6d4412b9a` control flow and adds the log, the guard, and the parking precondition
+upstream did not have.
+Groove (codex/jazz-core-engine-swap): not verified for this entry. The class is
+delivery-repair, which the groove line rearchitects (`CommitUnit`/`FateUpdate`); whether a
+rejected ancestor prunes the descent or the walk there was not checked.
+
+---
+
 ## Groove line: verification summary (2026-08-15)
 
 Upstream's Thursday publishes are cut from the integration branch
@@ -1238,7 +1457,8 @@ Open PRs on the branch that overlap entries here: #1538 → 17; #1533, #1537 →
 #1523 → 19/20; #1535, #1520 → 1's class; #1201 → 20's twin on main; #1367, #1503 → 18 and
 6's RN half; #1200 is tier-adjacent.
 
-The risk verdict: 17 of the 23 live entries (entry 4 is withdrawn; 24 total) have mechanisms unrepresentable on the groove line,
+The risk verdict: 17 of the 27 live entries (entry 4 is withdrawn; 28 total) have mechanisms unrepresentable on the groove line,
+(entries 25-28 postdate this groove pass and are marked "not verified" in their own footers — they are not counted either way),
 plus entry 24's branch-universe face (its outer-row-kill face is an unverified review item there),
 including 17, 19, 20 and 23 — the schema-crossing class. Still present: 6's RN half, the
 new O(table) policy scan flagged under entry 15, and 22's blind `id` readers (the IVM

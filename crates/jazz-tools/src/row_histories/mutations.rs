@@ -187,19 +187,22 @@ pub fn apply_row_batch<H: Storage>(
     // on out-of-order delivery) must not leave the locator pointing at a
     // generation whose write never landed — that strands every history point
     // read for batches stored without exact locators.
+    // The aligned locator rides the request so the visibility change this apply
+    // reports names the family the bytes went to. PERSISTING it belongs to
+    // `storage::enforce_single_visible_family_after_write`, which runs where the
+    // bytes land and therefore also covers the inbound sync path — that path
+    // builds its locator from the incoming metadata and never comes through here
+    // (defect 27).
     let context_hash = context.history_row_raw_table_id().schema_hash;
-    let stamped_schema_hash = row_locator.origin_schema_hash;
-    let needs_alignment = stamped_schema_hash != Some(context_hash);
-    let row_locator = if needs_alignment {
+    let row_locator = if row_locator.origin_schema_hash == Some(context_hash) {
+        row_locator
+    } else {
         crate::storage::RowLocator {
             table: row_locator.table.clone(),
             origin_schema_hash: Some(context_hash),
         }
-    } else {
-        row_locator
     };
-    let aligned_locator = needs_alignment.then(|| row_locator.clone());
-    let result = apply_row_batch_with_context(
+    apply_row_batch_with_context(
         io,
         ApplyRowBatchWithContext {
             object_id,
@@ -212,21 +215,19 @@ pub fn apply_row_batch<H: Storage>(
             context,
             is_known_new_object: false,
         },
-    )?;
-    if let Some(aligned) = aligned_locator {
-        io.put_row_locator(object_id, Some(&aligned))
-            .map_err(RowHistoryError::StorageError)?;
-        tracing::info!(
-            %object_id,
-            table = %aligned.table,
-            resolved_schema = %context_hash.short(),
-            stamped_schema = ?stamped_schema_hash.map(|hash| hash.short()),
-            "row locator aligned to the schema hash the write resolved"
-        );
-    }
-    Ok(result)
+    )
 }
 
+/// Apply one row batch under an already-resolved write context.
+///
+/// No family realignment happens here. Every visible write — this one included —
+/// lands through `storage::enforce_single_visible_family_after_write`, which
+/// measures which families hold `(branch, row)` at the moment the bytes land,
+/// MOVES the head rather than forking it, and points both locators at it. An
+/// earlier version of this fix did that work again here, on a predicted head
+/// family; it was measured redundant (disarm this pass alone and no gate falls,
+/// disarm both and seven do) and removed rather than kept as an unfalsifiable
+/// second belt.
 pub(crate) fn apply_row_batch_with_context<H: Storage>(
     io: &mut H,
     request: ApplyRowBatchWithContext<'_>,
@@ -435,8 +436,21 @@ pub fn patch_row_batch_state<H: Storage>(
     if original_row.branch.as_str() != branch_name.as_str() {
         return Ok(None);
     }
-    let context = crate::storage::resolve_history_row_write_context(io, &table, &original_row)
-        .map_err(RowHistoryError::StorageError)?;
+    // The family this batch ALREADY lives in, not the one the locator names: a
+    // patch must rewrite the batch where it is, or it leaves the original copy
+    // behind in another generation with its old state and creates a second one
+    // here. `scan_history_row_batches` is sibling-complete, so the row then has
+    // two versions of one batch, and the visible resolution takes whichever is
+    // visible — a batch patched to `Rejected` goes on being served.
+    let context = crate::storage::existing_history_row_write_context(
+        io,
+        &table,
+        branch_name.as_str(),
+        object_id,
+        batch_id,
+        &original_row,
+    )
+    .map_err(RowHistoryError::StorageError)?;
     let previous_entry = load_previous_visible_entry(
         io,
         &table,
@@ -513,11 +527,34 @@ pub fn patch_row_batch_state<H: Storage>(
         )?
     };
     let visible_entries: Vec<_> = patched_entry.iter().cloned().collect();
+    // The head this patch lands belongs to the WINNER, never to the batch being
+    // patched: rejecting a generation-B tip can hand the row back to a
+    // generation-A version, and the head then belongs in generation A. Nothing is
+    // predicted here any more — the write below encodes the entry, and
+    // `storage::enforce_single_visible_family_after_write` then measures which
+    // families actually hold `(branch, row)` and moves the head out of the one
+    // the winner left. Measuring after the fact is strictly better than
+    // predicting before it: this path re-enters itself
+    // (`supersede_older_staging_rows_for_batch`), so a prediction taken here can
+    // be stale by the time the bytes land.
     if patched_entry.is_some() {
-        io.apply_row_mutation(
+        // Encoded with the EXISTING batch's context, so the patched bytes
+        // replace the batch in place instead of forking it into the family the
+        // locator happens to name. The visible entries keep their own
+        // per-winner resolution.
+        let encoded_history =
+            crate::storage::encode_history_row_bytes_with_context(&context, &patched_row)
+                .map_err(RowHistoryError::StorageError)?;
+        let encoded_visible =
+            crate::storage::encode_visible_row_bytes_for_storage(io, &table, &visible_entries)
+                .map_err(RowHistoryError::StorageError)?;
+        <H as Storage>::apply_prepared_row_mutation(
+            io,
             &table,
             std::slice::from_ref(&patched_row),
             &visible_entries,
+            std::slice::from_ref(&encoded_history),
+            &encoded_visible,
             &[],
         )
         .map_err(RowHistoryError::StorageError)?;

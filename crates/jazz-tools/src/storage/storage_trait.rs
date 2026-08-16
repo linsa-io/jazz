@@ -105,21 +105,7 @@ pub trait Storage {
         row_id: ObjectId,
         locator: Option<&ExactRowTableLocator>,
     ) -> Result<(), StorageError> {
-        let key = visible_row_table_locator_key(branch, row_id);
-        if let Some(locator) = locator {
-            ensure_raw_table_header(
-                self,
-                VISIBLE_ROW_TABLE_LOCATOR_TABLE,
-                &RawTableHeader::system(
-                    STORAGE_KIND_VISIBLE_ROW_TABLE_LOCATOR,
-                    EXACT_ROW_TABLE_LOCATOR_STORAGE_FORMAT_V1,
-                ),
-            )?;
-            let bytes = encode_exact_row_table_locator(locator)?;
-            self.raw_table_put(VISIBLE_ROW_TABLE_LOCATOR_TABLE, &key, &bytes)
-        } else {
-            self.raw_table_delete(VISIBLE_ROW_TABLE_LOCATOR_TABLE, &key)
-        }
+        put_visible_row_table_locator_default(self, branch, row_id, locator)
     }
 
     fn load_history_row_batch_table_locator(
@@ -1067,6 +1053,11 @@ pub trait Storage {
             encoded_visible_rows,
             index_mutations,
         )?;
+        // The family these bytes landed in is now the row's only head. See
+        // `enforce_single_visible_family_after_write`: four writers reach here
+        // with a family chosen from a locator rather than measured, and a visible
+        // write into a second family ADDS a head rather than replacing one.
+        enforce_single_visible_family_after_write(self, table, encoded_visible_rows)?;
         self.index_local_batch_history_rows(table, history_rows, encoded_history_rows)
     }
 
@@ -1109,7 +1100,8 @@ pub trait Storage {
         entries: &[VisibleRowEntry],
     ) -> Result<(), StorageError> {
         let encoded_rows = encode_visible_row_bytes_for_storage(self, table, entries)?;
-        self.apply_encoded_row_mutation(table, &[], &encoded_rows, &[])
+        self.apply_encoded_row_mutation(table, &[], &encoded_rows, &[])?;
+        enforce_single_visible_family_after_write(self, table, &encoded_rows)
     }
 
     fn delete_visible_region_row(
@@ -1118,11 +1110,19 @@ pub trait Storage {
         branch: &str,
         row_id: ObjectId,
     ) -> Result<(), StorageError> {
+        // Retire the extra heads' index entries first, while their bytes can
+        // still be decoded — the caller's own index removals only cover the one
+        // version the point read served.
+        retire_index_entries_for_extra_visible_heads(self, table, branch, row_id)?;
         let key = key_codec::visible_row_raw_table_key(branch, row_id);
-        if let Some(locator) =
-            exact_visible_row_table_locator_for_delete(self, table, branch, row_id)?
-        {
-            self.raw_table_delete(locator.row_raw_table.as_str(), &key)?;
+        // EVERY family that holds the row, measured — not the single family a
+        // locator names. A delete that reaches one head out of two also clears
+        // the authoritative locator, which drops the read ladder onto the derived
+        // `__row_locator` still naming the surviving fossil: the deleted row is
+        // served again, and no repair pass revisits it because a row with one
+        // head is not split any more. See `visible_row_raw_tables_holding`.
+        for raw_table in visible_row_raw_tables_holding(self, table, branch, row_id)? {
+            self.raw_table_delete(&raw_table, &key)?;
         }
         self.put_visible_row_table_locator(branch, row_id, None)?;
         Ok(())
@@ -1187,7 +1187,9 @@ pub trait Storage {
     ) -> Result<Vec<StoredRowBatch>, StorageError> {
         let resolved_tables = resolved_row_tables_for_table(self, RowRawTableKind::Visible, table)?;
         let prefix = key_codec::visible_row_raw_table_prefix(branch);
-        let mut rows = Vec::new();
+        // Tagged with the family each row came out of, so a split row's two
+        // copies can be told apart and collapsed below.
+        let mut rows: Vec<(String, StoredRowBatch)> = Vec::new();
         for resolved in &resolved_tables {
             for (key, bytes) in self.raw_table_scan_prefix(&resolved.row_raw_table, &prefix)? {
                 let (decoded_branch, row_id) = key_codec::decode_visible_row_raw_table_key(&key)?;
@@ -1196,7 +1198,8 @@ pub trait Storage {
                         "visible row raw table key '{key}' decoded unexpected branch '{decoded_branch}'"
                     )));
                 }
-                rows.push(
+                rows.push((
+                    resolved.row_raw_table.clone(),
                     decode_visible_row_entry_bytes_in_table(
                         resolved,
                         row_id,
@@ -1204,9 +1207,24 @@ pub trait Storage {
                         &bytes,
                     )?
                     .current_row,
-                );
+                ));
             }
         }
+        // A row that still lives in two families is emitted twice, with two
+        // different contents — a phantom duplicate in every scan-driven query.
+        // Collapse onto whatever the point read serves, so the two surfaces
+        // cannot disagree. Free on a store with one family per table.
+        if resolved_tables.len() > 1 {
+            retain_point_read_winner_per_row(
+                self,
+                table,
+                branch,
+                &mut rows,
+                |(_, row)| row.row_id,
+                |(raw_table, _)| raw_table.as_str(),
+            )?;
+        }
+        let mut rows: Vec<StoredRowBatch> = rows.into_iter().map(|(_, row)| row).collect();
         rows.sort_by_key(|row| (row.branch.clone(), row.row_id));
         Ok(rows)
     }
@@ -2106,6 +2124,31 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         (**self).apply_encoded_row_mutation(table, history_rows, visible_rows, index_mutations)
     }
 
+    // These two MUST be forwarded. The backends override
+    // `put_visible_row_table_locator` to evict `inner.visible_row_table_locators`,
+    // which `apply_encoded_row_mutation` — forwarded just above — consults to
+    // skip redundant locator persists. Taking the trait default here would write
+    // the raw table and leave the backend's cache holding the old family, so a
+    // later locator write gets deduplicated away against a stale entry.
+    // `Box<dyn Storage + Send>` is what the sync server, the node binding and the
+    // web binding all run; only jazz-rn is concrete.
+    fn load_visible_row_table_locator(
+        &self,
+        branch: &str,
+        row_id: ObjectId,
+    ) -> Result<Option<ExactRowTableLocator>, StorageError> {
+        (**self).load_visible_row_table_locator(branch, row_id)
+    }
+
+    fn put_visible_row_table_locator(
+        &mut self,
+        branch: &str,
+        row_id: ObjectId,
+        locator: Option<&ExactRowTableLocator>,
+    ) -> Result<(), StorageError> {
+        (**self).put_visible_row_table_locator(branch, row_id, locator)
+    }
+
     fn apply_prepared_row_mutation(
         &mut self,
         table: &str,
@@ -2471,5 +2514,31 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
 
     fn close(&self) -> Result<(), StorageError> {
         (**self).close()
+    }
+}
+
+/// The default body of [`Storage::put_visible_row_table_locator`], split out so
+/// backends that keep an in-memory mirror of this pointer can invalidate it and
+/// then delegate.
+pub(super) fn put_visible_row_table_locator_default<H: Storage + ?Sized>(
+    storage: &mut H,
+    branch: &str,
+    row_id: ObjectId,
+    locator: Option<&ExactRowTableLocator>,
+) -> Result<(), StorageError> {
+    let key = visible_row_table_locator_key(branch, row_id);
+    if let Some(locator) = locator {
+        ensure_raw_table_header(
+            storage,
+            VISIBLE_ROW_TABLE_LOCATOR_TABLE,
+            &RawTableHeader::system(
+                STORAGE_KIND_VISIBLE_ROW_TABLE_LOCATOR,
+                EXACT_ROW_TABLE_LOCATOR_STORAGE_FORMAT_V1,
+            ),
+        )?;
+        let bytes = encode_exact_row_table_locator(locator)?;
+        storage.raw_table_put(VISIBLE_ROW_TABLE_LOCATOR_TABLE, &key, &bytes)
+    } else {
+        storage.raw_table_delete(VISIBLE_ROW_TABLE_LOCATOR_TABLE, &key)
     }
 }

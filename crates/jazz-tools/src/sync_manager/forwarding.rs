@@ -6,6 +6,52 @@ use crate::storage::{RowLocator, Storage, metadata_from_row_locator};
 use std::collections::HashSet;
 use uuid::Uuid;
 
+/// Debug-only sentinel for the structural guarantee of
+/// [`SyncManager::queue_row_to_server_with_missing_parents`]: the row it was
+/// called with is enqueued on EVERY exit path.
+///
+/// A post-loop `debug_assert!` cannot express this, because the exit that caused
+/// defect 28 was a `return` from inside the walk, which jumps straight over any
+/// code placed after it. Checking on drop is what makes the guarantee hold for
+/// exits that have not been written yet.
+#[cfg(debug_assertions)]
+struct TipMustBeQueued<'a> {
+    queued: &'a std::cell::Cell<bool>,
+    object_id: ObjectId,
+    branch_name: BranchName,
+    tip_batch_id: BatchId,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for TipMustBeQueued<'_> {
+    fn drop(&mut self) {
+        // Never convert an unrelated panic into a double panic, which aborts.
+        if std::thread::panicking() || self.queued.get() {
+            return;
+        }
+        panic!(
+            "queue_row_to_server_with_missing_parents left without queueing its own row \
+             (row {}, branch {}, batch {:?}) — an ancestor-level decision may prune the \
+             descent, never skip the tip (defect 28)",
+            self.object_id, self.branch_name, self.tip_batch_id
+        );
+    }
+}
+
+/// The `(code, reason)` of a terminal rejection, or `None` for any other fate.
+///
+/// Owned rather than borrowed so the caller can probe a fate it loaded into a
+/// temporary as cheaply as one it holds in a map, and pay the two clones only
+/// on the rare rejected branch.
+fn rejection_detail(fate: &BatchFate) -> Option<(String, String)> {
+    match fate {
+        BatchFate::Rejected { code, reason, .. } => Some((code.clone(), reason.clone())),
+        BatchFate::DurableDirect { .. }
+        | BatchFate::AcceptedTransaction { .. }
+        | BatchFate::Missing { .. } => None,
+    }
+}
+
 impl SyncManager {
     fn object_has_upstream_confirmation<H: Storage>(
         &self,
@@ -176,7 +222,6 @@ impl SyncManager {
                 metadata,
                 row,
             );
-            return;
         }
     }
 
@@ -210,6 +255,16 @@ impl SyncManager {
         }
     }
 
+    /// Queue `row` to a server, preceded by whatever ancestors that server is
+    /// not known to hold.
+    ///
+    /// Structural guarantee (hard): there is no exit path that skips enqueueing
+    /// `row` itself. An ancestor-level decision — the delivered frontier, an
+    /// unreadable parent, a terminal rejection — may prune the DESCENT only;
+    /// none of them may abandon the walk. A `return` placed inside the loop
+    /// re-introduces defect 28, in which one terminal `Rejected` anywhere in a
+    /// row's ancestry silently severed that row's outbound sync forever.
+    /// [`TipMustBeQueued`] is that guarantee, armed on every exit path.
     pub(super) fn queue_row_to_server_with_missing_parents<H: Storage>(
         &mut self,
         storage: &H,
@@ -221,6 +276,15 @@ impl SyncManager {
     ) {
         let object_id = row.row_id;
         let branch_name = BranchName::new(&row.branch);
+        let tip_batch_id = row.batch_id;
+        let tip_was_queued = std::cell::Cell::new(false);
+        #[cfg(debug_assertions)]
+        let _tip_guard = TipMustBeQueued {
+            queued: &tip_was_queued,
+            object_id,
+            branch_name,
+            tip_batch_id,
+        };
         let mut visited = HashSet::new();
 
         // Iterative post-order walk, not recursion: a deep history chain would
@@ -252,18 +316,49 @@ impl SyncManager {
                     {
                         continue;
                     }
-                    let parent_is_rejected = match authoritative_fates {
-                        Some(fates) => fates
-                            .get(&parent_batch_id)
-                            .is_some_and(BatchFate::is_rejected),
+                    let parent_rejection = match authoritative_fates {
+                        Some(fates) => fates.get(&parent_batch_id).and_then(rejection_detail),
                         None => storage
                             .load_authoritative_batch_fate(parent_batch_id)
                             .ok()
                             .flatten()
-                            .is_some_and(|fate| fate.is_rejected()),
+                            .as_ref()
+                            .and_then(rejection_detail),
                     };
-                    if parent_is_rejected {
-                        return;
+                    // A terminal rejection prunes the DESCENT ONLY. Withholding the
+                    // rejected ancestor itself stays right — the authority denied it, so
+                    // resending it only earns the same denial — but its descendants are
+                    // fresh writes the authority has never judged, and they must still go.
+                    //
+                    // Upstream f6d4412b9a ("withhold children of rejected parents") turned
+                    // this `continue` into a `return`, which abandoned the whole walk
+                    // including the tip: one rejection anywhere in a row's ancestry
+                    // severed that row's outbound sync permanently and silently (defect
+                    // 28). That was defensible when upstream wrote it, because an
+                    // authority then DROPPED a child whose parent it did not know.
+                    //
+                    // DEPENDENCY — this fix is only safe against an authority that PARKS
+                    // such a child instead: `sync_manager/inbox.rs`
+                    // `park_failed_row_batch` keeps a batch that failed with
+                    // `ParentNotFound`, and `request_missing_ancestor` asks the sender for
+                    // the ancestor (v16.15, `da3a7541e`). Against a pre-v16.15 authority
+                    // the descendant we send here is dropped with no repair protocol.
+                    if let Some((code, reason)) = parent_rejection {
+                        // Never silent: the gap between "written locally" and "missing
+                        // upstream" is what made defect 28 invisible for days.
+                        tracing::warn!(
+                            target: "jazz::sync",
+                            %server_id,
+                            row_id = %object_id,
+                            branch_name = %branch_name,
+                            batch_id = ?current.batch_id,
+                            rejected_ancestor = ?parent_batch_id,
+                            rejection_code = %code,
+                            rejection_reason = %reason,
+                            "withholding a rejected ancestor from a server; its descendants \
+                             are still queued and the authority parks them until the gap heals"
+                        );
+                        continue;
                     }
                     if !visited.insert(parent_batch_id) {
                         continue;
@@ -305,6 +400,9 @@ impl SyncManager {
             }
 
             let (current, _) = stack.pop().expect("stack is non-empty");
+            if current.batch_id == tip_batch_id {
+                tip_was_queued.set(true);
+            }
             self.queue_row_to_server_with_storage(
                 storage, table, server_id, object_id, metadata, current,
             );

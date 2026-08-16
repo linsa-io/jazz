@@ -472,6 +472,30 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     /// Create a new RuntimeCore.
     pub fn new(mut schema_manager: SchemaManager, mut storage: S, scheduler: Sch) -> Self {
         let _ = schema_manager.ensure_current_schema_persisted(&mut storage);
+        // Heal defect 27's damage before anything reads: a store that was
+        // written by an engine older than this one can hold a `(row, branch)`
+        // with a visible head in two schema-generation families, and every read
+        // would serve the stale one forever — no write ever revisits the row,
+        // and a restart does not clear it. On a store with one generation per
+        // table this is one header prefix scan and nothing else.
+        match crate::storage::repair_all_split_visible_row_families(&mut storage) {
+            Ok(report) if report.is_noop() => {}
+            Ok(report) => tracing::warn!(
+                split_rows = report.split_rows,
+                dropped_heads = report.dropped_heads,
+                rebuilt_rows = report.rebuilt_rows,
+                unresolved_rows = report.unresolved_rows,
+                repaired = ?report.repaired,
+                unresolved = ?report.unresolved,
+                failed_tables = ?report.failed_tables,
+                "startup repaired visible heads split across schema generations"
+            ),
+            Err(error) => tracing::error!(
+                %error,
+                "startup sweep for schema-generation-split visible heads failed; the store \
+                 may still serve a stale head for a split row"
+            ),
+        }
         let acknowledged_rejected_batches: HashSet<BatchId> = storage
             .scan_acknowledged_rejected_batch_fates()
             .map(|batch_ids| batch_ids.into_iter().collect())
