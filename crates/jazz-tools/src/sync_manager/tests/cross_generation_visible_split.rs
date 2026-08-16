@@ -645,6 +645,65 @@ fn a_stale_derived_locator_does_not_outrank_the_locator_writes_keep_current() {
     );
 }
 
+/// What the defect-27 write chokepoint costs on the COMMON path: a
+/// single-generation store, where it can only ever measure the families once
+/// and find nothing to move. Run:
+///   cargo test -p jazz-tools --features "sqlite test-utils" --release \
+///     --lib visible_write_chokepoint_cost -- --ignored --nocapture
+#[test]
+#[ignore = "measurement, not a gate"]
+fn visible_write_chokepoint_cost() {
+    const WRITES: usize = 2_000;
+
+    let mut io = split_capable_storage();
+    crate::test_support::persist_test_schema(&mut io, &users_test_schema());
+
+    let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::GlobalServer);
+    let client_id = ClientId::new();
+    sm.add_client_with_storage(&io, client_id);
+    sm.set_client_acks_deliveries(client_id, true);
+    sm.set_client_role(client_id, ClientRole::User);
+    sm.set_client_session(
+        client_id,
+        crate::query_manager::session::Session::new("alice"),
+    );
+    sm.take_outbox();
+
+    let whole_write = std::time::Instant::now();
+    for index in 0..WRITES {
+        let row = visible_row(
+            ObjectId::new(),
+            "main",
+            Vec::new(),
+            1_000 + index as u64,
+            format!("row-{index}").as_bytes(),
+        );
+        send_and_approve(&mut sm, &mut io, client_id, row_metadata("users"), &row);
+    }
+    let whole_write = whole_write.elapsed();
+
+    // The chokepoint's own probe: the header prefix scan that decides whether
+    // more than one family exists for this table.
+    let probe = std::time::Instant::now();
+    for _ in 0..WRITES {
+        let _ = std::hint::black_box(crate::storage::visible_row_families_holding(
+            &io,
+            "users",
+            "main",
+            ObjectId::new(),
+        ));
+    }
+    let probe = probe.elapsed();
+
+    let whole_ns = whole_write.as_nanos() as f64 / WRITES as f64;
+    let probe_ns = probe.as_nanos() as f64 / WRITES as f64;
+    println!(
+        "visible write path: whole write {whole_ns:.0} ns/op, chokepoint family probe \
+         {probe_ns:.0} ns/op ({:.1}% of the write it was added to)",
+        100.0 * probe_ns / whole_ns
+    );
+}
+
 /// The cost of the read-ladder inversion, measured rather than argued.
 ///
 /// Making the authoritative `__visible_row_table_locator` the FIRST step means
