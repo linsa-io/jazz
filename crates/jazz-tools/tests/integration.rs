@@ -69,6 +69,9 @@ async fn ws_handshake(port: u16, jwt_token: &str) -> Result<ConnectedResponse, S
         },
         catalogue_state_hash: None,
         declared_schema_hash: None,
+        // This harness is a raw WebSocket client: it never applies rows, so it
+        // never confirms them.
+        acks_deliveries: false,
     };
     let payload = serde_json::to_vec(&handshake).expect("serialize AuthHandshake");
     ws.send(Message::Binary(frame_encode(&payload).into()))
@@ -416,6 +419,9 @@ async fn test_ws_connection_stays_open_after_handshake() {
         },
         catalogue_state_hash: None,
         declared_schema_hash: None,
+        // This harness is a raw WebSocket client: it never applies rows, so it
+        // never confirms them.
+        acks_deliveries: false,
     };
     let payload = serde_json::to_vec(&handshake).expect("serialize AuthHandshake");
     ws.send(Message::Binary(frame_encode(&payload).into()))
