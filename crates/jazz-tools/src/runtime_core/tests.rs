@@ -3276,6 +3276,392 @@ fn a_parentless_write_still_resolves_a_row_that_spans_branches() {
 /// attempts read the whole history, under the runtime mutex, before being
 /// refused for a reason two point lookups would have given. One core pinned at
 /// 98%, the log silent for an hour.
+/// A tombstone whose parents are absent must PARK, never be rejected.
+///
+/// The refusal-cost shortcut must not touch deletes, and the reason is asymmetric in a way
+/// that is invisible from the sync layer. `inbox.rs` classifies on `is_deleted` BEFORE it
+/// looks at parents, so a tombstone with parents is `Operation::Delete`. The Update arm of
+/// the policy refills empty old content from the row's visible version
+/// (`server_queries.rs`, `evaluate_update_permission`); the Delete arm has no such
+/// recovery — with no old content it calls `reject_permission_check`, and that PERSISTS a
+/// `Rejected` fate. From then on every arrival of that batch id is forced to `Rejected` on
+/// sight, so handing over the missing parent afterwards cannot heal it.
+///
+/// So for a tombstone the difference between reading the row's history and not reading it
+/// is the difference between a recoverable park and the permanent destruction of a
+/// client's delete. The cheap path buys CPU on updates, which is the traffic that caused
+/// the incident; deletes keep paying, and that is the right trade until Delete is given
+/// the recovery Update already has.
+#[test]
+fn a_tombstone_with_absent_parents_parks_instead_of_being_rejected() {
+    let schema = owned_documents_schema_v1();
+    let mut server = create_runtime_with_schema(schema, "tombstone-absent-parents");
+    let client_id = ClientId::new();
+    let alice = Session::new("alice");
+    server.add_client(client_id, Some(alice.clone()));
+
+    let ((row_id, _), _) = server
+        .insert(
+            "documents",
+            document_insert_values("alice", "doc"),
+            Some(&WriteContext::from_session(alice.clone())),
+        )
+        .expect("seed a row alice owns");
+    server.batched_tick();
+    server.immediate_tick();
+
+    let live_branch = crate::storage::sole_branch_name(server.storage())
+        .expect("branch registry readable")
+        .expect("the seeded row registered a branch");
+
+    // The same row on another branch, so the fallback the tombstone depends on is the
+    // expensive arm — the shape a schema deployment leaves behind.
+    let other_branch = format!("{}-previous-generation", live_branch.as_str());
+    crate::test_support::apply_test_row_batch(
+        server.storage_mut(),
+        row_id,
+        &other_branch,
+        crate::row_histories::StoredRowBatch::new(
+            row_id,
+            other_branch.as_str(),
+            Vec::new(),
+            encode_row(
+                &owned_documents_schema_v1()[&TableName::new("documents")].columns,
+                &[Value::Text("alice".into()), Value::Text("older".into())],
+            )
+            .expect("row encodes"),
+            crate::metadata::RowProvenance::for_insert(row_id.to_string(), 1),
+            HashMap::new(),
+            crate::row_histories::RowState::VisibleDirect,
+            None,
+        ),
+    )
+    .expect("the older generation's version applies on its own branch");
+    server.sync_sender().take();
+
+    let mut tombstone = crate::row_histories::StoredRowBatch::new(
+        row_id,
+        live_branch.as_str(),
+        vec![
+            crate::row_histories::BatchId::new(),
+            crate::row_histories::BatchId::new(),
+        ],
+        encode_row(
+            &owned_documents_schema_v1()[&TableName::new("documents")].columns,
+            &[Value::Text("alice".into()), Value::Text("doc".into())],
+        )
+        .expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(row_id.to_string(), 9_999),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+    tombstone.is_deleted = true;
+    let tombstone_batch_id = tombstone.batch_id;
+
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: None,
+            row: tombstone,
+        },
+    });
+    server.batched_tick();
+    server.immediate_tick();
+
+    let rejected = server.sync_sender().take().into_iter().any(|entry| {
+        matches!(
+            &entry.payload,
+            SyncPayload::BatchFate { fate }
+                if fate.batch_id() == tombstone_batch_id && fate.is_rejected()
+        )
+    });
+    assert!(
+        !rejected,
+        "a delete whose declared parents are absent must park and wait for them, not be \
+         rejected. A rejection here is persisted as an authoritative fate, every later \
+         arrival of the batch is forced to `Rejected` on sight, and the client's delete is \
+         gone for good — supplying the missing parent afterwards cannot bring it back. The \
+         apply would have refused this batch with `ParentNotFound` either way; the only \
+         thing that changed is whether the policy was handed the old content it needs."
+    );
+}
+
+/// A parent and its child arriving together must both land, and the child must not be
+/// refused for a parent that is in the same delivery.
+///
+/// This is the one behaviour the cheap refusal predicate can reach. `pre_batch_visible_row`
+/// runs while the inbox is drained; the apply that needs the parent runs later in the same
+/// settle pass. So when parent and child arrive together, the child's policy inputs are
+/// computed at a moment when the parent is genuinely absent from storage — and the walk now
+/// stops there rather than reading the row's history. What must NOT follow is a refusal:
+/// the parent lands before the apply, the child applies on top of it, and nothing asks the
+/// peer to retransmit anything.
+///
+/// The distinction is why the predicate lives in the walk and not higher up. Hoisting an
+/// unappliability check to the top of the inbox would refuse this child outright, turning
+/// ordinary ordered delivery into a retransmit round-trip — amplifying the very loop this
+/// work exists to quiet.
+#[test]
+fn a_parent_and_child_in_one_delivery_both_apply() {
+    let schema = test_schema();
+    let mut server = create_runtime_with_schema(schema, "parent-child-same-delivery");
+    let client_id = ClientId::new();
+    server.add_client(client_id, Some(Session::new("writer")));
+    server.batched_tick();
+    server.immediate_tick();
+    server.sync_sender().take();
+
+    // One local write first, so the branch registry names the composed branch this
+    // authority actually writes on. An empty store has no branch to read.
+    let _ = insert_and_wait_for_batch(
+        &mut server,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(ObjectId::new())),
+            ("name".to_string(), Value::Text("seed".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed a row so the branch exists");
+    server.batched_tick();
+    server.immediate_tick();
+    server.sync_sender().take();
+
+    let row_id = ObjectId::new();
+    let columns = &test_schema()[&TableName::new("users")].columns;
+    let branch = crate::storage::sole_branch_name(server.storage())
+        .expect("branch registry readable")
+        .expect("the seeded row registered a branch")
+        .as_str()
+        .to_string();
+
+    // TWO parents, because one takes a different route: a single-parent batch is answered
+    // by a point read and returns before the ancestor walk, so a one-parent child would
+    // never reach the code this guards.
+    let first_parent = crate::row_histories::StoredRowBatch::new(
+        row_id,
+        branch.as_str(),
+        Vec::new(),
+        encode_row(columns, &user_row_values(row_id, "parent-a")).expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(row_id.to_string(), 1_000),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+    let second_parent = crate::row_histories::StoredRowBatch::new(
+        row_id,
+        branch.as_str(),
+        vec![first_parent.batch_id],
+        encode_row(columns, &user_row_values(row_id, "parent-b")).expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(row_id.to_string(), 2_000),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+    let child = crate::row_histories::StoredRowBatch::new(
+        row_id,
+        branch.as_str(),
+        vec![first_parent.batch_id, second_parent.batch_id],
+        encode_row(columns, &user_row_values(row_id, "child")).expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(row_id.to_string(), 3_000),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+
+    // All in ONE drain, child last — the ordering a client produces when it writes
+    // several times before the socket flushes.
+    for row in [first_parent, second_parent, child] {
+        server.park_sync_message(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::RowBatchCreated {
+                // The row is new to this authority, so the table has to ride with it —
+                // without it there is no locator and nothing can be applied at all.
+                metadata: Some(crate::sync_manager::RowMetadata {
+                    id: row_id,
+                    metadata: HashMap::from([(
+                        crate::metadata::MetadataKey::Table.as_str().to_string(),
+                        "users".to_string(),
+                    )]),
+                }),
+                row,
+            },
+        });
+    }
+    server.batched_tick();
+    server.immediate_tick();
+
+    let asked_for_a_retransmit = server.sync_sender().take().into_iter().any(|entry| {
+        matches!(
+            &entry.payload,
+            SyncPayload::BatchFate { fate } if matches!(fate, crate::batch_fate::BatchFate::Missing { .. })
+        )
+    });
+    assert!(
+        !asked_for_a_retransmit,
+        "a child whose parent is in the same delivery must not be answered with \
+         `BatchFate::Missing`: the parent was never lost, and asking for it converts \
+         ordered delivery into a retransmit round-trip"
+    );
+
+    let visible = server
+        .storage()
+        .load_visible_region_row("users", branch.as_str(), row_id)
+        .expect("visible row readable")
+        .expect("the row must exist after both batches applied");
+    let values = decode_row(columns, visible.data.as_ref()).expect("row decodes");
+    assert_eq!(
+        values[1],
+        Value::Text("child".into()),
+        "the child must be the visible version — it applied on top of the parent that \
+         arrived with it. Skipping the pre-batch read decides only what the policy sees, \
+         never whether the write lands."
+    );
+}
+
+/// The same refusal, for a row that also exists on another branch — the shape a schema
+/// deployment leaves behind, and the one the 2026-08-14 fix did not reach.
+///
+/// `pre_batch_visible_row` walks the batch's declared ancestors by point lookup, and when
+/// none resolves it asks one question before giving up: does this row have history on
+/// another branch. On `false` it returns cheaply, which is what
+/// `a_write_whose_parents_are_missing_costs_no_history_read` above gates — that fixture
+/// builds its row through `sole_branch_name`, so the probe is always false there and only
+/// the cheap arm is ever exercised. On `true` it still reads the row's ENTIRE history, and
+/// `apply_row_batch` then refuses the batch with `ParentNotFound` anyway. The scan buys
+/// nothing, and the refusal was decided by the parents alone.
+///
+/// The gate turns on the BRANCH because that is the question the code asks. In production
+/// the two branches are two schema generations — composed branch names carry the schema
+/// hash (`<env>-<hash12>-<branch>`), so a deployment splits every touched row across two of
+/// them — but nothing on this path reads a generation, and modelling one would test a
+/// coincidence rather than the condition.
+///
+/// MEASURED in production 2026-08-18: 130,634 refusals in three hours, peaking at 49,606
+/// per minute, every one of them the SAME row on the older generation's branch with
+/// `source="permission_approval"`, its declared parent count climbing 1, 2, 3 … 46 as the
+/// sender retried. The settle passes that carried them ran 15.4 s, 25.0 s, 29.3 s and
+/// 37.6 s with `subscriptions=0` and `rows_emitted=0`, spending 205–663 history scans over
+/// as many as 2,467,082 history entries and 412 MB. One core, held by refusals.
+#[test]
+fn a_write_whose_parents_are_missing_costs_no_history_read_across_branches() {
+    let schema = test_schema();
+    let mut server = create_runtime_with_schema(schema, "missing-parent-cost-cross-branch");
+    let client_id = ClientId::new();
+    server.add_client(client_id, Some(Session::new("writer")));
+
+    // One row, many versions — a presence row's shape, and the reason a whole-history read
+    // is not a rounding error.
+    let row_id = ObjectId::new();
+    let ((server_row_id, _), _) = insert_and_wait_for_batch(
+        &mut server,
+        "users",
+        HashMap::from([
+            ("id".to_string(), Value::Uuid(row_id)),
+            ("name".to_string(), Value::Text("v0".to_string())),
+        ]),
+        None,
+        DurabilityTier::Local,
+    )
+    .expect("seed the row");
+    for version in 1..40 {
+        server
+            .update(
+                server_row_id,
+                vec![("name".to_string(), Value::Text(format!("v{version}")))],
+                None,
+            )
+            .expect("grow the history");
+    }
+    server.batched_tick();
+    server.immediate_tick();
+
+    let live_branch = crate::storage::sole_branch_name(server.storage())
+        .expect("branch registry readable")
+        .expect("the seeded rows registered a branch");
+
+    // THE ONE DIFFERENCE from the single-branch gate: the same row also has history on
+    // another branch, which is what a schema deployment leaves behind and what flips
+    // `row_has_history_outside_branch` to true.
+    let other_branch = format!("{}-previous-generation", live_branch.as_str());
+    crate::test_support::apply_test_row_batch(
+        server.storage_mut(),
+        server_row_id,
+        &other_branch,
+        crate::row_histories::StoredRowBatch::new(
+            server_row_id,
+            other_branch.as_str(),
+            Vec::new(),
+            encode_row(
+                &test_schema()[&TableName::new("users")].columns,
+                &user_row_values(server_row_id, "authored under the older generation"),
+            )
+            .expect("row encodes"),
+            crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 1),
+            HashMap::new(),
+            crate::row_histories::RowState::VisibleDirect,
+            None,
+        ),
+    )
+    .expect("the older generation's version applies on its own branch");
+    assert!(
+        crate::storage::row_has_history_on_another_branch(
+            server.storage(),
+            "users",
+            server_row_id,
+            live_branch.as_str(),
+        )
+        .expect("branch probe readable"),
+        "fixture precondition: the row must have history outside the incoming branch, else \
+         this gates the same cheap arm the single-branch test already covers"
+    );
+    server.sync_sender().take();
+
+    // The diverged shape: two parents, neither of which this authority holds.
+    let orphaned = crate::row_histories::StoredRowBatch::new(
+        server_row_id,
+        live_branch.as_str(),
+        vec![
+            crate::row_histories::BatchId::new(),
+            crate::row_histories::BatchId::new(),
+        ],
+        encode_row(
+            &test_schema()[&TableName::new("users")].columns,
+            &user_row_values(server_row_id, "from a diverged client"),
+        )
+        .expect("row encodes"),
+        crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 9_999),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+
+    server.storage().reset_history_scans();
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::RowBatchCreated {
+            metadata: None,
+            row: orphaned,
+        },
+    });
+    server.batched_tick();
+    server.immediate_tick();
+    let history_reads = server.storage().history_scans();
+
+    eprintln!("whole-history reads for one unappliable cross-branch write: {history_reads}");
+    assert_eq!(
+        history_reads, 0,
+        "one write with absent parents cost {history_reads} reads of the row's entire \
+         history before refusing it. The refusal is decided by the declared parents alone — \
+         point lookups that cannot be changed by anything the policy inputs say — so the \
+         read is paid for an answer that was already fixed. A row that exists on two \
+         branches is not an edge case: a schema deployment splits every touched row across \
+         two of them, and a client left on the older one can send these as fast as it likes."
+    );
+}
+
 #[test]
 fn a_write_whose_parents_are_missing_costs_no_history_read() {
     let schema = test_schema();

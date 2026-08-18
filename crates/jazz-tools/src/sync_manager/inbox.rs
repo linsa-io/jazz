@@ -423,9 +423,6 @@ impl SyncManager {
             .as_ref()
             .map(|locator| locator.table.to_string())
             .unwrap_or_else(|| table.to_string());
-        let context =
-            crate::storage::resolve_history_row_write_context(storage, &history_table, row).ok()?;
-
         // The ancestors this batch declares, fetched one by one rather than
         // sieved out of the row's whole history. The walk below only ever
         // reaches versions linked from `row.parents`, so the history read was
@@ -437,6 +434,14 @@ impl SyncManager {
         // 23,661 refusals over 803 batches, every multi-parent one reading the
         // whole history under the runtime mutex before being refused for absent
         // parents. One core at 98%, the log silent for an hour.
+        // The DECLARED parents, as opposed to the transitive frontier below. The walk
+        // loads each of them with exactly the call `apply_row_batch_with_context` will use
+        // to decide `ParentNotFound` — same table, same branch pin, same row — so the walk
+        // already knows the refusal's answer and can stop before paying for inputs to a
+        // decision that is made. Nothing is read twice to learn it.
+        let declared_parents: HashSet<crate::row_histories::BatchId> =
+            row.parents.iter().copied().collect();
+
         let mut ancestors = Vec::new();
         let mut seen = HashSet::new();
         let mut frontier = row.parents.clone();
@@ -444,11 +449,33 @@ impl SyncManager {
             if !seen.insert(batch_id) {
                 continue;
             }
-            let Some(candidate) = storage
+            let loaded = storage
                 .load_history_row_batch(&history_table, row.branch.as_str(), row.row_id, batch_id)
                 .ok()
-                .flatten()
-            else {
+                .flatten();
+            // EXISTENCE, not visibility. `apply_row_batch_with_context` refuses on a parent
+            // it cannot load at all; a parent that is present but Rejected, Superseded or
+            // StagingPending is found there and does NOT refuse, while the visibility test
+            // below would drop it from `ancestors`. Reading this off `ancestors.is_empty()`
+            // instead would refuse to compute inputs for writes that go on to apply.
+            // NOT for a tombstone. `is_deleted` is classified as `Operation::Delete`
+            // before parents are looked at, and the Delete arm of the policy has no
+            // recovery: with no old content it calls `reject_permission_check`, which
+            // PERSISTS a `Rejected` fate. Every later arrival of that batch id is then
+            // forced to `Rejected` on sight, so supplying the missing parent afterwards
+            // cannot heal it — a recoverable park would become permanent destruction of
+            // the client's delete. Update has the recovery (it refills old content from
+            // the visible row); Delete does not, and giving it one is a separate defect.
+            if !row.is_deleted && loaded.is_none() && declared_parents.contains(&batch_id) {
+                // Production 2026-08-18: 6,981 of these in eight hours from one client left
+                // on an older schema generation, peaking at 1,333 a minute. Each one walked
+                // 3,721 history versions of a single row — the fallback below reads across
+                // ALL branches, so it kept finding the row on the generation the client had
+                // moved off — and then the write was refused for the absent parent anyway.
+                // Settle passes of up to 51 seconds, `subscriptions=0`, `rows_emitted=0`.
+                return None;
+            }
+            let Some(candidate) = loaded else {
                 continue;
             };
             if candidate.batch_id != row.batch_id && candidate.state.is_visible() {
@@ -456,6 +483,13 @@ impl SyncManager {
                 ancestors.push(candidate);
             }
         }
+
+        // Resolved AFTER the walk, not before: the walk needs only `history_table`, and a
+        // batch refused for an absent parent leaves above without ever reaching the one
+        // consumer of this context. Paying for it first would make the refusal cost a read
+        // it has no use for.
+        let context =
+            crate::storage::resolve_history_row_write_context(storage, &history_table, row).ok()?;
 
         // The sieve handed its rows over sorted; a depth-first pop order is not
         // obviously equivalent for a consumer that turns out to care, and the
@@ -648,15 +682,30 @@ impl SyncManager {
                     ) {
                         Ok(applied) => applied.visibility_change,
                         Err(err) => {
-                            tracing::warn!(
-                                row_id = %row.row_id,
-                                %branch_name,
-                                batch_id = ?row.batch_id,
-                                source = source.as_str(),
-                                parents = row.parents.len(),
-                                ?err,
-                                "failed to apply synced row batch"
-                            );
+                            let (speak, attempts, stuck_for) =
+                                self.note_unappliable_row((row.row_id, branch_name));
+                            if speak {
+                                tracing::warn!(
+                                    row_id = %row.row_id,
+                                    %branch_name,
+                                    batch_id = ?row.batch_id,
+                                    source = source.as_str(),
+                                    parents = row.parents.len(),
+                                    attempts,
+                                    stuck_for_secs = stuck_for / 1_000_000,
+                                    ?err,
+                                    "failed to apply synced row batch"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    row_id = %row.row_id,
+                                    %branch_name,
+                                    batch_id = ?row.batch_id,
+                                    attempts,
+                                    ?err,
+                                    "failed to apply synced row batch (repeat)"
+                                );
+                            }
                             return RowApplyOutcome::Failed(err);
                         }
                     }
@@ -665,15 +714,30 @@ impl SyncManager {
                     match apply_row_batch(storage, row.row_id, &branch_name, row.clone(), &[]) {
                         Ok(applied) => applied.visibility_change,
                         Err(err) => {
-                            tracing::warn!(
-                                row_id = %row.row_id,
-                                %branch_name,
-                                batch_id = ?row.batch_id,
-                                source = source.as_str(),
-                                parents = row.parents.len(),
-                                ?err,
-                                "failed to apply synced row batch"
-                            );
+                            let (speak, attempts, stuck_for) =
+                                self.note_unappliable_row((row.row_id, branch_name));
+                            if speak {
+                                tracing::warn!(
+                                    row_id = %row.row_id,
+                                    %branch_name,
+                                    batch_id = ?row.batch_id,
+                                    source = source.as_str(),
+                                    parents = row.parents.len(),
+                                    attempts,
+                                    stuck_for_secs = stuck_for / 1_000_000,
+                                    ?err,
+                                    "failed to apply synced row batch"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    row_id = %row.row_id,
+                                    %branch_name,
+                                    batch_id = ?row.batch_id,
+                                    attempts,
+                                    ?err,
+                                    "failed to apply synced row batch (repeat)"
+                                );
+                            }
                             return RowApplyOutcome::Failed(err);
                         }
                     }
@@ -742,6 +806,7 @@ impl SyncManager {
         );
         let error = match first_attempt {
             RowApplyOutcome::Applied(applied) => {
+                self.clear_unappliable_row(&row_key);
                 self.drain_parked_row_batches(storage, row_key);
                 return Some(*applied);
             }
@@ -762,6 +827,7 @@ impl SyncManager {
                 source,
             ) {
                 RowApplyOutcome::Applied(applied) => {
+                    self.clear_unappliable_row(&row_key);
                     self.drain_parked_row_batches(storage, row_key);
                     return Some(*applied);
                 }
@@ -1676,6 +1742,48 @@ impl SyncManager {
     /// offline-only — and the budget is connection-scoped, so a reconnect asks again. What
     /// the peer loses is the instruction to retransmit, which is exactly the thing that was
     /// costing both sides everything.
+    /// Whether this failure should be spoken aloud, and what the row has cost so far.
+    ///
+    /// The first failure for a `(row, branch)` always warns. After that the row is counted,
+    /// and warns again only once an interval has passed — carrying the accumulated attempts
+    /// and how long it has been stuck, which is the line that names the problem rather than
+    /// describing one attempt out of tens of thousands.
+    fn note_unappliable_row(&mut self, row_key: (ObjectId, BranchName)) -> (bool, u64, u64) {
+        let now = self.clock.reserve_timestamp();
+        let notice = self.unappliable_rows.entry(row_key).or_insert_with(|| {
+            crate::sync_manager::UnappliableRowNotice {
+                attempts: 0,
+                first_failed_at: now,
+                last_warned_at: 0,
+            }
+        });
+        notice.attempts += 1;
+        let stuck_for = now.saturating_sub(notice.first_failed_at);
+        let speak = notice.last_warned_at == 0
+            || now.saturating_sub(notice.last_warned_at)
+                >= crate::sync_manager::UNAPPLIABLE_ROW_WARN_INTERVAL_MICROS;
+        if speak {
+            notice.last_warned_at = now;
+        }
+        (speak, notice.attempts, stuck_for)
+    }
+
+    /// A row that was failing now applied. Say so once, with what it cost.
+    fn clear_unappliable_row(&mut self, row_key: &(ObjectId, BranchName)) {
+        let Some(notice) = self.unappliable_rows.remove(row_key) else {
+            return;
+        };
+        let now = self.clock.reserve_timestamp();
+        tracing::warn!(
+            target: "jazz::sync",
+            row_id = %row_key.0,
+            branch_name = %row_key.1,
+            attempts = notice.attempts,
+            stuck_for_secs = now.saturating_sub(notice.first_failed_at) / 1_000_000,
+            "a row that could not be applied has applied"
+        );
+    }
+
     fn may_tell_client_a_batch_is_missing(
         &mut self,
         client_id: ClientId,

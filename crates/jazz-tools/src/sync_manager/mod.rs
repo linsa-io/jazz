@@ -146,6 +146,24 @@ pub(super) struct ClientMissingAnswers {
 /// round, resets the budget every round and the bound never engages. A declaration that
 /// can be matched never reaches here at all, so re-arming on a changed one buys nothing
 /// except that hole.
+/// How often a row that keeps failing to apply may repeat its WARN.
+///
+/// The first failure per `(row, branch)` is always loud — that is the line that names the
+/// problem. After it, repeats carry no new information and are counted instead of logged,
+/// with one summary allowed per interval. Production 2026-08-18: one wedged row emitted
+/// 130,634 identical WARN lines in three hours, peaking at 49,606 a minute, and not one of
+/// them said "this row is stuck". The volume was its own outage surface, and the incident
+/// was found from a CPU graph rather than from the log that was describing it all along.
+pub(super) const UNAPPLIABLE_ROW_WARN_INTERVAL_MICROS: u64 = 30_000_000;
+
+/// What one `(row, branch)` has cost while it could not be applied.
+#[derive(Clone)]
+pub(super) struct UnappliableRowNotice {
+    pub(super) attempts: u64,
+    pub(super) first_failed_at: u64,
+    pub(super) last_warned_at: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct MissingAnswerBudget {
     pub(super) answers: u32,
@@ -193,6 +211,10 @@ pub struct SyncManager {
     /// and no fate is invented, because on the peer a `Rejected` destroys the row and the
     /// graft tool is offline-only.
     pub(super) missing_answers: HashMap<ClientId, ClientMissingAnswers>,
+    /// Rows that could not be applied, and what they have cost since. Keeps the repeat
+    /// failures out of the log while making the row itself nameable — see
+    /// `UNAPPLIABLE_ROW_WARN_INTERVAL_MICROS`.
+    pub(super) unappliable_rows: HashMap<(ObjectId, BranchName), UnappliableRowNotice>,
 
     /// Row batches whose apply failed recoverably, kept until a later arrival on the same
     /// row makes them applicable.
@@ -419,6 +441,7 @@ impl SyncManager {
             outbox: Vec::new(),
             pending_client_deliveries: HashMap::new(),
             missing_answers: HashMap::new(),
+            unappliable_rows: HashMap::new(),
             parked_row_batches: HashMap::new(),
             parked_rows_order: VecDeque::new(),
             applied_rows_to_confirm: Vec::new(),
