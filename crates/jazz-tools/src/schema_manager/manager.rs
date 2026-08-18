@@ -1870,7 +1870,8 @@ impl SchemaManager {
 
         let _span = tracing::debug_span!("SM::delete", table, %object_id, schema_hash = %self.context.current_hash).entered();
         let _ = source_branch;
-        self.query_manager
+        let handle = self
+            .query_manager
             .delete_existing_row_on_branch_with_schema_and_write_context(
                 storage,
                 RowBranchDelete {
@@ -1883,7 +1884,121 @@ impl SchemaManager {
                 &target_schema,
                 write_context,
                 false,
-            )
+            )?;
+
+        self.retire_row_on_generation_siblings(
+            storage,
+            &table,
+            object_id,
+            &target_branch,
+            &target_context,
+            write_context,
+        );
+
+        Ok(handle)
+    }
+
+    /// Tombstone the row on every generation sibling that still serves it.
+    ///
+    /// The delete above lands on the target branch only. A row written before a schema
+    /// deployment keeps its live head on the PREVIOUS generation's branch, and this is a
+    /// deliberate exception to the shelf model that
+    /// `a_local_update_across_a_generation_crossing_moves_the_head_instead_of_forking_it`
+    /// pins: an UPDATE may leave the old branch its own head, because an old reader is
+    /// entitled to the old shape, but deletion is monotone and existence cannot differ per
+    /// shelf.
+    ///
+    /// It is not only this store's answer that depends on it. Fan-out selects clients by
+    /// `is_in_scope(object_id, branch_name)`, an exact `(row, branch)` match, and per-branch
+    /// backfill re-serves whatever head that branch holds — so a peer whose scope names the
+    /// previous generation is never told anything and re-learns the live row on every
+    /// resync. Only a tombstone authored on THAT branch reaches it.
+    ///
+    /// Each sibling is written under its OWN schema and its own head's bytes. Passing the
+    /// current schema instead pairs one generation's hash with another's descriptor, which
+    /// fails as `EncodingError("variable column offset out of bounds")` and leaves the
+    /// sibling live — measured — and poisons a descriptor cache keyed by
+    /// `(schema_hash, table)` on the way.
+    ///
+    /// Failures are logged, never propagated: the primary delete has already applied, and
+    /// turning a sibling's failure into the caller's error would report a delete that
+    /// succeeded as failed.
+    fn retire_row_on_generation_siblings<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        table: &str,
+        object_id: ObjectId,
+        target_branch: &str,
+        target_context: &SchemaContext,
+        write_context: Option<&WriteContext>,
+    ) {
+        // Inside an open batch the members would span two target branches and the seal
+        // rejects that outright (`seal_batch_rejects_members_spanning_multiple_target_branches`).
+        // A staged delete also skips index mutations, so there is nothing to retire yet.
+        if crate::query_manager::manager::QueryManager::write_context_is_open_batch(write_context) {
+            return;
+        }
+
+        // Walked from the live schemas themselves, not from the branch NAMES. A composed
+        // name carries only the first 6 bytes of the hash, so parsing it back yields a
+        // truncated `SchemaHash` that matches no key — the lookup silently finds nothing
+        // and the fan-out quietly does no work.
+        let siblings: Vec<(String, Schema)> = target_context
+            .live_schemas
+            .iter()
+            .map(|(hash, schema)| {
+                (
+                    ComposedBranchName::new(
+                        &target_context.env,
+                        *hash,
+                        &target_context.user_branch,
+                    )
+                    .to_branch_name()
+                    .as_str()
+                    .to_string(),
+                    schema.clone(),
+                )
+            })
+            .collect();
+        for (sibling, sibling_schema) in siblings {
+            if sibling == target_branch {
+                continue;
+            }
+            let Ok(Some(head)) = storage.load_visible_region_row(table, &sibling, object_id) else {
+                continue;
+            };
+            if head.is_deleted {
+                continue;
+            }
+            let head_data = head.data.to_vec();
+            let head_provenance = head.row_provenance();
+            if let Err(error) = self
+                .query_manager
+                .delete_existing_row_on_branch_with_schema_and_write_context(
+                    storage,
+                    RowBranchDelete {
+                        table,
+                        branch: &sibling,
+                        id: object_id,
+                        old_data_for_policy: &head_data,
+                        old_provenance_for_policy: &head_provenance,
+                    },
+                    &sibling_schema,
+                    write_context,
+                    false,
+                )
+            {
+                tracing::warn!(
+                    target: "jazz::sync",
+                    %object_id,
+                    table,
+                    sibling_branch = sibling.as_str(),
+                    ?error,
+                    "could not retire a deleted row on a generation sibling; a peer whose \
+                     scope names that branch will keep serving it"
+                );
+            }
+        }
     }
 
     /// Restore a soft-deleted row, performing copy-on-write when targeting a

@@ -211,7 +211,7 @@ impl QueryManager {
         row_provenance_metadata(provenance, delete_kind)
     }
 
-    fn write_context_is_open_batch(write_context: Option<&WriteContext>) -> bool {
+    pub(crate) fn write_context_is_open_batch(write_context: Option<&WriteContext>) -> bool {
         matches!(
             write_context.map(WriteContext::batch_mode),
             Some(BatchMode::Transactional)

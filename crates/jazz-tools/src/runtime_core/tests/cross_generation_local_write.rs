@@ -240,15 +240,12 @@ fn a_local_update_across_a_generation_crossing_moves_the_head_instead_of_forking
 /// row's live head sat on the previous one. The device held only that head, never received
 /// a deleted version for it, and so kept the row — and the app's own query returned BOTH
 /// handles, `["timer","timer3"]`, straight out of its backref.
-// OPEN — the write-side half. Read-side resolution is now tombstone-dominant, so this
-// store answers queries correctly; what is still wrong is the representation, and it is
-// what a diverged PEER depends on. Fan-out is keyed on `(row, branch)`, so a client whose
-// scope holds the row on the previous generation is never told anything, and per-branch
-// backfill re-serves the live head. Only a write that lands a tombstone on that branch
-// reaches it. Ignored so it does not block unrelated releases; run it with
-//   cargo test -p jazz-tools --features test --lib -- --ignored a_delete_across
+// What a diverged PEER depends on. Read-side resolution is tombstone-dominant, so this
+// store already answers queries correctly; the representation is what reaches everyone
+// else. Fan-out is keyed on `(row, branch)`, so a client whose scope names the previous
+// generation is never told anything and per-branch backfill re-serves the live head —
+// only a tombstone authored on that branch reaches it.
 #[test]
-#[ignore = "open: the delete does not tombstone its generation siblings, so a diverged peer is never told"]
 fn a_delete_across_a_generation_crossing_retires_the_row_on_every_branch() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let path = dir.path().join("delete.sqlite");
