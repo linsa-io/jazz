@@ -1307,6 +1307,7 @@ mod e2e_sync;
 mod include_routing_liveness;
 mod joins;
 mod json_storage;
+mod local_write_exemption;
 mod misc;
 mod policies;
 mod recursive_queries;

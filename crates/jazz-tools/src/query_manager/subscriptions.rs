@@ -356,6 +356,11 @@ impl QueryManager {
             .map(|sub| sub.propagation)
             .unwrap_or(QueryPropagation::Full);
         self.subscriptions.remove(&id);
+        // Subscription ids are never recycled, so a left-behind entry can never poison a
+        // later reader — it is pure leak. On a node whose reads are one-shot that is one
+        // entry per READ for the process lifetime, which is the same shape of unbounded
+        // in-memory map this whole family was split to end.
+        self.authoritative_snapshot_pass.remove(&QueryId(id.0));
 
         if self.should_send_local_subscription_upstream(propagation) {
             let query_id = QueryId(id.0);

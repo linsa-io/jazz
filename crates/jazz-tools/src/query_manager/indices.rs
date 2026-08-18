@@ -542,7 +542,7 @@ impl QueryManager {
         let table_name = TableName::new(table);
         let Some(table_schema) = self.schema.get(&table_name) else {
             if was_visible {
-                self.pending_local_row_batches.remove(&row_id);
+                self.retire_local_row_tracking(row_id);
                 self.mark_subscriptions_dirty_local(table);
                 self.mark_local_row_deleted_in_subscriptions(table, row_id);
             } else {
@@ -570,7 +570,7 @@ impl QueryManager {
         }
 
         if was_visible {
-            self.pending_local_row_batches.remove(&row_id);
+            self.retire_local_row_tracking(row_id);
             self.mark_subscriptions_dirty_local(table);
             self.mark_local_row_deleted_in_subscriptions(table, row_id);
         } else {
@@ -628,7 +628,7 @@ impl QueryManager {
             );
         }
 
-        self.pending_local_row_batches.remove(&row_id);
+        self.retire_local_row_tracking(row_id);
         self.mark_subscriptions_dirty_local(table);
         self.mark_local_row_updated_in_subscriptions(table, row_id);
     }

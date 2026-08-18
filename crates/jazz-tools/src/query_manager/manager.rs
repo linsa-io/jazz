@@ -132,6 +132,68 @@ impl std::error::Error for QueryError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QueryHandle(pub u64);
 
+/// Whose local writes a subscription may be exempted from server-scope filtering for.
+///
+/// The two sources are ADDITIVE, not alternatives, which is why this is a struct and not
+/// an enum of cases. Getting that wrong in either direction is a real defect:
+///
+/// | overlay   | `LocalUpdates` | authority                |
+/// | --------- | -------------- | ------------------------ |
+/// | non-empty | `Immediate`    | overlay ∪ process-wide   |
+/// | non-empty | `Deferred`     | overlay only             |
+/// | empty     | `Immediate`    | process-wide             |
+/// | empty     | `Deferred`     | none                     |
+///
+/// Row one is the subtle one and it is the common case, since `Immediate` is the default
+/// for a transaction-scoped read. Such a read downgrades its durability tier for EVERY row
+/// it loads, not only staged ones (`lacks_authoritative_remote_scope` tests `LocalUpdates`
+/// and says nothing about the overlay), so it materialises the node's ordinary unsettled
+/// writes too — and dropping those would blind it to writes it made outside the
+/// transaction, which is exactly what `Immediate` asks not to happen.
+///
+/// Row two is the other direction: a `Deferred` read that staged rows asked for ITS batch,
+/// and handing it the process-wide maps would exempt it for every unsettled write in the
+/// process, most of them nothing to do with it.
+struct LocalWriteAuthority<'a> {
+    /// Rows this read staged itself, if any.
+    overlay: Option<&'a HashMap<ObjectId, RowBatchKey>>,
+    /// Whether this node's own unsettled writes count for this reader.
+    process_wide: bool,
+}
+
+impl LocalWriteAuthority<'_> {
+    fn grants_nothing(&self) -> bool {
+        self.overlay.is_none() && !self.process_wide
+    }
+}
+
+/// What the three maps tracking a local write say about one row. See
+/// `QueryManager::retire_local_row_tracking`. Exists for the gates that assert the family
+/// retires together, so it is test-only by construction.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LocalRowTracking {
+    pub(crate) pending_batch: bool,
+    pub(crate) scope_exempt: bool,
+    pub(crate) awaiting_scope: bool,
+}
+
+#[cfg(test)]
+impl LocalRowTracking {
+    /// True when no map still holds the row.
+    pub(crate) fn is_retired(&self) -> bool {
+        !self.pending_batch && !self.scope_exempt && !self.awaiting_scope
+    }
+}
+
+/// A local write that is durable at the settlement target and is waiting for the scope
+/// snapshot that accounts for it. See `QueryManager::confirmed_local_rows_awaiting_scope`.
+#[derive(Debug, Clone)]
+pub(super) struct ParkedExemption {
+    pub(super) branch: BranchName,
+    pub(super) parked_in_pass: u64,
+}
+
 /// Result of an insert, including durability metadata and row values.
 ///
 /// Poll via `is_complete()` to check if the row is persisted.
@@ -539,6 +601,49 @@ pub struct QueryManager {
     /// local row batch entry when the requested remote durability tier has not been
     /// reached yet.
     pub(super) pending_local_row_batches: HashMap<ObjectId, RowBatchKey>,
+    /// Rows this node authored that the REMOTE SCOPE is not yet known to cover.
+    ///
+    /// Split out of `pending_local_row_batches`, which serves three unrelated roles: the
+    /// IndexScan source overlay and the row loader's durability downgrade both ask "does
+    /// the durable store lack my write?" and correctly retire on durability, while the
+    /// scope filter asks "does the server not know about my write?" and must retire on
+    /// evidence from the scope channel. One map, one clear, three retirements was the
+    /// design error: it left the scope exemption with no expiry at all for a node whose
+    /// reads are one-shot, because the clear only ever fired on an inbound update for the
+    /// row and the server never sends a row back to its author.
+    ///
+    /// Branch-aware, unlike the map it came from: the filter used to compare ids only, so
+    /// a row pending on one branch exempted the same id in a query over another.
+    pub(super) scope_exempt_local_rows: HashMap<ObjectId, BranchName>,
+    /// Rows whose write has reached the settlement target but for which no fresh scope
+    /// snapshot has arrived yet. Still exempt — dropping them here would make the row
+    /// vanish from a reader holding a scope older than the write, which is worse than the
+    /// staleness being fixed.
+    ///
+    /// They retire when a `QuerySettled` at or above the settlement target is APPLIED in a
+    /// later pass than the one that parked them, which is why the pass number is stored
+    /// alongside the branch. Two things this is deliberately not:
+    ///
+    /// * not `remote_query_scope_dirty` — `SyncManager::remove_server` raises that too, and
+    ///   losing a server is the opposite of learning a fresh answer; retiring on it would
+    ///   blind a node to its own writes exactly when it can least afford it.
+    /// * not any settle at any tier — a `Local`-tier snapshot for an unrelated query says
+    ///   nothing about a read answered at `GlobalServer`.
+    ///
+    /// The later-pass requirement is what the two-phase release is for: a settle applied in
+    /// the same pass that parked the row would collapse it to a single phase and let the
+    /// row blink out of a reader still holding the older scope.
+    pub(super) confirmed_local_rows_awaiting_scope: HashMap<ObjectId, ParkedExemption>,
+
+    /// Counts settle passes, so a parked exemption can tell "a scope snapshot arrived
+    /// after I was parked" from "one arrived in the same pass".
+    pub(super) settle_pass: u64,
+
+    /// Per query, the pass in which it last received a settle FROM A SERVER at or above
+    /// its own required tier. This is the authority a parked exemption is measured
+    /// against — see `record_authoritative_snapshot` for why it cannot be one global
+    /// number.
+    pub(super) authoritative_snapshot_pass: HashMap<QueryId, u64>,
 
     /// Visible rows observed through normal row visibility processing, keyed by
     /// batch. Batch fate processing uses this to mark affected query rows
@@ -672,6 +777,10 @@ impl QueryManager {
             branch_schema_map: HashMap::new(),
             pending_row_visibility_changes: Vec::new(),
             pending_local_row_batches: HashMap::new(),
+            scope_exempt_local_rows: HashMap::new(),
+            confirmed_local_rows_awaiting_scope: HashMap::new(),
+            settle_pass: 0,
+            authoritative_snapshot_pass: HashMap::new(),
             visible_rows_by_batch: HashMap::new(),
             authoritative_batch_fate_cache: HashMap::new(),
             row_bytes_dedup: Default::default(),
@@ -1225,7 +1334,106 @@ impl QueryManager {
         &mut self.sync_manager
     }
 
-    pub(crate) fn apply_query_settled(&mut self, query_id: QueryId, tier: DurabilityTier) {
+    /// Record that this query has an answer it can trust, and let its parked exemptions go.
+    ///
+    /// Phase two of the two-phase release, and it is deliberately PER QUERY. Two earlier
+    /// shapes of this were global and both went permanently inert, for different reasons:
+    ///
+    /// * against `SyncManager::settlement_target()` — that answers "how durable must MY
+    ///   WRITE be", is `GlobalServer` for any node with a server attached whatever that
+    ///   server can attest, and a settle carries the EMITTING server's tier. Behind an edge
+    ///   the comparison never holds and nothing ever retires.
+    /// * against the maximum tier across all readers — one `GlobalServer` subscription
+    ///   anywhere in the process then pins every `EdgeServer` reader into permanent
+    ///   exemption, although an `EdgeServer` snapshot is fully authoritative for that
+    ///   reader. Same inertness, triggered by subscription mix instead of topology.
+    ///
+    /// The quantity is not global at all. An exemption is consumed by ONE subscription, in
+    /// `filter_synced_query_scope_tuples`, against `remote_query_scope_at_least(query_id,
+    /// subscription.durability_tier)` — so authority is recorded here per query, and the
+    /// filter compares it to the pass a row was parked in. No bar to pick, no cross-query
+    /// premature loss, and nothing to fan out.
+    fn record_authoritative_snapshot(&mut self, query_id: QueryId, tier: DurabilityTier) {
+        let sub_id = QuerySubscriptionId(query_id.0);
+        let Some(subscription) = self.subscriptions.get(&sub_id) else {
+            return;
+        };
+        // A reader with no tier is filtered against the untiered scope union, for which any
+        // settle is authoritative.
+        if subscription
+            .durability_tier
+            .is_some_and(|required| tier < required)
+        {
+            return;
+        }
+        let previous = self
+            .authoritative_snapshot_pass
+            .insert(query_id, self.settle_pass);
+        // The filter's answer for this subscription's parked rows just changed. Nothing
+        // else will notice — the scope itself may be identical to the last one — so say so
+        // here rather than leaving the row to disappear at whatever unrelated event dirties
+        // this subscription next.
+        if previous != Some(self.settle_pass)
+            && !self.confirmed_local_rows_awaiting_scope.is_empty()
+            && let Some(subscription) = self.subscriptions.get_mut(&sub_id)
+        {
+            subscription.needs_visibility_recompute = true;
+        }
+    }
+
+    /// Drop parked exemptions that every live scope-filtered reader has already passed.
+    ///
+    /// Pure bookkeeping: the filter decides per subscription, so an entry left here changes
+    /// no answer. It exists so the map does not accumulate one entry per write for the
+    /// process lifetime — the shape of leak this whole family was split to end. A
+    /// subscription that has no authoritative snapshot yet holds everything back, because
+    /// its exemptions are still live.
+    fn evict_exemptions_every_reader_has_passed(&mut self) {
+        if self.confirmed_local_rows_awaiting_scope.is_empty() {
+            return;
+        }
+        // No scope-filtered reader is NOT the same proposition as "an answer accounting for
+        // the write has arrived", and only the second may retire an exemption. Falling out
+        // of the `u64::MAX` sentinel below would wipe the whole map on the first, which is
+        // reachable between one-shot reads and inverts the defect: the author would be
+        // unable to read a write it had already waited on at global tier, and a uniqueness
+        // check would report free what is taken.
+        let mut has_scope_filtered_reader = false;
+        let mut passed_by_every_reader = u64::MAX;
+        for (sub_id, subscription) in &self.subscriptions {
+            if !subscription.sync_backed {
+                continue;
+            }
+            has_scope_filtered_reader = true;
+            let pass = self
+                .authoritative_snapshot_pass
+                .get(&QueryId(sub_id.0))
+                .copied()
+                .unwrap_or(0);
+            passed_by_every_reader = passed_by_every_reader.min(pass);
+        }
+        if !has_scope_filtered_reader || passed_by_every_reader == 0 {
+            return;
+        }
+        self.confirmed_local_rows_awaiting_scope
+            .retain(|_, parked| parked.parked_in_pass >= passed_by_every_reader);
+    }
+
+    /// `from_server` distinguishes a settle a SERVER sent us from one a downstream CLIENT
+    /// relayed (`sync_manager::inbox` pushes both into the same queue, and the client
+    /// branch copies the tier straight off the peer's payload with no validation). Only
+    /// the former is evidence about how authoritative anyone's answer is; letting a peer's
+    /// number retire our exemptions would hand a downstream client control over what this
+    /// node may read of its own writes.
+    pub(crate) fn apply_query_settled(
+        &mut self,
+        query_id: QueryId,
+        tier: DurabilityTier,
+        from_server: bool,
+    ) {
+        if from_server {
+            self.record_authoritative_snapshot(query_id, tier);
+        }
         let sub_id = QuerySubscriptionId(query_id.0);
         if let Some(sub) = self.subscriptions.get_mut(&sub_id) {
             let was_unsatisfied = !Self::subscription_query_frontier_satisfied(sub);
@@ -1300,6 +1508,42 @@ impl QueryManager {
             .max();
         if let Some(confirmed_tier) = max_confirmed_tier {
             self.mark_subscriptions_visibility_recompute_for_tier(confirmed_tier);
+        }
+
+        // Phase one of releasing the scope exemption: a write that has reached the
+        // settlement target no longer needs to be shielded from the server's answer on its
+        // own merits. It is only PARKED here, not dropped — see the drain in `process`,
+        // which retires it once a fresh scope snapshot has actually arrived.
+        let settlement_target = self.sync_manager.settlement_target();
+        for fate in &batch_fates {
+            if fate
+                .confirmed_tier()
+                .is_none_or(|tier| tier < settlement_target)
+            {
+                continue;
+            }
+            let batch_id = fate.batch_id();
+            let confirmed_rows: Vec<ObjectId> = self
+                .scope_exempt_local_rows
+                .keys()
+                .copied()
+                .filter(|object_id| {
+                    self.pending_local_row_batches
+                        .get(object_id)
+                        .is_some_and(|key| key.batch_id == batch_id)
+                })
+                .collect();
+            for object_id in confirmed_rows {
+                if let Some(branch) = self.scope_exempt_local_rows.remove(&object_id) {
+                    self.confirmed_local_rows_awaiting_scope.insert(
+                        object_id,
+                        ParkedExemption {
+                            branch,
+                            parked_in_pass: self.settle_pass,
+                        },
+                    );
+                }
+            }
         }
 
         let mut batch_ids = batch_fates
@@ -1395,6 +1639,7 @@ impl QueryManager {
         // snapshots the counters here and emits one line on drop if the pass
         // ran longer than `JAZZ_SETTLE_LOG_MS`.
         let _settle_cost = super::settle_cost::SettlePass::begin();
+        self.settle_pass = self.settle_pass.wrapping_add(1);
 
         if let Err(error) = self.ensure_known_schemas_catalogued(storage) {
             tracing::warn!(%error, "failed to persist known schemas to catalogue storage");
@@ -1474,7 +1719,11 @@ impl QueryManager {
                             pending_settled.tier,
                         );
                     }
-                    self.apply_query_settled(pending_settled.query_id, pending_settled.tier);
+                    self.apply_query_settled(
+                        pending_settled.query_id,
+                        pending_settled.tier,
+                        pending_settled.server_id.is_some(),
+                    );
                 } else {
                     blocked.push(pending_settled);
                 }
@@ -1484,6 +1733,7 @@ impl QueryManager {
             }
         }
 
+        self.evict_exemptions_every_reader_has_passed();
         self.process_pending_query_rejections();
 
         // 5. Index storage is handled by Storage via batched_tick() - not here.
@@ -1691,12 +1941,18 @@ impl QueryManager {
                 && (subscription.propagation == QueryPropagation::Full
                     || !self.sync_manager.has_durability_identity())
             {
-                visible_tuples = Cow::Owned(self.filter_synced_query_scope_tuples(
-                    QueryId(sub_id.0),
-                    subscription.durability_tier,
-                    &subscription.pending_local_row_ids,
-                    visible_tuples.into_owned(),
-                ));
+                visible_tuples = Cow::Owned(
+                    self.filter_synced_query_scope_tuples(
+                        QueryId(sub_id.0),
+                        subscription.durability_tier,
+                        LocalWriteAuthority {
+                            overlay: (!subscription.local_overlay_rows.is_empty())
+                                .then_some(&subscription.local_overlay_rows),
+                            process_wide: subscription.local_updates == LocalUpdates::Immediate,
+                        },
+                        visible_tuples.into_owned(),
+                    ),
+                );
             }
 
             visible_tuples = self.filter_transaction_visible_tuples(
@@ -1941,6 +2197,12 @@ impl QueryManager {
         if local_update {
             self.pending_local_row_batches
                 .insert(update.object_id, current_row_key);
+            self.scope_exempt_local_rows.insert(
+                update.object_id,
+                BranchName::new(update.row.branch.as_str()),
+            );
+            self.confirmed_local_rows_awaiting_scope
+                .remove(&update.object_id);
         } else if let Some(pending_row_key) = self
             .pending_local_row_batches
             .get(&update.object_id)
@@ -1949,7 +2211,7 @@ impl QueryManager {
             && (pending_row_key.batch_id != current_batch_id
                 || update.row.confirmed_tier == Some(DurabilityTier::GlobalServer))
         {
-            self.pending_local_row_batches.remove(&update.object_id);
+            self.retire_local_row_tracking(update.object_id);
         }
 
         if self.visible_row_is_hard_deleted(storage, update.object_id, &update.row.branch)
@@ -2499,8 +2761,33 @@ impl QueryManager {
         }
     }
 
-    pub(crate) fn clear_local_pending_row_overlay(&mut self, table: &str, id: ObjectId) {
+    /// What the three local-write maps currently say about one row. Exists so a gate can
+    /// assert the family retires together — the whole point of `retire_local_row_tracking`.
+    #[cfg(test)]
+    pub(crate) fn local_row_tracking(&self, id: ObjectId) -> LocalRowTracking {
+        LocalRowTracking {
+            pending_batch: self.pending_local_row_batches.contains_key(&id),
+            scope_exempt: self.scope_exempt_local_rows.contains_key(&id),
+            awaiting_scope: self.confirmed_local_rows_awaiting_scope.contains_key(&id),
+        }
+    }
+
+    /// Drop every trace of a local write from the three maps that track one.
+    ///
+    /// They are separate because they answer separate questions (source overlay,
+    /// durability downgrade, scope exemption) and retire on different terms — but a row
+    /// that is going away entirely must leave all of them together. Splitting the scope
+    /// exemption out of `pending_local_row_batches` and forgetting one removal site is
+    /// exactly how a stale exemption outlives the write it stood for, which is the defect
+    /// this family was split to fix. Route every removal through here.
+    pub(super) fn retire_local_row_tracking(&mut self, id: ObjectId) {
         self.pending_local_row_batches.remove(&id);
+        self.scope_exempt_local_rows.remove(&id);
+        self.confirmed_local_rows_awaiting_scope.remove(&id);
+    }
+
+    pub(crate) fn clear_local_pending_row_overlay(&mut self, table: &str, id: ObjectId) {
+        self.retire_local_row_tracking(id);
         self.mark_subscriptions_dirty_local(table);
         self.mark_local_row_updated_in_subscriptions(table, id);
     }
@@ -3048,13 +3335,36 @@ impl QueryManager {
             .collect()
     }
 
+    /// Keep a tuple when the remote scope covers it, or when it carries a local write the
+    /// server is not yet known to have accounted for.
+    ///
+    /// The exemption is deliberately narrow on three axes the previous version ignored:
+    ///
+    /// * **branch** — matched on `(id, branch)` from the tuple's provenance, not on the id
+    ///   alone. A row pending on one branch used to exempt the same id everywhere.
+    /// * **the reader's choice** — carried by `LocalWriteAuthority`, which names WHOSE
+    ///   local writes this reader may be exempted for, not merely whether it may be.
+    ///   `Deferred` with no overlay opted out and gets nothing; `Immediate` gets the
+    ///   process-wide maps. A transaction-scoped read is the third case and the reason
+    ///   this is not a bool: it carries its staged rows in `local_overlay_rows`, and both
+    ///   consumers of that map — the row loader and the source overlay — read it before
+    ///   they look at `LocalUpdates` at all, so those rows are materialised whatever the
+    ///   flag says and dropping them here would load them only to throw them away. But the
+    ///   process-wide maps hold every unsettled write of every table, and that read asked
+    ///   for ONE batch: it is exempted for its own staged rows and nobody else's.
+    /// * **durability** — a write that has reached the settlement target and been followed
+    ///   by a scope refresh is no longer exempt, because from that point the server's
+    ///   answer accounts for it. Without this bound the exemption never expired on a node
+    ///   whose reads are one-shot, and every row it had ever written stayed frozen in its
+    ///   own reads for the process lifetime.
     fn filter_synced_query_scope_tuples(
         &self,
         query_id: QueryId,
         durability_tier: Option<DurabilityTier>,
-        pending_local_row_ids: &HashSet<ObjectId>,
+        local_writes: LocalWriteAuthority<'_>,
         tuples: Vec<Tuple>,
     ) -> Vec<Tuple> {
+        let authoritative_snapshot_pass = self.authoritative_snapshot_pass.get(&query_id).copied();
         let remote_scope = match durability_tier {
             Some(tier) => self
                 .sync_manager
@@ -3064,13 +3374,74 @@ impl QueryManager {
         tuples
             .into_iter()
             .filter(|tuple| {
-                tuple.id_iter().any(|id| {
-                    pending_local_row_ids.contains(&id)
-                        || self.pending_local_row_batches.contains_key(&id)
-                }) || tuple
+                let in_remote_scope = tuple
                     .provenance()
                     .iter()
-                    .any(|scoped_object| remote_scope.contains(scoped_object))
+                    .any(|scoped_object| remote_scope.contains(scoped_object));
+                if in_remote_scope {
+                    return true;
+                }
+                if local_writes.grants_nothing() {
+                    return false;
+                }
+                if let Some(overlay) = local_writes.overlay
+                    && tuple.provenance().iter().any(|(id, branch)| {
+                        overlay
+                            .get(id)
+                            .is_some_and(|staged| staged.branch_name == *branch)
+                    })
+                {
+                    return true;
+                }
+                if !local_writes.process_wide {
+                    return false;
+                }
+                // The per-subscription `pending_local_row_ids` is deliberately NOT consulted
+                // here. It serves two other roles (the IndexScan overlay and the row-loader
+                // durability downgrade) and is retired on different terms, so as a scope
+                // exemption it outlived the write it stood for. The two maps below are the
+                // single authority for this role:
+                //
+                //   `scope_exempt_local_rows`            — written but not yet durable at the
+                //                                          settlement target; unbounded on
+                //                                          purpose, nothing upstream can know
+                //                                          about it yet. A row staged in an
+                //                                          open transaction stays here until
+                //                                          the batch commits and confirms.
+                //   `confirmed_local_rows_awaiting_scope` — durable, but no scope refresh has
+                //                                          landed since. Held one more round
+                //                                          so the exemption does not drop
+                //                                          before the server's answer can
+                //                                          account for the write.
+                tuple.provenance().iter().any(|(id, branch)| {
+                    // Chained, not `or_else`: the two maps are disjoint by construction
+                    // (every insert into one removes from the other, and phase one moves an
+                    // entry across), but a short-circuit would make a violation of that
+                    // invariant silently drop the tuple instead of failing loudly.
+                    debug_assert!(
+                        !(self.scope_exempt_local_rows.contains_key(id)
+                            && self.confirmed_local_rows_awaiting_scope.contains_key(id)),
+                        "a local row must be exempt-pending or awaiting-scope, never both"
+                    );
+                    if self
+                        .scope_exempt_local_rows
+                        .get(id)
+                        .is_some_and(|pending_branch| pending_branch == branch)
+                    {
+                        // Written, not yet durable at the settlement target. Unbounded on
+                        // purpose: nothing upstream can know about it.
+                        return true;
+                    }
+                    self.confirmed_local_rows_awaiting_scope
+                        .get(id)
+                        .is_some_and(|parked| {
+                            parked.branch == *branch
+                                // Durable, and still exempt for THIS reader until an answer
+                                // this reader can trust arrives after the write did.
+                                && authoritative_snapshot_pass
+                                    .is_none_or(|pass| pass <= parked.parked_in_pass)
+                        })
+                })
             })
             .collect()
     }

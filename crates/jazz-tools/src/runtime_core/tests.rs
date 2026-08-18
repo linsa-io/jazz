@@ -2139,6 +2139,7 @@ mod fk_remove_error;
 mod incremental_scan;
 mod install_transport_tests;
 mod query_subscription;
+mod rejected_write_retires_tracking;
 mod schema_catalogue;
 mod sealed_batch_cost;
 mod sync_replay;

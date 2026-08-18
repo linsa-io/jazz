@@ -741,8 +741,11 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                                 pending_settled.tier,
                             );
                     }
-                    query_manager
-                        .apply_query_settled(pending_settled.query_id, pending_settled.tier);
+                    query_manager.apply_query_settled(
+                        pending_settled.query_id,
+                        pending_settled.tier,
+                        pending_settled.server_id.is_some(),
+                    );
                 }
             }
             self.schema_manager.process(&mut self.storage);

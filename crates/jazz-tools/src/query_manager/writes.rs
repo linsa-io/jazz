@@ -387,6 +387,13 @@ impl QueryManager {
 
         self.pending_local_row_batches
             .insert(row_batch_key.row_id, row_batch_key);
+        // Same row, the scope-exemption half. A row staged in an open batch is unknown
+        // upstream by construction, so it stays exempt until it commits and its batch is
+        // confirmed — see `QueryManager::scope_exempt_local_rows`.
+        self.scope_exempt_local_rows
+            .insert(row_batch_key.row_id, row_batch_key.branch_name);
+        self.confirmed_local_rows_awaiting_scope
+            .remove(&row_batch_key.row_id);
         self.mark_subscriptions_dirty_local(table);
         if deleted {
             self.mark_local_row_deleted_in_subscriptions(table, row_batch_key.row_id);
