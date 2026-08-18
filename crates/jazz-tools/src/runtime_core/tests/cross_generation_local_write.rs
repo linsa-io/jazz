@@ -213,3 +213,228 @@ fn a_local_update_across_a_generation_crossing_moves_the_head_instead_of_forking
         "the read must serve the update, not the pre-crossing version"
     );
 }
+
+/// A DELETE across a generation crossing must retire the row on every branch, not only on
+/// the one it was issued from.
+///
+/// The update twin above establishes the shelf model: a crossing may legitimately leave the
+/// old branch holding its own head, because an update changes a row's SHAPE and an old
+/// reader is entitled to the old shape. Deletion is not a shape change. It changes whether
+/// the row exists, and existence cannot differ per shelf — a reader still on the previous
+/// generation would go on serving a row the authority has deleted, forever, with nothing
+/// left to correct it.
+///
+/// MEASURED on the dev stack 2026-08-18. A user renamed their handle; the rpc-server
+/// deleted the previous `unique_names` row and inserted the new one, and the inspector — a
+/// reader that resolves each row to its newest version across generations — showed exactly
+/// one row, correctly. The device showed the old handle for hours. Dumping the same row
+/// from both stores:
+///
+/// ```text
+///   server  019fbaa1…  dev-53710882d8e0-main  VisibleDirect  deleted=false   (1 Aug)
+///           019fbaa1…  dev-b32dae47bbd9-main  deleted=true   kind=Soft       (the rename)
+///   device  019fbaa1…  dev-53710882d8e0-main  VisibleDirect  deleted=false
+/// ```
+///
+/// The deletion was recorded as a new version on the authority's OWN generation while the
+/// row's live head sat on the previous one. The device held only that head, never received
+/// a deleted version for it, and so kept the row — and the app's own query returned BOTH
+/// handles, `["timer","timer3"]`, straight out of its backref.
+// OPEN — the write-side half. Read-side resolution is now tombstone-dominant, so this
+// store answers queries correctly; what is still wrong is the representation, and it is
+// what a diverged PEER depends on. Fan-out is keyed on `(row, branch)`, so a client whose
+// scope holds the row on the previous generation is never told anything, and per-branch
+// backfill re-serves the live head. Only a write that lands a tombstone on that branch
+// reaches it. Ignored so it does not block unrelated releases; run it with
+//   cargo test -p jazz-tools --features test --lib -- --ignored a_delete_across
+#[test]
+#[ignore = "open: the delete does not tombstone its generation siblings, so a diverged peer is never told"]
+fn a_delete_across_a_generation_crossing_retires_the_row_on_every_branch() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let path = dir.path().join("delete.sqlite");
+    let storage = SqliteStorage::open(&path).expect("sqlite storage should open");
+
+    let mut core = runtime_over(docs_schema_v1(), "defect27-delete", storage);
+    let alice = WriteContext::from_session(Session::new("alice"));
+
+    let ((row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "docs",
+        HashMap::from([
+            ("owner".to_string(), Value::Text("alice".to_string())),
+            ("body".to_string(), Value::Text("draft".to_string())),
+        ]),
+        Some(&alice),
+        DurabilityTier::Local,
+    )
+    .expect("the row inserts under generation A");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let branch_before = crate::storage::sole_branch_name(core.storage())
+        .expect("branch registry readable")
+        .expect("the seeded row registered a branch");
+    assert!(
+        core.storage()
+            .load_visible_region_row("docs", branch_before.as_str(), row_id)
+            .expect("visible row readable")
+            .is_some(),
+        "fixture precondition: the row must be visible on generation A before the crossing"
+    );
+
+    // The crossing: same store, rehydrated under a schema that hashes differently.
+    let storage = core.into_storage();
+    let mut core = runtime_over(docs_schema_v2(), "defect27-delete", storage);
+
+    core.delete(row_id, Some(&alice))
+        .expect("the owner's delete across the crossing applies");
+    core.batched_tick();
+    core.immediate_tick();
+
+    // Every branch that still serves this row, and whether it serves it as LIVE.
+    let families = visible_docs_families(core.storage());
+    assert_eq!(
+        families.len(),
+        2,
+        "the deployment must have created a second docs family, or the crossing did not \
+         happen and this gate proves nothing: {families:?}"
+    );
+
+    // Enumerated from the visible families themselves, NOT from the branch-ord registry.
+    // Ords are allocated only by sealed-batch persistence, never by history application
+    // (`storage/mod.rs` says so where `sole_branch_name` is defined), so a device that
+    // received a generation's rows purely by inbound sync has no ord for that branch — and
+    // that is the production shape this gate exists for. An ord walk would have gone green
+    // on the very store the defect was measured on.
+    let mut live_on: Vec<String> = Vec::new();
+    for family in &families {
+        for key in core
+            .storage()
+            .raw_table_scan_prefix_keys(family, "")
+            .expect("raw table scan should succeed")
+        {
+            // `<branch>:<row-uuid-hex>` is the visible raw-table key layout, the same one
+            // `cross_generation_visible_split` reads by hand.
+            let Some((branch, keyed_row_hex)) = key.rsplit_once(':') else {
+                continue;
+            };
+            if keyed_row_hex != row_id.uuid().simple().to_string() {
+                continue;
+            }
+            let branch = branch.to_string();
+            let head = core
+                .storage()
+                .load_visible_region_row("docs", branch.as_str(), row_id)
+                .expect("visible row readable");
+            if head.is_some_and(|row| !row.is_deleted) {
+                live_on.push(branch);
+            }
+        }
+    }
+    live_on.sort();
+    live_on.dedup();
+
+    eprintln!("branches still serving the deleted row as live: {live_on:?}");
+    assert!(
+        live_on.is_empty(),
+        "a delete must retire the row on EVERY branch, not only the one it was issued \
+         from — it still reads as live on {live_on:?}. A reader left on the previous \
+         generation goes on serving a row the authority deleted, and nothing later \
+         corrects it: the deletion was recorded on the authority's own generation, so no \
+         deleted version for the reader's branch ever exists to be delivered."
+    );
+}
+
+/// A delete must not lose to a clock.
+///
+/// Cross-generation resolution picks a row's newest version by `(updated_at, batch_id)`
+/// across branches (`query_manager/manager.rs`, `load_best_visible_row_batch_*`). Within one
+/// generation that is harmless: the delete is a child of the row's chain on that branch, so
+/// causality already orders it. Across a crossing the delete is authored as a PARENTLESS
+/// root on the authority's own generation — the chain is gone, and a wall-clock comparison
+/// between two heads that never saw each other is all that remains.
+///
+/// `updated_at` is per-node `SystemTime::now()` with a local monotonic bump
+/// (`sync_manager/clock.rs`), and any caller may set it outright via
+/// `WriteContext::with_updated_at`. One second of skew between the node that inserted and
+/// the node that deleted is therefore enough to make a successful delete lose, on the
+/// authority's own store, permanently.
+///
+/// The engine already knows this reasoning is wrong where it repairs split families:
+/// `repair_split_visible_row_families` refuses to compare heads by timestamp, and says why
+/// — "comparing the heads is exactly the reasoning that made the stale one look
+/// defensible." The live read path does that comparison anyway.
+///
+/// Deletion is monotone. A live head is never evidence against a tombstone, whatever its
+/// clock says.
+#[test]
+fn a_delete_across_a_generation_crossing_outranks_a_newer_looking_live_head() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let path = dir.path().join("skew.sqlite");
+    let storage = SqliteStorage::open(&path).expect("sqlite storage should open");
+
+    let mut core = runtime_over(docs_schema_v1(), "defect27-skew", storage);
+
+    // The insert is stamped LATER than the delete will be — one node's clock ahead of the
+    // other's, which is the only thing this fixture does differently.
+    let inserting_node =
+        WriteContext::from_session(Session::new("alice")).with_updated_at(9_000_000);
+    let ((row_id, _), _) = insert_and_wait_for_batch(
+        &mut core,
+        "docs",
+        HashMap::from([
+            ("owner".to_string(), Value::Text("alice".to_string())),
+            ("body".to_string(), Value::Text("draft".to_string())),
+        ]),
+        Some(&inserting_node),
+        DurabilityTier::Local,
+    )
+    .expect("the row inserts under generation A");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let storage = core.into_storage();
+    let mut core = runtime_over(docs_schema_v2(), "defect27-skew", storage);
+
+    let deleting_node =
+        WriteContext::from_session(Session::new("alice")).with_updated_at(8_000_000);
+    core.delete(row_id, Some(&deleting_node))
+        .expect("the delete across the crossing applies");
+    core.batched_tick();
+    core.immediate_tick();
+
+    let query = core
+        .schema_manager_mut()
+        .query_manager_mut()
+        .query("docs")
+        .build();
+    let rows = {
+        let waker = noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut future = core.query_with_propagation(
+            query,
+            None,
+            ReadDurabilityOptions::default(),
+            crate::sync_manager::QueryPropagation::Full,
+        );
+        match Pin::new(&mut future).poll(&mut cx) {
+            Poll::Ready(Ok(results)) => results,
+            Poll::Ready(Err(err)) => panic!("query should succeed: {err:?}"),
+            Poll::Pending => panic!("query should resolve immediately"),
+        }
+    };
+
+    eprintln!(
+        "rows a deleted-but-older-stamped row still returns: {}",
+        rows.len()
+    );
+    assert!(
+        rows.is_empty(),
+        "a delete must outrank a live head that merely carries a newer clock. Deletion is \
+         monotone, and across a generation crossing the delete has no causal link to the \
+         head it retires — so a timestamp comparison is the only thing deciding, and one \
+         second of skew between two nodes silently resurrects the row for good. Got {} \
+         rows.",
+        rows.len()
+    );
+}

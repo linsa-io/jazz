@@ -5278,7 +5278,14 @@ mod store_probe {
         for name in names {
             let entries = storage.raw_table_scan_prefix(&name, "").unwrap_or_default();
             println!("index {name}: {} entries", entries.len());
-            for (key, _value) in entries.iter().take(40) {
+            // Capped so a probe on a big table stays readable; raise it with
+            // `JAZZ_PROBE_LIMIT` when the question is "what is the SHAPE of every key",
+            // because a silent cap answers that question wrongly and convincingly.
+            let limit = std::env::var("JAZZ_PROBE_LIMIT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(40);
+            for (key, _value) in entries.iter().take(limit) {
                 println!("    {key}");
             }
         }

@@ -2986,8 +2986,29 @@ impl QueryManager {
             }
 
             let batch_id = row.batch_id;
+            // A tombstone outranks a live head, whatever the clocks say.
+            //
+            // Within one generation the comparison below is ordered by causality: a delete
+            // is a child of the row's chain on that branch. Across a generation crossing it
+            // is not — the delete is authored as a parentless root on the writer's own
+            // generation, so nothing links it to the head it retires, and `updated_at` — a
+            // per-node wall clock that any caller may set outright — becomes the only
+            // arbiter. One second of skew between the node that wrote and the node that
+            // deleted then resurrects the row permanently.
+            //
+            // Deletion is monotone, so a rule is available that needs no clock: a live head
+            // is never evidence against a tombstone. `repair_split_visible_row_families`
+            // already refuses this comparison for the same reason, in its own words —
+            // "comparing the heads is exactly the reasoning that made the stale one look
+            // defensible." This is the live read path finally agreeing with it.
+            let row_retires = row.delete_kind.is_some();
+            let best_retires = best
+                .as_ref()
+                .is_some_and(|(_, best_row)| best_row.delete_kind.is_some());
             match &best {
                 None => best = Some((batch_id, row)),
+                Some(_) if best_retires && !row_retires => {}
+                Some(_) if row_retires && !best_retires => best = Some((batch_id, row)),
                 Some((best_batch_id, best_row))
                     if (row.updated_at, batch_id) > (best_row.updated_at, *best_batch_id) =>
                 {
@@ -3093,8 +3114,29 @@ impl QueryManager {
             }
 
             let batch_id = row.batch_id;
+            // A tombstone outranks a live head, whatever the clocks say.
+            //
+            // Within one generation the comparison below is ordered by causality: a delete
+            // is a child of the row's chain on that branch. Across a generation crossing it
+            // is not — the delete is authored as a parentless root on the writer's own
+            // generation, so nothing links it to the head it retires, and `updated_at` — a
+            // per-node wall clock that any caller may set outright — becomes the only
+            // arbiter. One second of skew between the node that wrote and the node that
+            // deleted then resurrects the row permanently.
+            //
+            // Deletion is monotone, so a rule is available that needs no clock: a live head
+            // is never evidence against a tombstone. `repair_split_visible_row_families`
+            // already refuses this comparison for the same reason, in its own words —
+            // "comparing the heads is exactly the reasoning that made the stale one look
+            // defensible." This is the live read path finally agreeing with it.
+            let row_retires = row.delete_kind.is_some();
+            let best_retires = best
+                .as_ref()
+                .is_some_and(|(_, best_row)| best_row.delete_kind.is_some());
             match &best {
                 None => best = Some((batch_id, row)),
+                Some(_) if best_retires && !row_retires => {}
+                Some(_) if row_retires && !best_retires => best = Some((batch_id, row)),
                 Some((best_batch_id, best_row))
                     if (row.updated_at, batch_id) > (best_row.updated_at, *best_batch_id) =>
                 {
