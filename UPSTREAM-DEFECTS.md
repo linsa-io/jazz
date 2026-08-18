@@ -1535,6 +1535,120 @@ this defect violated. `INV-READ-4` covers the transaction-overlay half ("Reads i
 open exclusive transaction MUST overlay that transaction's own pending writes on top of the
 snapshot-covered base view") — additive against the snapshot, matching the shape we landed.
 
+---
+
+## 30. A write that cannot be applied is refused only after its whole history is read
+
+**Severity: one core, in bursts, driven by a single peer; and a log that described the
+outage for hours without ever naming it.** A client left on an older schema generation
+pinned a core on the sync server for minutes at a time, and the 130,634 lines it produced
+said nothing that would let anyone find it.
+
+Measured on jazz-sync 2026-08-18:
+
+```text
+  arrivals for one row              6,981 in 8 hours, peak 1,333/min
+  history versions read per arrival 3,721   (a constant — one row's depth)
+  distinct rows in the refusal      1
+  heaviest settle passes            51.1 s, 37.6 s, 29.3 s, 25.0 s
+                                    subscriptions=0  rows_emitted=0
+  refusal WARN lines                130,634 in 3 hours, peak 49,606/min
+  missing-ancestor requests sent    195
+```
+
+That the history entries are the clock, and not a side effect of something else, is
+measurable rather than argued: across 23 heavy passes the cost held at **14–17 µs per
+history entry** while pass duration ranged over 24×. A term that consumes time without
+decoding history entries — the repeated apply attempts — would have made that ratio float.
+It did not.
+
+The mechanism, verified in source. `pre_batch_visible_row` runs for every non-replay
+inbound batch, at the point the inbox itself comments as _"Not a replay: now pay for the
+policy check's inputs"_. It resolves the batch's declared ancestors by point lookup
+**pinned to the incoming batch's branch**. A client on an older generation declares parents
+that live on the branch it has moved off, so none resolve; with an empty ancestor set the
+walk asks whether the row has history on another branch, and for a cross-generation row the
+answer is yes — so it reads the row's ENTIRE history, across all branches. Then
+`apply_row_batch_with_context` refuses the batch with `ParentNotFound`, a decision the
+declared parents alone had already fixed. The read bought nothing.
+
+A previous fix, `d792365b3` (2026-08-14), addressed the same symptom after an incident of
+23,661 refusals: it replaced a sieve over the whole history with point lookups and gated
+the remaining fallback behind a cheap "is this row on another branch" probe. That cured the
+single-generation case. It could not cure this one, because here the probe answers _true_.
+
+Fix. The walk already performs, one for one, the lookups the refusal will perform — same
+table, same branch pin, same row. It now records their outcome and returns as soon as a
+DECLARED parent is absent, before the probe and before the fallback scan. No read is added
+to learn it, and `resolve_history_row_write_context` moved below the walk so the refusal
+path pays for nothing it cannot use.
+
+Three things the fix had to get right, each of which cost a wrong turn first:
+
+- **Existence, not visibility.** The walk discards a candidate unless `state.is_visible()`,
+  while the refusal checks existence only. A parent that is present but `Rejected`,
+  `Superseded` or `StagingPending` does NOT cause `ParentNotFound`, so keying off the
+  visible ancestor set would refuse to compute inputs for writes that go on to apply.
+- **Not tombstones.** `is_deleted` classifies as `Operation::Delete` before parents are
+  considered, and the Delete arm of the policy has no old-content recovery: with none it
+  rejects, and `reject_permission_check` PERSISTS that as an authoritative fate, after
+  which every later arrival of the batch is forced to `Rejected` on sight. For a tombstone
+  the shortcut would have converted a recoverable park into the permanent destruction of
+  the client's delete. Update has the recovery (it refills from the visible row); giving
+  Delete the same is a separate defect, open.
+- **Not by hoisting the check.** The obvious shape — refuse an unappliable batch at the top
+  of the inbox — is wrong: a parent and its child delivered together are queued in step 1
+  and applied in step 4, so hoisting refuses a child whose parent was never lost, turning
+  ordinary ordered delivery into a retransmit round-trip. It would have amplified the loop
+  it was meant to quiet.
+
+The log was fixed alongside, and that is the half that matters for the next incident. The
+first failure per `(row, branch)` stays loud and complete; repeats are counted rather than
+printed, with one summary per interval carrying the accumulated attempts and how long the
+row has been stuck; the row is named once more when it finally applies. A row whose failure
+MODE changes is never suppressed — production runs at `info`, so the DEBUG line that
+repeats fall back to does not exist there, and without that rule a storage failure arriving
+behind a `ParentNotFound` on the same row would be silent for the whole interval. That is
+how entry 26's ENOSPC incident began.
+
+What this does NOT fix, stated plainly because the distinction is operational: the cost,
+not the outcome. The batch is still refused, still parks, and the client's row stays
+wedged. The repair exchange is open at both ends — the server asks for the missing ancestor
+(195 times here, correctly bounded by its own budget), the client cannot supply it because
+it does not hold it, and `retransmit_local_batch_to_servers` finding nothing sends nothing
+and says nothing. There is no third instruction in the protocol for "your local history
+here is unusable, resync from me": `Missing` is a request the client cannot satisfy and
+`Rejected` would destroy its row. Open, and a design rather than a patch. The proximate
+cure is operational — put the diverged client on the current schema generation.
+
+Two measurements worth keeping for their own sake. The brake on missing-ancestor answers
+**worked**: 46 distinct parent ids × `MAX_MISSING_ANSWERS` of 5 = 230 permitted, 195
+observed — a server cannot stop a peer by declining to answer, and this one sent 6,981
+batches while being answered 195 times. And `rocksdb.rs` never bumps `STORAGE_READ_OPS` /
+`_MICROS` / `_BYTES`, so those four fields are structurally zero in every `settle_cost`
+line on jazz-sync; nobody should read `storage_read_micros=0` there as "no IO".
+
+One diagnostic trap this cost a day to: the shipped `jazz-tools.js` is a wrapper that
+`spawnSync`s a prebuilt native binary, so the sync server is the CLI build — `cli` enables
+`rocksdb`, and `build_main_storage` opens `jazz.rocksdb`. Reading `jazz-napi/src/lib.rs`
+and concluding "production is SQLite" describes rpc-server, a different process. The two
+disagree on this exact path: `SqliteStorage` does not override
+`row_has_history_outside_branch`, so on rpc-server the "cheap probe" IS a whole-history
+scan. Separate defect, open.
+
+Attribution: OURS. The ordering — compute the policy's inputs, then discover the write is
+unappliable — predates the fork on both sides, but the cross-generation population that
+makes it expensive is ours, and so is the deployment that left a client on an older
+generation.
+Groove (codex/jazz-core-engine-swap): architected away, by a named invariant.
+`SPEC/3_transactions.md` `INV-TX-5` — "The authority MUST park a commit unit with missing
+parent/schema/content prerequisites and MUST decide it only after all prerequisites are
+present." §3.6 spells out the ordering this defect inverts: the fate authority "first parks
+— and does not decide — any unit that is missing parent transactions or schema versions. It
+decides only once all prerequisites are present", and write-policy authorization _follows_
+that. There is no path there on which a policy input is computed for a unit whose parents
+are absent.
+
 ## Groove line: verification summary (2026-08-15)
 
 Upstream's Thursday publishes are cut from the integration branch
@@ -1557,10 +1671,12 @@ Open PRs on the branch that overlap entries here: #1538 → 17; #1533, #1537 →
 #1523 → 19/20; #1535, #1520 → 1's class; #1201 → 20's twin on main; #1367, #1503 → 18 and
 6's RN half; #1200 is tier-adjacent.
 
-The risk verdict: 17 of the 27 live entries (entry 4 is withdrawn; 29 total) have mechanisms unrepresentable on the groove line,
+The risk verdict: 17 of the 27 live entries (entry 4 is withdrawn; 30 total) have mechanisms unrepresentable on the groove line,
 (entries 25-28 postdate this groove pass and are marked "not verified" in their own footers — they are not counted either way;
-entry 29 also postdates it but WAS verified against the same tip `aada95800`, and is architected away — `INV-READ-11` makes
-read-your-own-writes a property of the read tier rather than a separately tracked exemption),
+entries 29 and 30 also postdate it but WERE verified against the same tip `aada95800`, and both are architected away —
+`INV-READ-11` makes read-your-own-writes a property of the read tier rather than a separately tracked exemption, and
+`INV-TX-5` parks a unit with missing prerequisites before any verdict, so no policy input is computed for a write whose
+parents are absent),
 plus entry 24's branch-universe face (its outer-row-kill face is an unverified review item there),
 including 17, 19, 20 and 23 — the schema-crossing class. Still present: 6's RN half, the
 new O(table) policy scan flagged under entry 15, and 22's blind `id` readers (the IVM
