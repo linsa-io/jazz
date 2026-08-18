@@ -2143,6 +2143,7 @@ mod rejected_write_retires_tracking;
 mod schema_catalogue;
 mod sealed_batch_cost;
 mod sync_replay;
+mod unappliable_row_logging;
 mod write_batch;
 
 /// A wiped upstream (fresh store behind the same endpoint) RELEARNS settled

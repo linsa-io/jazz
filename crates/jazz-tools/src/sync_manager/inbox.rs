@@ -682,8 +682,10 @@ impl SyncManager {
                     ) {
                         Ok(applied) => applied.visibility_change,
                         Err(err) => {
-                            let (speak, attempts, stuck_for) =
-                                self.note_unappliable_row((row.row_id, branch_name));
+                            let (speak, attempts, stuck_for) = self.note_unappliable_row(
+                                (row.row_id, branch_name),
+                                Self::unappliable_error_kind(&err),
+                            );
                             if speak {
                                 tracing::warn!(
                                     row_id = %row.row_id,
@@ -714,8 +716,10 @@ impl SyncManager {
                     match apply_row_batch(storage, row.row_id, &branch_name, row.clone(), &[]) {
                         Ok(applied) => applied.visibility_change,
                         Err(err) => {
-                            let (speak, attempts, stuck_for) =
-                                self.note_unappliable_row((row.row_id, branch_name));
+                            let (speak, attempts, stuck_for) = self.note_unappliable_row(
+                                (row.row_id, branch_name),
+                                Self::unappliable_error_kind(&err),
+                            );
                             if speak {
                                 tracing::warn!(
                                     row_id = %row.row_id,
@@ -1748,24 +1752,47 @@ impl SyncManager {
     /// and warns again only once an interval has passed — carrying the accumulated attempts
     /// and how long it has been stuck, which is the line that names the problem rather than
     /// describing one attempt out of tens of thousands.
-    fn note_unappliable_row(&mut self, row_key: (ObjectId, BranchName)) -> (bool, u64, u64) {
+    pub(super) fn note_unappliable_row(
+        &mut self,
+        row_key: (ObjectId, BranchName),
+        error_kind: &'static str,
+    ) -> (bool, u64, u64) {
         let now = self.clock.reserve_timestamp();
         let notice = self.unappliable_rows.entry(row_key).or_insert_with(|| {
             crate::sync_manager::UnappliableRowNotice {
                 attempts: 0,
                 first_failed_at: now,
                 last_warned_at: 0,
+                last_error: error_kind,
             }
         });
         notice.attempts += 1;
         let stuck_for = now.saturating_sub(notice.first_failed_at);
-        let speak = notice.last_warned_at == 0
+        // A CHANGED failure is new information and is never suppressed — only a repeat of
+        // the same one is counted rather than printed. Without this the interval hides the
+        // change, and production runs at `info` where the DEBUG repeat line does not exist
+        // at all: a storage failure arriving behind a `ParentNotFound` on the same row
+        // would be silent for half a minute, which is how the 2026-08-15 ENOSPC incident
+        // began.
+        let changed = notice.last_error != error_kind;
+        let speak = changed
+            || notice.last_warned_at == 0
             || now.saturating_sub(notice.last_warned_at)
                 >= crate::sync_manager::UNAPPLIABLE_ROW_WARN_INTERVAL_MICROS;
         if speak {
             notice.last_warned_at = now;
+            notice.last_error = error_kind;
         }
         (speak, notice.attempts, stuck_for)
+    }
+
+    /// A stable name for what went wrong, so a row that changes failure mode says so.
+    fn unappliable_error_kind(error: &crate::row_histories::RowHistoryError) -> &'static str {
+        match error {
+            crate::row_histories::RowHistoryError::ObjectNotFound(_) => "object-not-found",
+            crate::row_histories::RowHistoryError::ParentNotFound(_) => "parent-not-found",
+            crate::row_histories::RowHistoryError::StorageError(_) => "storage-error",
+        }
     }
 
     /// A row that was failing now applied. Say so once, with what it cost.

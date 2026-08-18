@@ -477,5 +477,6 @@ mod server_sync;
 mod settlements;
 mod subscriptions;
 mod transaction_sealing;
+mod unappliable_row_notices;
 mod visible_ancestor_cost;
 mod wedged_row_recovery;

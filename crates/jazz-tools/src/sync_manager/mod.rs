@@ -162,6 +162,12 @@ pub(super) struct UnappliableRowNotice {
     pub(super) attempts: u64,
     pub(super) first_failed_at: u64,
     pub(super) last_warned_at: u64,
+    /// Which failure the last spoken line described. A row that changes failure mode is
+    /// loud again immediately, because the interval would otherwise hide the change and
+    /// production runs at `info` — the DEBUG repeat line does not exist there. Silence for
+    /// half a minute is how a storage failure would arrive behind a `ParentNotFound` that
+    /// preceded it on the same row, which is the shape of the 2026-08-15 ENOSPC incident.
+    pub(super) last_error: &'static str,
 }
 
 #[derive(Debug, Clone)]
