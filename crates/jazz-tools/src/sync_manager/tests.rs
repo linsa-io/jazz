@@ -463,6 +463,11 @@ mod delivered_row_reseal;
 mod dropped_payload;
 mod forwarding_recursion;
 mod frontier_pruning;
+// The whole module runs on `SqliteStorage`: `MemoryStorage` overrides the visible-row
+// reads and never executes the locator ladder, so the cross-generation raw-table family
+// this gates is invisible to it.
+#[cfg(feature = "sqlite")]
+mod inbound_row_indexing;
 mod missing_answer_bound;
 mod permissions;
 mod policied_row_repeat_submissions;
