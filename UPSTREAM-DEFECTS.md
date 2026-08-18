@@ -1435,6 +1435,106 @@ rejected ancestor prunes the descent or the walk there was not checked.
 
 ---
 
+## 29. A node reads its own replica forever — read-your-own-writes never expires
+
+**Severity: permanent stale reads per row, for the process lifetime, on any node whose
+reads are one-shot; silent.** Every row a node had ever written stayed frozen in that
+node's own reads. Nothing logged, nothing degraded — the reads simply answered from a
+local copy while believing they had asked the server.
+
+Measured end to end on the live stack (2026-08-17), `unique_names` row
+`01a0116b-4641-76d1-874b-87a72296fa22` on branch `dev-b32dae47bbd9-main`:
+
+```text
+  rpc-server store   1 version, VisibleDirect, idx:unique_names:userId = 1
+  jazz-sync store    2 versions, winner deleted=true kind=Soft,
+                     idx:…:_id_deleted = 1, _id/userId/uniqueName = 0
+  handler reading at tier 'edge'    claimants=1 owned=1 outcome="alreadyOwned"
+  after restarting the rpc process  claimants=0 owned=0 outcome="taken"
+```
+
+One variable changed — the process restart — and the store was untouched by it. What the
+restart cleared is an in-memory map.
+
+`QueryManager::pending_local_row_batches` served THREE roles at once: the `IndexScan`
+source overlay, the row-loader durability downgrade, and a read-your-own-writes exemption
+in `filter_synced_query_scope_tuples`, which kept a tuple unconditionally when its id was
+in that map — before it ever looked at the remote scope. The map is cleared only by an
+INBOUND update for the same object and branch, and a server never sends a row back to its
+author: `inbox.rs` forwards to everyone EXCEPT the originating client, and `forwarding.rs`
+additionally requires scope membership, which a node holding no live subscription never
+has. So on a node whose reads are one-shot — an rpc-server backend facade — the exemption
+never expired.
+
+Product consequence, measured: every uniqueness check read the node's own replica while
+believing it had asked the server. That is `uniqueName.take`, email binding and the
+apple-identity lookup. The user-visible symptom was a free nickname that could not be
+taken, and it needed a second defect to become visible — an inspector writing with
+`ClientRole::Admin` bypasses `allowDelete`, so the soft delete applied on jazz-sync only,
+wiping that store's indices while rpc-server kept its own live copy exempt forever.
+
+Fix, in four parts. The exemption is split out of `pending_local_row_batches` into
+`scope_exempt_local_rows` (written, not yet durable at the settlement target — unbounded on
+purpose, nothing upstream can know about it) and `confirmed_local_rows_awaiting_scope`
+(durable, awaiting an answer that accounts for it, carrying the settle pass it was parked
+in). All five removal sites route through one `retire_local_row_tracking` helper, because
+three of them — the two `retract_local_rejected_row` paths and
+`restore_local_rejected_delete_row` — cleared only the old map, which left a rejected row's
+exemption permanently unreachable (the inbound-update arm is gated on the row still being
+in the map the rejection had just cleared). Release is per SUBSCRIPTION: `apply_query_settled`
+records, per query, the pass in which it last received a settle FROM A SERVER at or above
+that subscription's own required tier, and the filter compares it to the parked pass.
+Finally the local-write authority became additive — a transaction-scoped read is exempt for
+the rows it staged, plus the process-wide maps when it asked for `Immediate`.
+
+Three predicates were tried and discarded before that shape, each verified inert in source
+rather than argued about:
+
+- against `SyncManager::settlement_target()` — that answers "how durable must MY WRITE be",
+  is `GlobalServer` for any node with a server attached whatever that server can attest,
+  while a `QuerySettled` carries the EMITTING server's `max_local_durability_tier()`, and
+  `server/builder.rs` declares `EdgeServer` for any server with an upstream. Behind an edge
+  the comparison never holds and nothing ever retires.
+- against the maximum tier across readers — one `GlobalServer` subscription anywhere in the
+  process then pins every `EdgeServer` reader into permanent exemption, although an
+  `EdgeServer` snapshot is fully authoritative for that reader. Same inertness, triggered by
+  subscription mix instead of topology.
+- against `remote_query_scope_dirty` — `SyncManager::remove_server` raises that too, so
+  losing a server would retire exemptions, which is the node learning LESS.
+
+Verification. Five gates plus a differential oracle, each falsified by disarming the fix and
+confirming the gate goes red at its own assertion: the durable write loses its exemption;
+the not-yet-durable write keeps it; the same behind an edge server (server declaring
+`EdgeServer`, reader at `EdgeServer`, write still confirming at `GlobalServer` — the
+asymmetry is settle-tier versus write-tier, not both dropping together); losing a server
+does not retire a parked exemption (two servers, since with one the filter stops filtering
+and the bug is masked); and a rejected write leaves every map that tracked it (a real
+policy denial producing a real `Rejected` fate). The oracle runs randomised sequences —
+write, confirm at and below the tier, `Missing` fate, publish into the server's scope,
+scope refresh — over two servers and TWO readers at different tiers in one process, with
+each reader's model advanced only by a frame addressed to it at a tier it can trust. The
+two-reader dimension is what turns the maximum-tier predicate red, on a four-step sequence.
+
+Known residual: a long-lived subscription whose server-side scope never changes receives no
+further `QuerySettled` (`server_queries.rs` requires `scope_changed` once a subscription has
+settled once), so its parked exemptions never retire. Scoped to that one reader rather than
+the process. The measured path — one-shot reads — allocates a fresh query id each time and
+always receives a frame. Also open: no gate covers an `Immediate` read carrying an overlay
+whose non-overlay local write reaches the filter; the state was argued from source but not
+constructed in a fixture, and the shipped behaviour there is the pre-existing one.
+
+Attribution: OURS, not upstream-inherited — the exemption predates the fork on both sides,
+but the one-shot-read backend facade that makes it permanent is ours.
+Groove (codex/jazz-core-engine-swap): architected away. There is no `remote_query_scope` on
+that line at all, and no separate exemption to expire: `SPEC/5_reads_snapshots.md`
+`INV-READ-11` makes it a property of the read tier itself — "A local-tier read on the writer
+node MUST include the node's own pending committed transaction, while a global-tier read
+MUST exclude it until global fate/current state is applied." A global-tier uniqueness check
+there cannot see its own unconfirmed write by construction, which is exactly the invariant
+this defect violated. `INV-READ-4` covers the transaction-overlay half ("Reads inside an
+open exclusive transaction MUST overlay that transaction's own pending writes on top of the
+snapshot-covered base view") — additive against the snapshot, matching the shape we landed.
+
 ## Groove line: verification summary (2026-08-15)
 
 Upstream's Thursday publishes are cut from the integration branch
@@ -1457,8 +1557,10 @@ Open PRs on the branch that overlap entries here: #1538 → 17; #1533, #1537 →
 #1523 → 19/20; #1535, #1520 → 1's class; #1201 → 20's twin on main; #1367, #1503 → 18 and
 6's RN half; #1200 is tier-adjacent.
 
-The risk verdict: 17 of the 27 live entries (entry 4 is withdrawn; 28 total) have mechanisms unrepresentable on the groove line,
-(entries 25-28 postdate this groove pass and are marked "not verified" in their own footers — they are not counted either way),
+The risk verdict: 17 of the 27 live entries (entry 4 is withdrawn; 29 total) have mechanisms unrepresentable on the groove line,
+(entries 25-28 postdate this groove pass and are marked "not verified" in their own footers — they are not counted either way;
+entry 29 also postdates it but WAS verified against the same tip `aada95800`, and is architected away — `INV-READ-11` makes
+read-your-own-writes a property of the read tier rather than a separately tracked exemption),
 plus entry 24's branch-universe face (its outer-row-kill face is an unverified review item there),
 including 17, 19, 20 and 23 — the schema-crossing class. Still present: 6's RN half, the
 new O(table) policy scan flagged under entry 15, and 22's blind `id` readers (the IVM
