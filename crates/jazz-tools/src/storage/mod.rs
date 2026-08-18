@@ -5165,6 +5165,240 @@ mod store_probe {
         );
     }
 
+    /// Dump the DECODED rows of a table, per branch, straight out of the visible
+    /// region — bypassing the query manager, and therefore its read policy.
+    ///
+    /// Needed because a table can be perfectly present in storage and still serve
+    /// zero rows to a session-less query (`auth_pending_secrets` is policy-gated).
+    /// Env: JAZZ_PROBE_PATH, JAZZ_PROBE_APP_ID, JAZZ_PROBE_SCHEMA_HASH,
+    /// JAZZ_PROBE_TABLES.
+    fn probe_dump_rows<S: Storage>(storage: S) {
+        use crate::query_manager::types::{Schema, TableName};
+        use crate::schema_manager::{AppId, SchemaManager};
+        use crate::sync_manager::SyncManager;
+
+        let app_id =
+            AppId::from_string(&std::env::var("JAZZ_PROBE_APP_ID").expect("set JAZZ_PROBE_APP_ID"))
+                .expect("valid app id");
+        let hash_hex = std::env::var("JAZZ_PROBE_SCHEMA_HASH").expect("set JAZZ_PROBE_SCHEMA_HASH");
+        let tables = std::env::var("JAZZ_PROBE_TABLES").expect("set JAZZ_PROBE_TABLES");
+
+        let mut extractor =
+            SchemaManager::new(SyncManager::new(), Schema::new(), app_id, "dev", "main")
+                .expect("phase-1 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(
+            &mut extractor,
+            &storage,
+            app_id,
+        )
+        .expect("phase-1 rehydrate");
+        let target = crate::query_manager::types::SchemaHash::from_hex(&hash_hex)
+            .expect("valid schema hash");
+        let current = extractor
+            .context()
+            .live_schemas
+            .get(&target)
+            .or_else(|| extractor.context().pending_schemas.get(&target))
+            .cloned()
+            .expect("schema in catalogue");
+
+        let mut sm = SchemaManager::new(SyncManager::new(), current, app_id, "dev", "main")
+            .expect("phase-2 schema manager");
+        crate::schema_manager::rehydrate_schema_manager_from_catalogue(&mut sm, &storage, app_id)
+            .expect("phase-2 rehydrate");
+        let branches = sm.query_manager_mut().all_query_branches();
+
+        for table in tables.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            println!("=== table {table} ===");
+            for branch in &branches {
+                let rows = storage
+                    .scan_visible_region(table, branch)
+                    .unwrap_or_default();
+                if rows.is_empty() {
+                    continue;
+                }
+                // Decode against the schema of the generation this branch names.
+                let schema_hash = crate::query_manager::types::ComposedBranchName::parse(
+                    &BranchName::new(branch.as_str()),
+                )
+                .map(|composed| composed.schema_hash);
+                let schema = schema_hash.and_then(|short| {
+                    if sm.context().current_hash.0[..6] == short.0[..6] {
+                        return Some(sm.context().current_schema.clone());
+                    }
+                    sm.context()
+                        .live_schemas
+                        .iter()
+                        .find(|(full, _)| full.0[..6] == short.0[..6])
+                        .map(|(_, schema)| schema.clone())
+                });
+                for row in rows {
+                    let decoded = schema
+                        .as_ref()
+                        .and_then(|schema| schema.get(&TableName::new(table)))
+                        .and_then(|table_schema| {
+                            decode_row(&table_schema.columns, &row.data.to_vec()).ok()
+                        });
+                    println!(
+                        "  branch={branch} row_id={} state={:?} updated_at={}",
+                        row.row_id, row.state, row.updated_at
+                    );
+                    match decoded {
+                        Some(values) => {
+                            for value in values {
+                                println!("      {value:?}");
+                            }
+                        }
+                        None => println!("      <could not decode against this generation>"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dump the raw index tables whose name matches JAZZ_PROBE_INDEX (substring),
+    /// with their entry keys. A backref lookup answers from
+    /// `index:<table>:<column>:<branch>`; a row that is VisibleDirect in storage
+    /// but missing here is findable by `_id` and invisible to the backref scan.
+    fn probe_dump_index<S: Storage>(storage: S) {
+        let needle = std::env::var("JAZZ_PROBE_INDEX").expect("set JAZZ_PROBE_INDEX");
+        // Index raw tables carry no header, so they are invisible to a header
+        // scan: an exact name (containing ':') is scanned directly.
+        let names: Vec<String> = if needle.contains(':') {
+            vec![needle.clone()]
+        } else {
+            storage
+                .scan_raw_table_headers()
+                .expect("scan raw table headers")
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| name.contains(&needle))
+                .collect()
+        };
+        for name in names {
+            let entries = storage.raw_table_scan_prefix(&name, "").unwrap_or_default();
+            println!("index {name}: {} entries", entries.len());
+            for (key, _value) in entries.iter().take(40) {
+                println!("    {key}");
+            }
+        }
+    }
+
+    /// Full HISTORY of one row, per branch: every version, its state and its batch.
+    /// A row whose head is VisibleDirect while its history carries a delete is the
+    /// shape a rejected/partial delete leaves behind.
+    /// Env: JAZZ_PROBE_PATH, JAZZ_PROBE_TABLE, JAZZ_PROBE_ROW_ID.
+    fn probe_dump_history<S: Storage>(storage: S) {
+        let table = std::env::var("JAZZ_PROBE_TABLE").expect("set JAZZ_PROBE_TABLE");
+        let row_id = crate::object::ObjectId::from_uuid(
+            std::env::var("JAZZ_PROBE_ROW_ID")
+                .expect("set JAZZ_PROBE_ROW_ID")
+                .parse::<uuid::Uuid>()
+                .expect("valid row id"),
+        );
+        let rows = storage
+            .scan_history_row_batches(&table, row_id)
+            .expect("history scan");
+        println!("history for {table}/{row_id}: {} versions", rows.len());
+        for row in &rows {
+            println!(
+                "  branch={} state={:?} deleted={} kind={:?} updated_at={} batch={:?}",
+                row.branch,
+                row.state,
+                row.is_deleted,
+                row.delete_kind,
+                row.updated_at,
+                row.batch_id
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn probe_dump_history_sqlite() {
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch =
+            std::env::temp_dir().join(format!("jazz-hist-probe-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the replica");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                let to = scratch.with_file_name(format!(
+                    "{}{sidecar}",
+                    scratch.file_name().unwrap().to_string_lossy()
+                ));
+                let _ = std::fs::copy(&from, &to);
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the copied replica");
+        probe_dump_history(storage);
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_dump_history_rocksdb() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+        probe_dump_history(storage);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn probe_dump_index_sqlite() {
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch =
+            std::env::temp_dir().join(format!("jazz-index-probe-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the replica");
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                let to = scratch.with_file_name(format!(
+                    "{}{sidecar}",
+                    scratch.file_name().unwrap().to_string_lossy()
+                ));
+                let _ = std::fs::copy(&from, &to);
+            }
+        }
+        let storage = SqliteStorage::open(&scratch).expect("open the copied replica");
+        probe_dump_index(storage);
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_dump_index_rocksdb() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+        probe_dump_index(storage);
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_dump_rows_rocksdb() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+        probe_dump_rows(storage);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn probe_dump_rows_sqlite() {
+        let source = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let scratch =
+            std::env::temp_dir().join(format!("jazz-dump-probe-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        std::fs::copy(&source, &scratch).expect("copy the replica for the probe");
+        let storage = SqliteStorage::open(&scratch).expect("open the copied replica");
+        probe_dump_rows(storage);
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     #[ignore]
