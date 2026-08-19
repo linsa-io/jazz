@@ -145,6 +145,22 @@ pub static LIVE_SUBQUERY_NODES: AtomicU64 = AtomicU64::new(0);
 /// is unexplainable until these three are on the line.
 pub static HISTORY_SCANS: AtomicU64 = AtomicU64::new(0);
 
+/// Rows found only by walking every visible raw table because their locator named a
+/// family that does not hold them.
+///
+/// The ladder is a correctness net for a real condition — a row delivered before the
+/// catalogue knew its origin schema is placed in the CURRENT family while its locator keeps
+/// the server-stamped origin hash — and it returns `needs_exact_locator` so the store can
+/// correct itself. Nothing on the READ path acts on that, so a split row pays the walk on
+/// every read, forever: production 2026-08-18 measured 1,200 recoveries in five minutes
+/// against a single `users` row on an otherwise idle server, while settle passes accounted
+/// for a fifth of the process's CPU.
+///
+/// A number rather than a log line, because "did the store heal" is a question about a
+/// count converging to zero, and 1,200 identical INFO lines answer it only to whoever
+/// thinks to count them.
+pub static LOCATOR_LADDER_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
 /// History entries decoded — counted at `decode_history_row_bytes_in_table`,
 /// the choke point every scan path funnels through. Divided by
 /// [`HISTORY_SCANS`] it gives the mean depth the pass paid for.
@@ -311,6 +327,7 @@ pub struct SettleCounts {
     pub row_loads: u64,
     pub index_reads: u64,
     pub rows_emitted: u64,
+    pub locator_ladder_recoveries: u64,
     pub history_scans: u64,
     pub history_entries: u64,
     pub history_bytes: u64,
@@ -347,6 +364,7 @@ impl SettleCounts {
             row_loads: ROW_LOADS.load(Ordering::Relaxed),
             index_reads: INDEX_READS.load(Ordering::Relaxed),
             rows_emitted: ROWS_EMITTED.load(Ordering::Relaxed),
+            locator_ladder_recoveries: LOCATOR_LADDER_RECOVERIES.load(Ordering::Relaxed),
             history_scans: HISTORY_SCANS.load(Ordering::Relaxed),
             history_entries: HISTORY_ENTRIES.load(Ordering::Relaxed),
             history_bytes: HISTORY_BYTES.load(Ordering::Relaxed),
@@ -387,6 +405,9 @@ impl SettleCounts {
             row_loads: self.row_loads.saturating_sub(base.row_loads),
             index_reads: self.index_reads.saturating_sub(base.index_reads),
             rows_emitted: self.rows_emitted.saturating_sub(base.rows_emitted),
+            locator_ladder_recoveries: self
+                .locator_ladder_recoveries
+                .saturating_sub(base.locator_ladder_recoveries),
             history_scans: self.history_scans.saturating_sub(base.history_scans),
             history_entries: self.history_entries.saturating_sub(base.history_entries),
             history_bytes: self.history_bytes.saturating_sub(base.history_bytes),
@@ -482,6 +503,7 @@ impl Drop for SettlePass {
             row_loads = cost.row_loads,
             index_reads = cost.index_reads,
             rows_emitted = cost.rows_emitted,
+            locator_ladder_recoveries = cost.locator_ladder_recoveries,
             history_scans = cost.history_scans,
             history_entries = cost.history_entries,
             history_bytes = cost.history_bytes,

@@ -3261,6 +3261,9 @@ pub(super) fn load_history_row_batch_row_bytes_with_storage<H: Storage + ?Sized>
         };
         let row_raw_table = row_raw_table_id.raw_table_name().to_string();
         if let Some(bytes) = storage.raw_table_get(&row_raw_table, &key)? {
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::LOCATOR_LADDER_RECOVERIES,
+            );
             tracing::info!(
                 table,
                 branch,
@@ -3375,6 +3378,9 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
         };
         let row_raw_table = row_raw_table_id.raw_table_name().to_string();
         if let Some(bytes) = storage.raw_table_get(&row_raw_table, &key)? {
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::LOCATOR_LADDER_RECOVERIES,
+            );
             tracing::info!(
                 table,
                 branch,
@@ -5037,6 +5043,128 @@ mod store_probe {
         let storage =
             RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
         probe_table_census(storage);
+    }
+
+    /// What the per-tick sealed-batch recovery sweep actually reads.
+    ///
+    /// `recover_completed_sealed_batches_with_storage` runs first in EVERY
+    /// `immediate_tick` (runtime_core/ticks.rs:661), unconditionally: it scans the
+    /// whole retained sealed-submission table, decodes each row (resolving a branch
+    /// name per member ord), then point-gets the authoritative fate of each batch and
+    /// `continue`s on anything already settled. The scan is documented as small —
+    /// "Submissions are deleted once the runtime no longer needs the original
+    /// seal/member list" — so this probe measures whether that holds in a real store,
+    /// and how much of the sweep is re-read every tick only to be discarded.
+    #[test]
+    #[ignore]
+    fn probe_recovery_sweep_rocksdb() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+
+        let raw = storage
+            .raw_table_scan_prefix(SEALED_BATCH_SUBMISSION_TABLE, "batch:")
+            .expect("scan submission keys");
+        println!("retained sealed submissions (raw keys): {}", raw.len());
+
+        let started = std::time::Instant::now();
+        let submissions = storage
+            .scan_sealed_batch_submissions()
+            .expect("scan sealed batch submissions");
+        let scan_cost = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let mut already_settled = 0usize;
+        let mut by_variant: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for submission in &submissions {
+            match storage
+                .load_authoritative_batch_fate(submission.batch_id)
+                .expect("load fate")
+            {
+                Some(fate) => {
+                    already_settled += 1;
+                    let label = match &fate {
+                        crate::batch_fate::BatchFate::Rejected { .. } => "Rejected".to_string(),
+                        crate::batch_fate::BatchFate::Missing { .. } => "Missing".to_string(),
+                        other => format!("{:?}", other.confirmed_tier()),
+                    };
+                    *by_variant.entry(label).or_default() += 1;
+                }
+                None => *by_variant.entry("no fate".to_string()).or_default() += 1,
+            }
+        }
+        let fate_cost = started.elapsed();
+        println!("fates of retained submissions: {by_variant:?}");
+
+        println!(
+            "decoded {} submissions in {:?}; fate lookups {:?}; already settled {} ({:.1}%)",
+            submissions.len(),
+            scan_cost,
+            fate_cost,
+            already_settled,
+            if submissions.is_empty() {
+                0.0
+            } else {
+                100.0 * already_settled as f64 / submissions.len() as f64
+            }
+        );
+        // Cross-check the two fate stores. `LocalBatchRecord::apply_fate` (batch_fate.rs:384)
+        // REFUSES to downgrade a confirmed fate to `Missing`; `merged_with` (batch_fate.rs:123,
+        // the `_ => incoming.clone()` catch-all) accepts it, and that is the path
+        // `upsert_authoritative_batch_fate` takes. So a record that still says
+        // DurableDirect/AcceptedTransaction while the authoritative table says `Missing` is
+        // direct evidence that the downgrade fired here, rather than the batch simply never
+        // having landed.
+        let mut record_fates: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for submission in &submissions {
+            let label = match storage.load_local_batch_record(submission.batch_id) {
+                Ok(Some(record)) => match record.latest_fate {
+                    Some(crate::batch_fate::BatchFate::Missing { .. }) => "record: Missing",
+                    Some(crate::batch_fate::BatchFate::Rejected { .. }) => "record: Rejected",
+                    Some(crate::batch_fate::BatchFate::DurableDirect { .. }) => {
+                        "record: DurableDirect (DOWNGRADED)"
+                    }
+                    Some(crate::batch_fate::BatchFate::AcceptedTransaction { .. }) => {
+                        "record: AcceptedTransaction (DOWNGRADED)"
+                    }
+                    None => "record present, no fate",
+                },
+                Ok(None) => "no local batch record",
+                Err(_) => "record read error",
+            };
+            *record_fates.entry(label.to_string()).or_default() += 1;
+        }
+        println!("local batch records for the same batches: {record_fates:?}");
+
+        // BatchId is a UUIDv7: the first 48 bits are a millisecond unix timestamp, so
+        // every retained submission can be dated exactly. That separates a historical
+        // residue (all old, nothing accruing) from a live leak (arrivals every day).
+        let mut days: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+        let mut oldest_ms = i64::MAX;
+        let mut newest_ms = i64::MIN;
+        for submission in &submissions {
+            let b = submission.batch_id.as_bytes();
+            let ms = ((b[0] as i64) << 40)
+                | ((b[1] as i64) << 32)
+                | ((b[2] as i64) << 24)
+                | ((b[3] as i64) << 16)
+                | ((b[4] as i64) << 8)
+                | (b[5] as i64);
+            oldest_ms = oldest_ms.min(ms);
+            newest_ms = newest_ms.max(ms);
+            *days.entry(ms / 86_400_000).or_default() += 1;
+        }
+        println!("oldest submission unix_ms={oldest_ms}, newest unix_ms={newest_ms}");
+        println!("per-day counts (unix_day -> retained): {days:?}");
+
+        let sweep = scan_cost + fate_cost;
+        println!(
+            "one sweep costs {:?}; at 100 ticks/s that is {:.1}% of a core",
+            sweep,
+            100.0 * sweep.as_secs_f64() * 100.0
+        );
     }
 
     /// How much of the store is the SAME row id on two generations' branches,

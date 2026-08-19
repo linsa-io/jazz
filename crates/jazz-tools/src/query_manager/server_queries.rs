@@ -216,7 +216,7 @@ impl QueryManager {
         }
     }
 
-    pub(super) fn build_server_subscription_context(
+    pub(crate) fn build_server_subscription_context(
         &self,
         query: &crate::query_manager::query::Query,
     ) -> Option<(Arc<Schema>, crate::schema_manager::SchemaContext)> {
