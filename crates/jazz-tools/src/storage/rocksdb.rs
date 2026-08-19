@@ -92,6 +92,29 @@ impl RocksDBStorage {
         // LZ4 for L0-L2 (fast), Zstd for deeper levels (compact)
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        // Compact a file once it is mostly deletions.
+        //
+        // The engine's write pattern puts a key and then deletes it on the same narrow
+        // keyspaces — every unbatched direct write seals its own batch, writing a sealed
+        // submission that is deleted again the moment the batch settles. The live set stays
+        // tiny while the tombstones accumulate, and every prefix iteration over that
+        // keyspace has to step over all of them.
+        //
+        // Measured on a store shaped like production: iterating the ~1284 live
+        // sealed-submission keys cost 350 µs with no churn and 2.87 ms behind ~50k
+        // tombstones, and that iteration runs at the top of every tick. Reclaiming it needs
+        // a compaction that RocksDB will not schedule on its own, because nothing here
+        // triggers its usual heuristics — the files are small and the level is bottommost.
+        //
+        // 10000 keys in a sliding window, 5000 of them deletions: a file that is half
+        // tombstones over any such window is marked for compaction as it is written.
+        //
+        // This does not retroactively clean a store that already accrued them — a forced
+        // range compaction would, but `TransactionDB` exposes no compaction call in this
+        // binding. It does not need to: the sealed-submission keyspace is rewritten by
+        // every direct write, so new files are produced, marked, and compacted against the
+        // old ones continuously. The tombstones drain with use rather than at open.
+        opts.add_compact_on_deletion_collector_factory(10_000, 5_000, 0.0);
 
         let txdb_opts = TransactionDBOptions::default();
         let db = TransactionDB::open(&opts, &txdb_opts, path.as_ref())
