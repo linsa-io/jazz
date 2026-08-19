@@ -247,17 +247,23 @@ impl RocksDBStorage {
         if let Some(ub) = Self::prefix_upper_bound(prefix_bytes) {
             read_opts.set_iterate_upper_bound(ub);
         }
+        // A raw iterator, not `iterator_opt`: the latter yields `(key, value)` and copies
+        // BOTH out of the block for every row, so a "keys only" scan still paid for every
+        // value. This is the scan the per-tick sealed-batch recovery leans on, and on a
+        // store holding a thousand-odd retained submissions the copies were most of its
+        // cost.
         let mut out = Vec::new();
-        let iter = db.iterator_opt(
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-            read_opts,
-        );
-        for item in iter {
-            let (key, _) = item.map_err(|e| StorageError::IoError(format!("rocksdb iter: {e}")))?;
+        let mut iter = db.raw_iterator_opt(read_opts);
+        iter.seek(prefix_bytes);
+        while iter.valid() {
+            let Some(key) = iter.key() else { break };
             let key_str = String::from_utf8(key.to_vec())
                 .map_err(|e| StorageError::IoError(format!("rocksdb invalid key utf8: {e}")))?;
             out.push(key_str);
+            iter.next();
         }
+        iter.status()
+            .map_err(|e| StorageError::IoError(format!("rocksdb iter: {e}")))?;
         Ok(out)
     }
 

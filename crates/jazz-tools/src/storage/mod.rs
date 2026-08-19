@@ -5067,6 +5067,16 @@ mod store_probe {
             .expect("scan submission keys");
         println!("retained sealed submissions (raw keys): {}", raw.len());
 
+        // Warm the block cache before timing anything: whichever order ran first would
+        // otherwise pay for the other one's cold reads and the comparison would be a
+        // measurement of cache state, not of the change.
+        let _ = storage
+            .scan_sealed_batch_submissions()
+            .expect("warm the cache");
+        let _ = storage
+            .scan_sealed_batch_submission_ids()
+            .expect("warm the cache");
+
         let started = std::time::Instant::now();
         let submissions = storage
             .scan_sealed_batch_submissions()
@@ -5158,6 +5168,36 @@ mod store_probe {
         }
         println!("oldest submission unix_ms={oldest_ms}, newest unix_ms={newest_ms}");
         println!("per-day counts (unix_day -> retained): {days:?}");
+
+        // The same work in the order the sweep now uses: ids only, then the fate, and the
+        // row read only for whatever survives. On a store where nothing is drivable the
+        // rows are never read at all, which is the whole point.
+        let started = std::time::Instant::now();
+        let ids = storage
+            .scan_sealed_batch_submission_ids()
+            .expect("scan sealed batch submission ids");
+        let id_scan_cost = started.elapsed();
+        let started = std::time::Instant::now();
+        let mut drivable = 0usize;
+        for batch_id in &ids {
+            match storage
+                .load_authoritative_batch_fate(*batch_id)
+                .expect("load fate")
+            {
+                None => drivable += 1,
+                Some(crate::batch_fate::BatchFate::DurableDirect { .. }) => drivable += 1,
+                Some(_) => {}
+            }
+        }
+        let new_fate_cost = started.elapsed();
+        println!(
+            "NEW order: {} ids in {:?}; fate lookups {:?}; rows worth reading: {}",
+            ids.len(),
+            id_scan_cost,
+            new_fate_cost,
+            drivable
+        );
+        println!("NEW sweep costs {:?}", id_scan_cost + new_fate_cost);
 
         let sweep = scan_cost + fate_cost;
         println!(
