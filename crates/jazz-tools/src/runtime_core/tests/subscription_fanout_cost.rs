@@ -112,6 +112,13 @@ fn measure_split(interested: usize, uninterested: usize, writes: usize) -> f64 {
 #[ignore = "measurement, not a gate: prints the fan-out curve"]
 fn a_write_should_cost_the_subscriptions_that_care_not_the_ones_that_do_not() {
     const WRITES: usize = 40;
+    if std::env::var("JAZZ_FANOUT_PROFILE").is_ok() {
+        // A long run at one point on the curve, so a sampler has something to catch.
+        println!("profiling 400 interested subscriptions...");
+        let us = measure_split(400, 0, 400);
+        println!("  {us:.1} us per write");
+        return;
+    }
     println!("A) one interested subscription, growing the UNinterested crowd:");
     println!("  uninterested |  us per write | ratio");
     let mut base_a = 0.0;
