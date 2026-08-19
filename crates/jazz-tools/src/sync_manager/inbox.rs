@@ -2081,6 +2081,18 @@ impl SyncManager {
 
             // Survived the fate check, so this one is worth reading.
             let submission = match storage.load_sealed_batch_submission(batch_id) {
+                // The old value scan hard-errored when a row disagreed with its own key.
+                // Reading the row separately means the fate was checked under the key's id
+                // while the rest of the loop drives the row's, so keep the guard: under
+                // corruption those are two different batches.
+                Ok(Some(submission)) if submission.batch_id != batch_id => {
+                    tracing::warn!(
+                        ?batch_id,
+                        row_batch_id = ?submission.batch_id,
+                        "sealed batch submission key disagrees with its row; skipping"
+                    );
+                    continue;
+                }
                 Ok(Some(submission)) => submission,
                 Ok(None) => continue,
                 Err(error) => {

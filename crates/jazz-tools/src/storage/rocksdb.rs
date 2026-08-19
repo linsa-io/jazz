@@ -481,11 +481,19 @@ impl Storage for RocksDBStorage {
     ) -> Result<super::RawTableKeys, StorageError> {
         #[cfg(test)]
         self.prefix_scans.set(self.prefix_scans.get() + 1);
-        self.with_inner(|inner| {
-            raw_table_scan_prefix_keys_core(table, prefix, |storage_prefix| {
-                Self::scan_prefix_keys_from_db(&inner.db, storage_prefix)
-            })
-        })
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::STORAGE_READ_OPS,
+        );
+        crate::query_manager::settle_cost::timed(
+            &crate::query_manager::settle_cost::STORAGE_READ_MICROS,
+            || {
+                self.with_inner(|inner| {
+                    raw_table_scan_prefix_keys_core(table, prefix, |storage_prefix| {
+                        Self::scan_prefix_keys_from_db(&inner.db, storage_prefix)
+                    })
+                })
+            },
+        )
     }
 
     fn raw_table_first_key_with_prefix(

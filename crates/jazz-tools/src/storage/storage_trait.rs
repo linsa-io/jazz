@@ -2070,6 +2070,10 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         (**self).scan_sealed_batch_submissions()
     }
 
+    fn scan_sealed_batch_submission_ids(&self) -> Result<Vec<BatchId>, StorageError> {
+        (**self).scan_sealed_batch_submission_ids()
+    }
+
     fn upsert_authoritative_batch_fate(
         &mut self,
         settlement: &BatchFate,

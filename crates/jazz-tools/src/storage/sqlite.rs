@@ -470,11 +470,19 @@ impl Storage for SqliteStorage {
         table: &str,
         prefix: &str,
     ) -> Result<super::RawTableKeys, StorageError> {
-        self.with_inner(|inner| {
-            raw_table_scan_prefix_keys_core(table, prefix, |storage_prefix| {
-                Self::scan_prefix_keys(&inner.conn, storage_prefix)
-            })
-        })
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::STORAGE_READ_OPS,
+        );
+        crate::query_manager::settle_cost::timed(
+            &crate::query_manager::settle_cost::STORAGE_READ_MICROS,
+            || {
+                self.with_inner(|inner| {
+                    raw_table_scan_prefix_keys_core(table, prefix, |storage_prefix| {
+                        Self::scan_prefix_keys(&inner.conn, storage_prefix)
+                    })
+                })
+            },
+        )
     }
 
     fn raw_table_scan_range(

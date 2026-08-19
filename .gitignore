@@ -60,3 +60,6 @@ data-multi/
 
 # Benchmark scratch data
 /crates/opfs-btree/wasm-bench/bench-data/
+
+# dhat profiler output — a run artifact, never source
+dhat-*.json
