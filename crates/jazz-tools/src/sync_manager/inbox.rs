@@ -2044,8 +2044,16 @@ impl SyncManager {
             return false;
         }
 
-        let submissions = match storage.scan_sealed_batch_submissions() {
-            Ok(submissions) => submissions,
+        // Ids first, rows later. The old shape read and decoded every retained submission
+        // up front — and each decode resolves a branch name by ord, a random point read per
+        // row on top of the value scan — only to `continue` on the ones already fated. On a
+        // production store that was 11.06 ms per tick against 1284 rows none of which were
+        // drivable, 70% of the process's CPU under a user typing into one chat draft, and
+        // because ticks are serialized under the runtime mutex it set the tick rate for
+        // every client on the process. The fate check is the cheap discriminator, so it goes
+        // first, and a submission's row is read only once it has survived it.
+        let batch_ids = match storage.scan_sealed_batch_submission_ids() {
+            Ok(batch_ids) => batch_ids,
             Err(error) => {
                 tracing::warn!(%error, "failed to scan sealed batch submissions for recovery");
                 return false;
@@ -2053,8 +2061,8 @@ impl SyncManager {
         };
 
         let mut recovered_any = false;
-        for submission in submissions {
-            match storage.load_authoritative_batch_fate(submission.batch_id) {
+        for batch_id in batch_ids {
+            match storage.load_authoritative_batch_fate(batch_id) {
                 Ok(Some(fate)) if self.can_promote_direct_fate(&fate) => {
                     // Continue into validation so this authority can promote a
                     // direct fate that was previously confirmed by a lower tier.
@@ -2063,13 +2071,27 @@ impl SyncManager {
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(
-                        batch_id = ?submission.batch_id,
+                        ?batch_id,
                         %error,
                         "failed to load authoritative batch fate during sealed batch recovery"
                     );
                     continue;
                 }
             }
+
+            // Survived the fate check, so this one is worth reading.
+            let submission = match storage.load_sealed_batch_submission(batch_id) {
+                Ok(Some(submission)) => submission,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        ?batch_id,
+                        %error,
+                        "failed to load a sealed batch submission during recovery"
+                    );
+                    continue;
+                }
+            };
 
             let batch_rows = self.transactional_batch_rows(
                 storage,

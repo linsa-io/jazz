@@ -758,6 +758,26 @@ pub trait Storage {
         Ok(submissions)
     }
 
+    /// The batch id of every retained sealed submission, without reading a single row.
+    ///
+    /// [`Self::scan_sealed_batch_submissions`] reads and decodes every retained row, and each
+    /// decode resolves a branch name by ord — a random point read per submission on top of the
+    /// value scan. The per-tick recovery sweep discards nearly all of that: a submission whose
+    /// stored fate is already terminal is skipped without its row ever being looked at. This
+    /// hands the sweep the cheap half first, so the expensive half is paid only for the
+    /// submissions it can actually drive.
+    ///
+    /// Sorted by batch id to match `scan_sealed_batch_submissions`, so the sweep still visits
+    /// submissions in the same order.
+    fn scan_sealed_batch_submission_ids(&self) -> Result<Vec<BatchId>, StorageError> {
+        let mut batch_ids = Vec::new();
+        for key in self.raw_table_scan_prefix_keys(SEALED_BATCH_SUBMISSION_TABLE, "batch:")? {
+            batch_ids.push(decode_local_batch_record_key(&key)?);
+        }
+        batch_ids.sort();
+        Ok(batch_ids)
+    }
+
     fn upsert_authoritative_batch_fate(
         &mut self,
         settlement: &BatchFate,

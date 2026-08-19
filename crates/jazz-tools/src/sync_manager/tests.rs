@@ -473,6 +473,7 @@ mod permissions;
 mod policied_row_repeat_submissions;
 mod query_scope;
 mod round2_cross_generation_review;
+mod server_origin_seal;
 mod server_sync;
 mod settlements;
 mod subscriptions;

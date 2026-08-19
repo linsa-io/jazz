@@ -56,9 +56,29 @@ struct RowMutationCallCounts {
     local_batch_record_get_calls: usize,
 }
 
+/// What one tick's sealed-batch recovery sweep read. Separate from
+/// [`RowMutationCallCounts`] because that struct is compared exhaustively by tests about
+/// row mutations, which have no business knowing what the sweep costs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SweepCallCounts {
+    /// Full prefix scans of the sealed-submission table. The sweep does one per tick,
+    /// unconditionally, so this answers "did this tick walk the whole table".
+    sealed_submission_scans: usize,
+    /// Point reads of an authoritative batch fate. The sweep does one PER retained
+    /// submission, which is what makes its cost track the table instead of the work.
+    authoritative_fate_gets: usize,
+    /// Reads of a sealed submission ROW. Every one of these carries a decode, and each
+    /// decode resolves a branch name by ord — the expensive half of the sweep.
+    submission_row_reads: usize,
+    /// Point reads resolving a branch ord back to its name. Only submission decoding does
+    /// this on the sweep's path, so it tracks how many rows the sweep decoded.
+    branch_name_gets: usize,
+}
+
 struct RowMutationObservingStorage {
     inner: MemoryStorage,
     calls: Arc<Mutex<RowMutationCallCounts>>,
+    sweep: Arc<Mutex<SweepCallCounts>>,
 }
 
 #[derive(Clone, Default)]
@@ -124,6 +144,15 @@ impl RowMutationObservingStorage {
         Self {
             inner: MemoryStorage::new(),
             calls,
+            sweep: Arc::new(Mutex::new(SweepCallCounts::default())),
+        }
+    }
+
+    fn observing_sweep(sweep: Arc<Mutex<SweepCallCounts>>) -> Self {
+        Self {
+            inner: MemoryStorage::new(),
+            calls: Arc::new(Mutex::new(RowMutationCallCounts::default())),
+            sweep,
         }
     }
 }
@@ -1017,6 +1046,20 @@ impl Storage for RowMutationObservingStorage {
         if table == "__local_batch_record" && key.starts_with("batch:") {
             self.calls.lock().unwrap().local_batch_record_get_calls += 1;
         }
+        // This wrapper deliberately does NOT override `load_authoritative_batch_fate` or
+        // `scan_sealed_batch_submissions`: their default trait bodies run here and route
+        // through the raw table, which is what makes the count observable — and it also
+        // bypasses `MemoryStorage`'s own fate map, so for these two reads the wrapper
+        // behaves like a real backend rather than like memory.
+        if table == "__authoritative_batch_settlement" && key.starts_with("batch:") {
+            self.sweep.lock().unwrap().authoritative_fate_gets += 1;
+        }
+        if table == "__sealed_batch_submission" && key.starts_with("batch:") {
+            self.sweep.lock().unwrap().submission_row_reads += 1;
+        }
+        if table == "__branch_name_by_ord" {
+            self.sweep.lock().unwrap().branch_name_gets += 1;
+        }
         self.inner.raw_table_get(table, key)
     }
 
@@ -1025,6 +1068,9 @@ impl Storage for RowMutationObservingStorage {
         table: &str,
         prefix: &str,
     ) -> Result<RawTableRows, StorageError> {
+        if table == "__sealed_batch_submission" {
+            self.sweep.lock().unwrap().sealed_submission_scans += 1;
+        }
         self.inner.raw_table_scan_prefix(table, prefix)
     }
 
@@ -2140,10 +2186,12 @@ mod delivery_confirmation;
 mod fk_remove_error;
 mod incremental_scan;
 mod install_transport_tests;
+mod locator_ladder_heal;
 mod query_subscription;
 mod rejected_write_retires_tracking;
 mod schema_catalogue;
 mod sealed_batch_cost;
+mod subscription_registration_cost;
 mod sync_replay;
 mod unappliable_row_logging;
 mod write_batch;
