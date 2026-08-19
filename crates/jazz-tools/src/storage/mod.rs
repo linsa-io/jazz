@@ -3264,7 +3264,14 @@ pub(super) fn load_history_row_batch_row_bytes_with_storage<H: Storage + ?Sized>
             crate::query_manager::settle_cost::bump(
                 &crate::query_manager::settle_cost::LOCATOR_LADDER_RECOVERIES,
             );
-            tracing::info!(
+            // `debug`, not `info`: this fires on every READ of a split row, and the
+            // ladder never writes the exact locator back, so it repeats for the life of
+            // the row. Production logged 8751 of these in eight minutes from one table —
+            // formatting and I/O on the settle path, and enough noise to bury the lines
+            // that matter. The count is on the settle line as `locator_ladder_recoveries`,
+            // which is where an operator should read it; `LOCATOR_LADDER_RECOVERIES` above
+            // is bumped either way, so nothing is lost by lowering this.
+            tracing::debug!(
                 table,
                 branch,
                 %row_id,
@@ -3381,7 +3388,14 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
             crate::query_manager::settle_cost::bump(
                 &crate::query_manager::settle_cost::LOCATOR_LADDER_RECOVERIES,
             );
-            tracing::info!(
+            // `debug`, not `info`: this fires on every READ of a split row, and the
+            // ladder never writes the exact locator back, so it repeats for the life of
+            // the row. Production logged 8751 of these in eight minutes from one table —
+            // formatting and I/O on the settle path, and enough noise to bury the lines
+            // that matter. The count is on the settle line as `locator_ladder_recoveries`,
+            // which is where an operator should read it; `LOCATOR_LADDER_RECOVERIES` above
+            // is bumped either way, so nothing is lost by lowering this.
+            tracing::debug!(
                 table,
                 branch,
                 %row_id,
@@ -5066,6 +5080,129 @@ mod store_probe {
             .raw_table_scan_prefix(SEALED_BATCH_SUBMISSION_TABLE, "batch:")
             .expect("scan submission keys");
         println!("retained sealed submissions (raw keys): {}", raw.len());
+
+        // How many row versions each table carries — the denominator for "cost per write".
+        for (name, _header) in storage.scan_raw_table_headers().expect("headers") {
+            if name.contains("history") && name.contains("chat_drafts") {
+                let keys = storage
+                    .raw_table_scan_prefix_keys(&name, "")
+                    .unwrap_or_default();
+                // key = <row_id_hex>:<branch>:<batch_id_hex>
+                let mut rows_by_id: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                let mut branches: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                let mut batches: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                let mut oldest = i64::MAX;
+                let mut newest = i64::MIN;
+                for key in &keys {
+                    let parts: Vec<&str> = key.rsplitn(2, ':').collect();
+                    if parts.len() != 2 {
+                        continue;
+                    }
+                    let batch_hex = parts[0];
+                    let head = parts[1];
+                    batches.insert(batch_hex.to_string());
+                    if let Some((row_id, branch)) = head.split_once(':') {
+                        *rows_by_id.entry(row_id.to_string()).or_default() += 1;
+                        *branches.entry(branch.to_string()).or_default() += 1;
+                    }
+                    if let Ok(bytes) = hex::decode(batch_hex)
+                        && bytes.len() == 16
+                    {
+                        let ms = ((bytes[0] as i64) << 40)
+                            | ((bytes[1] as i64) << 32)
+                            | ((bytes[2] as i64) << 24)
+                            | ((bytes[3] as i64) << 16)
+                            | ((bytes[4] as i64) << 8)
+                            | (bytes[5] as i64);
+                        oldest = oldest.min(ms);
+                        newest = newest.max(ms);
+                    }
+                }
+                println!("history rows in {name}: {}", keys.len());
+                println!("  distinct batches (logical writes): {}", batches.len());
+                println!("  distinct row ids: {}", rows_by_id.len());
+                println!("  per branch: {branches:?}");
+                println!("  batch time span: {oldest} .. {newest} unix_ms");
+                // The last ten minutes only: that is the session just measured.
+                let cutoff = newest - 600_000;
+                let mut recent_by_row: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                let mut recent_by_second: std::collections::BTreeMap<i64, usize> =
+                    std::collections::BTreeMap::new();
+                for key in &keys {
+                    let parts: Vec<&str> = key.rsplitn(2, ':').collect();
+                    if parts.len() != 2 {
+                        continue;
+                    }
+                    let Ok(bytes) = hex::decode(parts[0]) else {
+                        continue;
+                    };
+                    if bytes.len() != 16 {
+                        continue;
+                    }
+                    let ms = ((bytes[0] as i64) << 40)
+                        | ((bytes[1] as i64) << 32)
+                        | ((bytes[2] as i64) << 24)
+                        | ((bytes[3] as i64) << 16)
+                        | ((bytes[4] as i64) << 8)
+                        | (bytes[5] as i64);
+                    if ms < cutoff {
+                        continue;
+                    }
+                    if let Some((row_id, _)) = parts[1].split_once(':') {
+                        *recent_by_row.entry(row_id[..8].to_string()).or_default() += 1;
+                    }
+                    *recent_by_second.entry(ms / 1000).or_default() += 1;
+                }
+                let total_recent: usize = recent_by_row.values().sum();
+                println!(
+                    "  last 10 min: {total_recent} writes across {} rows",
+                    recent_by_row.len()
+                );
+                println!("  per row: {recent_by_row:?}");
+                let mut per_sec: Vec<usize> = recent_by_second.values().copied().collect();
+                per_sec.sort_unstable();
+                // Which apply shape is this row in? The serial fast path needs the incoming
+                // parents to cover the STORED frontier exactly; a frontier that has grown
+                // more than one tip can never be covered by a single-parent write, and every
+                // write then pays a full history scan plus a rebuild.
+                if let Some((row_hex, _)) = recent_by_row.iter().max_by_key(|(_, n)| **n) {
+                    for key in &keys {
+                        if !key.starts_with(row_hex.as_str()) {
+                            continue;
+                        }
+                        let Some((full_row_hex, rest)) = key.split_once(':') else {
+                            continue;
+                        };
+                        let Some((branch, _)) = rest.split_once(':') else {
+                            continue;
+                        };
+                        if let Ok(uuid) = uuid::Uuid::parse_str(full_row_hex)
+                            && let row_id = crate::object::ObjectId::from_uuid(uuid)
+                            && let Ok(Some(entry)) =
+                                storage.load_visible_region_entry("chat_drafts", branch, row_id)
+                        {
+                            println!(
+                                "  busiest row {full_row_hex}: frontier tips = {}, winner pool = {}, merge artifacts present = {}",
+                                entry.branch_frontier.len(),
+                                entry.winner_batch_pool.len(),
+                                entry.merge_artifacts.is_some()
+                            );
+                        }
+                        break;
+                    }
+                }
+                println!(
+                    "  active seconds: {}, writes/s median {}, max {}",
+                    per_sec.len(),
+                    per_sec.get(per_sec.len() / 2).copied().unwrap_or(0),
+                    per_sec.last().copied().unwrap_or(0)
+                );
+            }
+        }
 
         // Warm the block cache before timing anything: whichever order ran first would
         // otherwise pay for the other one's cold reads and the comparison would be a
