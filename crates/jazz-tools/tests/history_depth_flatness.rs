@@ -644,6 +644,64 @@ impl HotRow {
         self.tip = Some(confirmed);
     }
 
+    /// One DELIVERED version: the same visible batch a peer sends, which is to say with
+    /// its parents stripped — `scope_delivery_row` clears them for every visible row it
+    /// puts on the wire.
+    ///
+    /// On the receiver a parentless visible row is a frontier ROOT, so each delivery adds a
+    /// tip instead of advancing one. `parents_cover_frontier_exactly` rejects empty parents
+    /// outright, so the O(1) construction never applies and every delivery falls to a full
+    /// history read plus a rebuild — and the frontier it rebuilds grows by one every time.
+    fn deliver(&mut self) {
+        let batch_id = self.next_batch_id();
+        let ts = self.next_ts;
+        self.next_ts += 10;
+        let provenance = if self.depth == 0 {
+            RowProvenance::for_insert(AUTHOR.to_string(), ts)
+        } else {
+            RowProvenance {
+                created_by: AUTHOR.to_string(),
+                created_at: 1_000,
+                updated_by: AUTHOR.to_string(),
+                updated_at: ts,
+            }
+        };
+        let values = vec![
+            Value::Text("hot".into()),
+            Value::Integer((self.depth % 1_000) as i32),
+        ];
+        let data = encode_row(&self.descriptor, &values).expect("hot row values should encode");
+        let batch = StoredRowBatch::new_with_batch_id(
+            batch_id,
+            self.row_id,
+            BRANCH,
+            // Stripped on the wire. This is the whole point of the gate.
+            Vec::new(),
+            data,
+            provenance,
+            HashMap::new(),
+            RowState::VisibleDirect,
+            None,
+        );
+        apply_row_batch(
+            &mut self.storage,
+            self.row_id,
+            &self.branch,
+            batch.clone(),
+            &[],
+        )
+        .unwrap_or_else(|err| panic!("delivery at depth {} failed: {err:?}", self.depth));
+        self.tip = Some(batch);
+        self.depth += 1;
+    }
+
+    /// Grow the history the way a receiver's history actually grows: by delivery.
+    fn grow_delivered_to(&mut self, depth: usize) {
+        while self.depth < depth {
+            self.deliver();
+        }
+    }
+
     /// The query-serving visible point read.
     fn read_visible(&self) {
         let row = self
@@ -771,4 +829,36 @@ fn visible_read_work_is_flat_in_history_depth() {
     hot.grow_to(DEPTH_HIGH);
     let high = measure(&mut hot, WINDOW_OPS, |hot| hot.read_visible());
     assert_flat("visible reads", low, high);
+}
+
+/// (d) A row whose versions ARRIVE — the receiving side of every chat.
+///
+/// Delivery strips parents from visible rows (`sync_manager::sync_logic::scope_delivery_row`),
+/// so on the receiver every delivered version is a frontier root. The frontier therefore
+/// grows by one per delivery, `parents_cover_frontier_exactly` rejects the empty parent set
+/// before it compares anything, and the O(1) construction is unreachable for the life of the
+/// row: each arrival reads the whole history and rebuilds.
+///
+/// MEASURED on a device store, 2026-08-20: `users` row 1234c757 — 460 frontier tips at
+/// history depth 460; `chat_activities` row 92d67d1d — 145 tips at depth 145. Every version
+/// a tip, none naming a parent. The phone showed a CPU spike on every presence beat, peaking
+/// at 107% of a core, and 139% sustained while a draft was typed.
+///
+/// Rows the device writes ITSELF are single-tip and take the fast path — the same store had
+/// `users` 2b1452ba at depth 11956 with one tip. The cost is not history depth; it is being
+/// the receiver.
+#[test]
+#[ignore = "open defect: delivery strips parents, so every arriving version is a frontier \
+            root and the O(1) apply path is unreachable on the receiving side. Measured \
+            here at 8256 reads and 17.6 MB per delivery at depth 8000 — 1.03 reads and \
+            2307 bytes per stored version, on every message that arrives. Un-ignore with \
+            the fix. Also slow (~100 s) for exactly the reason it is red."]
+fn delivered_apply_work_is_flat_in_history_depth() {
+    let _lock = measure_lock();
+    let mut hot = HotRow::new();
+    hot.grow_delivered_to(DEPTH_LOW);
+    let low = measure(&mut hot, WINDOW_OPS, HotRow::deliver);
+    hot.grow_delivered_to(DEPTH_HIGH);
+    let high = measure(&mut hot, WINDOW_OPS, HotRow::deliver);
+    assert_flat("delivered applies", low, high);
 }

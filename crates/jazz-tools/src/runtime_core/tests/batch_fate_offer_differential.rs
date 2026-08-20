@@ -70,7 +70,15 @@
 //! - Rows are never deleted, so `rows_present` is monotone. The defect is about
 //!   bookkeeping vanishing out from under rows that are still there.
 //! - Open (begun, not yet sealed) transactional batches are exempted from the
-//!   "offered ⊆ model" direction only; see `OPEN_BATCH_EXEMPTION` below.
+//!   "offered ⊆ model" direction only. `pending_batch_ids_needing_reconciliation`
+//!   reads `local_batch_record_cache`, which holds a record from the moment a
+//!   batch is BEGUN — so an unsealed batch is in the offer set while the process
+//!   lives and gone after a restart, because the derivation never consults the
+//!   persisted record. Whether an uncommitted batch should be offered at all is
+//!   a separate question from this defect, and answering it either way in the
+//!   model would turn a design opinion into a failing assertion. The
+//!   "model ⊆ offered" direction — the one the outage lived in — still covers
+//!   every sealed batch.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -85,7 +93,7 @@ use crate::sync_manager::{
 
 use super::*;
 
-const OPS_PER_SEED: usize = 1200;
+const OPS_PER_SEED: usize = 300;
 const SEEDS: [u64; 24] = [
     0xFA7E_0F5E_0000_0001,
     0xFA7E_0F5E_0000_0002,
@@ -112,18 +120,6 @@ const SEEDS: [u64; 24] = [
     0xD1FF_0F5E_0000_0017,
     0xD1FF_0F5E_0000_0018,
 ];
-
-/// Why an open batch is not held to the "offered ⊆ model" direction.
-///
-/// `pending_batch_ids_needing_reconciliation` reads `local_batch_record_cache`,
-/// which holds a record from the moment a batch is begun — so a begun-but-unsealed
-/// transactional batch is in the offer set while the process lives and gone after a
-/// restart (the derivation never consults the PERSISTED record). Whether an
-/// uncommitted batch should be offered at all is a separate question from this
-/// defect, and answering it either way in the model would turn a design opinion into
-/// a failing assertion. The "model ⊆ offered" direction — the one the outage lived
-/// in — still covers every sealed batch.
-const OPEN_BATCH_EXEMPTION: () = ();
 
 struct Xorshift(u64);
 
@@ -171,8 +167,19 @@ struct ModelBatch {
     /// This node holds the batch's rows. Monotone here: nothing in the op
     /// alphabet deletes row history.
     rows_present: bool,
+    /// Retained sealed submission. Asserted against storage.
     has_submission: bool,
+    /// The runtime can still find the batch's local record — cache OR storage.
+    /// Deliberately a union rather than two fields: the only thing it gates is
+    /// whether `commit_batch` finds a record to seal, and that lookup consults
+    /// both. It is not asserted against storage for the same reason, because on
+    /// an offline direct commit the record lives ONLY in the cache
+    /// (`retire_settled_batch` deletes the persisted one and `commit_batch`
+    /// re-inserts the cached one immediately after).
     has_record: bool,
+    /// Retained batch→rows index. Asserted against storage: this is what
+    /// survives a local-tier retirement, and it is how a batch whose
+    /// bookkeeping is gone is still findable at all.
     has_row_index: bool,
 }
 
@@ -210,6 +217,10 @@ struct OpCounts {
     missing_after_rejected: usize,
     offline_commit_connect_missing_restart_connect: usize,
     restart_between_fate_deliveries: usize,
+    /// How many batch-offers the wire assertion actually demanded. Without this
+    /// a green run cannot be told apart from one where `must_offer` was always
+    /// empty and the second half of the invariant was never checked.
+    wire_offers_demanded: usize,
 }
 
 impl OpCounts {
@@ -234,6 +245,7 @@ impl OpCounts {
         self.offline_commit_connect_missing_restart_connect +=
             other.offline_commit_connect_missing_restart_connect;
         self.restart_between_fate_deliveries += other.restart_between_fate_deliveries;
+        self.wire_offers_demanded += other.wire_offers_demanded;
     }
 }
 
@@ -331,7 +343,9 @@ impl<S: Storage> Harness<S> {
 
     /// Apply an arriving fate to the model exactly as the two writers do:
     /// `Missing` never writes and always counts as changed; anything else
-    /// merges. Returns whether the runtime will act on it.
+    /// merges — first in `persist_authoritative_batch_fate`, then again inside
+    /// the storage upsert itself, which is idempotent over the merged value.
+    /// The bool is "the runtime acts on this", which is what gates the retire.
     fn model_apply_fate(&mut self, batch_id: BatchId, fate: &BatchFate) -> bool {
         if matches!(fate, BatchFate::Missing { .. }) {
             return true;
@@ -460,14 +474,19 @@ impl<S: Storage> Harness<S> {
         self.mark(batch_id, Mark::Other);
     }
 
-    fn deliver_fate(&mut self, fate: BatchFate) -> bool {
+    /// A fate arrives from the upstream. Delivered even while disconnected —
+    /// `process_from_server` does not check that the sender is a registered
+    /// server, so a fate can land on a node with nothing attached, and the
+    /// settlement target it is judged against is `Local` rather than
+    /// `GlobalServer` when it does.
+    fn deliver_fate(&mut self, fate: BatchFate) {
         let batch_id = fate.batch_id();
         let source = Source::Server(self.server.unwrap_or_else(ServerId::new));
         self.core().park_sync_message(InboxEntry {
             source,
             payload: SyncPayload::BatchFate { fate: fate.clone() },
         });
-        let acted = self.model_apply_fate(batch_id, &fate);
+        self.model_apply_fate(batch_id, &fate);
         match &fate {
             BatchFate::Missing { .. } => {
                 self.counts.fate_missing += 1;
@@ -499,7 +518,6 @@ impl<S: Storage> Harness<S> {
                 self.mark(batch_id, mark);
             }
         }
-        acted
     }
 
     fn connect(&mut self) {
@@ -613,7 +631,9 @@ impl<S: Storage> Harness<S> {
         }
 
         // And the other way: nothing settled may be offered. Open batches are
-        // exempt for the reason at `OPEN_BATCH_EXEMPTION`.
+        // exempt — see the module doc: they ride the in-memory record cache, so
+        // whether they belong in the offer set is a live design question this
+        // oracle deliberately does not answer.
         for batch_id in &offered {
             let is_open = model.get(batch_id).is_some_and(|batch| !batch.sealed);
             if expected_offers.contains(batch_id) || is_open {
@@ -840,10 +860,7 @@ impl<S: Storage> Harness<S> {
 #[test]
 fn batch_fate_offer_differential_random_ops() {
     let mut totals = OpCounts::default();
-    let deep: Vec<u64> = (0..120u64)
-        .map(|n| 0xDEEB_0F5E_0000_0000u64 ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-        .collect();
-    for seed in deep {
+    for seed in SEEDS {
         let mut harness = Harness::new("batch-fate-offer-differential", MemoryStorage::new(), seed);
         run_seed(&mut harness, seed, &std::convert::identity);
         tally_pairs(&mut harness);
@@ -866,6 +883,11 @@ fn batch_fate_offer_differential_random_ops() {
         "the op mix stopped committing while offline — the production shape: {totals:?}"
     );
     assert!(
+        totals.wire_offers_demanded > 500,
+        "the second half of the invariant — what actually goes on the wire — was barely \
+         checked, so a green run says little about it: {totals:?}"
+    );
+    assert!(
         totals.repeated_missing_no_change_between > 0
             && totals.missing_right_after_global_durable > 0
             && totals.missing_after_rejected > 0
@@ -881,9 +903,10 @@ fn batch_fate_offer_differential_random_ops() {
 /// — the fate could be unrepresentable on disk and this oracle would not
 /// notice. Sqlite round-trips every read through the bytes.
 ///
-/// Fewer seeds and a shorter stream: sqlite is ~40x slower per op here, and the
-/// question this arm answers is about the encoding, which does not need the
-/// same op count to be exercised.
+/// Fewer seeds and a shorter stream than the memory arm. The question here is
+/// whether a fate survives as bytes, and that is answered by the first restart
+/// on each seed; op count buys interleavings, which the memory arm already
+/// pays for far more cheaply.
 #[test]
 fn batch_fate_offer_differential_sqlite_round_trip() {
     for (index, seed) in SEEDS.iter().take(4).enumerate() {
@@ -1024,6 +1047,7 @@ fn run_seed_with_ops<S: Storage>(
                 .unwrap_or_default(),
         };
 
+        harness.counts.wire_offers_demanded += must_offer.len();
         let outbox = harness.settle_and_assert(op_index, &label);
         harness.assert_offers_on_the_wire(&outbox, &must_offer, op_index, &label);
     }

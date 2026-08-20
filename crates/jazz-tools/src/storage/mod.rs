@@ -5182,6 +5182,60 @@ mod store_probe {
         }
     }
 
+    /// What one presence beat costs the CLIENT, on its own store.
+    ///
+    /// The device pays the same apply path as the server: if the row's stored frontier has
+    /// more than one tip, the incoming single-parent write cannot cover it, the O(1) fast
+    /// path declines, and every beat re-reads the row's whole history and rebuilds the
+    /// visible entry. A phone profile showed a CPU spike on every beat, peaking at 107% of
+    /// a core.
+    ///
+    /// Point `JAZZ_PROBE_PATH` at a copy of a device's sqlite store.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[ignore]
+    fn probe_client_row_frontier_and_depth() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage = SqliteStorage::open(&path).expect("open the device store");
+
+        for (name, _) in storage.scan_raw_table_headers().expect("headers") {
+            let Some(rest) = name.strip_prefix("rowtable:visible:") else {
+                continue;
+            };
+            let Some((table, hash)) = rest.split_once(':') else {
+                continue;
+            };
+            let branch = format!("dev-{}-main", &hash[..12.min(hash.len())]);
+            let rows = storage
+                .scan_visible_region(table, &branch)
+                .unwrap_or_default();
+            if rows.is_empty() {
+                continue;
+            }
+            println!("--- {table} on {branch}: {} visible rows", rows.len());
+            let mut worst: Vec<(usize, usize, String)> = Vec::new();
+            for row in &rows {
+                let Ok(Some(entry)) = storage.load_visible_region_entry(table, &branch, row.row_id)
+                else {
+                    continue;
+                };
+                let depth = storage
+                    .scan_history_row_batches(table, row.row_id)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                worst.push((
+                    entry.branch_frontier.len(),
+                    depth,
+                    row.row_id.to_string()[..8].to_string(),
+                ));
+            }
+            worst.sort_by_key(|(tips, depth, _)| std::cmp::Reverse((*tips, *depth)));
+            for (tips, depth, row) in worst.iter().take(5) {
+                println!("    row {row}: frontier tips = {tips}, history depth = {depth}");
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn probe_recovery_sweep_rocksdb() {
