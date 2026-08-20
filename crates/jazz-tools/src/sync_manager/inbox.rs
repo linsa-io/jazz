@@ -263,6 +263,14 @@ impl SyncManager {
         // `try_accept_completed_sealed_batch_from_client` already said a stored `Missing`
         // "would wrongly outlive the arrival of the rows"; this is that intent, enforced.
         if matches!(fate, BatchFate::Missing { .. }) {
+            // `Rejected` is terminal and sticky in `merged_with`; returning before the read
+            // would let a request to resend provoke a replay of rows the peer has already
+            // refused. Keep the refusal, and report it unchanged so nobody acts on it.
+            if let Some(rejected @ BatchFate::Rejected { .. }) =
+                storage.load_authoritative_batch_fate(fate.batch_id())?
+            {
+                return Ok((rejected, false));
+            }
             return Ok((fate.clone(), true));
         }
 
@@ -1966,6 +1974,19 @@ impl SyncManager {
                             %error,
                             "failed to delete sealed batch submission"
                         );
+                    }
+                    // Every other emitter of `Missing` is budgeted; this one was not, and
+                    // did not need to be while a stored `Missing` on the peer made it stop
+                    // answering after the first. Now that the peer answers every time, an
+                    // unbudgeted echo free-runs: measured at +2 requests and +2 resends per
+                    // round with no rate limit engaging. Only a store written before that
+                    // change can still hold a `Missing`, which is every store in the field
+                    // at rollout.
+                    if matches!(fate, BatchFate::Missing { .. }) {
+                        if self.may_tell_client_a_batch_is_missing(client_id, batch_id) {
+                            self.queue_batch_fate_to_client_unfiltered(client_id, fate);
+                        }
+                        return;
                     }
                     self.queue_batch_fate_to_client_unfiltered(client_id, fate);
                     return;

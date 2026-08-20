@@ -2176,6 +2176,7 @@ fn noop_waker() -> std::task::Waker {
 mod accepted_batch_downgrade;
 mod authz_cache_runtime;
 mod basic;
+mod batch_fate_offer_differential;
 mod batched_tick_parked_drain;
 mod cold_boot_generation_universe;
 mod cross_generation_backref_read;
