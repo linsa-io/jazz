@@ -455,6 +455,7 @@ fn push_query_subscription(
 /// reconcile.
 mod adversarial_cross_generation;
 mod basic;
+mod batch_member_digest_parity;
 mod catalogue_intake_differential;
 mod client_lifecycle;
 mod cross_generation_oracle;

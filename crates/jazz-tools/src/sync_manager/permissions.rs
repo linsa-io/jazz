@@ -180,7 +180,12 @@ impl SyncManager {
                     )
                     .ok()
                     .flatten()?;
-                (row.content_digest() == member.row_digest).then_some(row)
+                // Either rule: the mint is parent-blind now, and every installed store
+                // still carries members minted with parents included. A member that stops
+                // matching drops its row from the batch and the seal becomes uncompletable.
+                (row.content_digest_ignoring_parents() == member.row_digest
+                    || row.content_digest() == member.row_digest)
+                    .then_some(row)
             })
             .collect::<Vec<_>>();
 

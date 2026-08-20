@@ -673,7 +673,8 @@ pub trait Storage {
                     table_name: table.to_string(),
                     branch_name: BranchName::new(row.branch.as_str()),
                     schema_hash: encoded.row_raw_table_id.schema_hash,
-                    row_digest: row.content_digest(),
+                    // Parent-blind, matching the other mint site.
+                    row_digest: row.content_digest_ignoring_parents(),
                 });
         }
 

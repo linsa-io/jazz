@@ -1244,7 +1244,7 @@ impl SyncManager {
         }
     }
 
-    fn transactional_batch_rows<H: Storage>(
+    pub(super) fn transactional_batch_rows<H: Storage>(
         &self,
         storage: &H,
         batch_id: crate::row_histories::BatchId,
@@ -1267,7 +1267,12 @@ impl SyncManager {
                 ) else {
                     return None;
                 };
-                (row.content_digest() == member.row_digest).then_some((member.table_name, row))
+                // Either rule: the mint is parent-blind now, and every installed store
+                // still carries members minted with parents included. A member that stops
+                // matching drops its row from the batch and the seal becomes uncompletable.
+                (row.content_digest_ignoring_parents() == member.row_digest
+                    || row.content_digest() == member.row_digest)
+                    .then_some((member.table_name, row))
             })
             .collect::<Vec<_>>();
 

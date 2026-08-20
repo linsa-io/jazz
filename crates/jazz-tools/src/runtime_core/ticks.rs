@@ -96,7 +96,11 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             )
             .ok()
             .flatten()?;
-        (row.content_digest() == member.row_digest).then_some((row_locator, row))
+        // Either rule, as at the other check sites: the mint is parent-blind, and members
+        // minted with parents included are already on disk in every installed store.
+        (row.content_digest_ignoring_parents() == member.row_digest
+            || row.content_digest() == member.row_digest)
+            .then_some((row_locator, row))
     }
 
     fn sealed_submission_batch_members(&self, batch_id: BatchId) -> Vec<LocalBatchMember> {
@@ -208,7 +212,10 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                     table_name: row_locator.table.to_string(),
                     branch_name,
                     schema_hash,
-                    row_digest: row.content_digest(),
+                    // Parent-blind on purpose: a member identifies a payload, and the two
+                    // copies of a row that meet here do not agree about parents once
+                    // delivery stamps them. See `content_digest_ignoring_parents`.
+                    row_digest: row.content_digest_ignoring_parents(),
                 };
                 rows.push((member, row_locator.clone(), row));
             }
