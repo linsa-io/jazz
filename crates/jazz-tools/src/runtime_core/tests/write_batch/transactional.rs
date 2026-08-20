@@ -329,11 +329,112 @@ fn rc_missing_batch_fate_retransmits_local_transactional_rows() {
         "expected replayed outbound seal after Missing settlement, got {replay_outbox:?}"
     );
 
-    assert_eq!(
+    // The replay above is the whole point; the answer that provoked it is not kept. A stored
+    // `Missing` would make the next identical request look like a duplicate and would
+    // overwrite whatever fate the batch actually has, which is what strands it.
+    assert!(
+        !matches!(
+            s.a.storage()
+                .load_authoritative_batch_fate(batch_id)
+                .unwrap(),
+            Some(crate::batch_fate::BatchFate::Missing { .. })
+        ),
+        "a Missing answer must not be persisted"
+    );
+}
+
+/// A repeated `Missing` must be answered again, not swallowed as unchanged.
+///
+/// `Missing` is not a fact about a batch, it is an instruction: "I do not have this, send
+/// it again". The client stores it like any other fate, and the inbound-fate arm only acts
+/// `if changed` — so the FIRST `Missing` triggers a replay and every one after it is
+/// discarded as a duplicate. If that first replay does not reach the server, nothing ever
+/// will: the stored fate is on disk, so it survives the socket reconnecting and the app
+/// restarting, and the request can never be answered again.
+///
+/// MEASURED in production 2026-08-20: the sync server was restarted while a client was
+/// writing. One presence batch never arrived; every later beat on that row parented from
+/// it, so the server asked for the ancestor **397 times in thirteen minutes** and the
+/// client answered none of them — while holding the row, its history and its batch row
+/// index the whole time. Presence froze for that user and stayed frozen through a socket
+/// reconnect and an app restart. Only deleting the client's store cleared it.
+///
+/// Same shape as the `AcceptedTransaction` half of upstream pr1133: a fate that is an
+/// instruction cannot be deduplicated by its content.
+#[test]
+fn rc_repeated_missing_batch_fate_retransmits_again() {
+    let mut s = create_3tier_rc();
+    let write_context = WriteContext {
+        session: None,
+        attribution: None,
+        updated_at: None,
+        batch_mode: Some(crate::batch_fate::BatchMode::Transactional),
+        batch_id: None,
+        target_branch_name: None,
+    };
+
+    let ((row_id, _row_values), _receiver) = insert_and_wait_for_batch(
+        &mut s.a,
+        "users",
+        user_insert_values(ObjectId::new(), "Alice"),
+        Some(&write_context),
+        DurabilityTier::Local,
+    )
+    .unwrap();
+
+    let history_rows =
         s.a.storage()
-            .load_authoritative_batch_fate(batch_id)
-            .unwrap(),
-        Some(crate::batch_fate::BatchFate::Missing { batch_id })
+            .scan_history_row_batches("users", row_id)
+            .unwrap();
+    let batch_id = history_rows[0].batch_id;
+    s.a.commit_batch(batch_id).unwrap();
+    s.a.batched_tick();
+    // The first outbound attempt is what the restart lost.
+    s.a.sync_sender().take();
+
+    let ask_again = |core: &mut TestCore| {
+        core.park_sync_message(InboxEntry {
+            source: Source::Server(s.b_server_for_a),
+            payload: SyncPayload::BatchFate {
+                fate: crate::batch_fate::BatchFate::Missing { batch_id },
+            },
+        });
+        core.batched_tick();
+        core.sync_sender().take()
+    };
+
+    let first = ask_again(&mut s.a);
+    assert!(
+        first.iter().any(|entry| matches!(
+            &entry,
+            OutboxEntry {
+                payload: SyncPayload::RowBatchCreated { row, .. }
+                    | SyncPayload::RowBatchNeeded { row, .. },
+                ..
+            } if row.batch_id == batch_id
+        )),
+        "fixture precondition: the first Missing must replay the row, else this gates \
+         nothing — got {first:?}"
+    );
+
+    // The server never received the replay — from its side nothing changed, so it asks
+    // exactly the same question again. Nothing about the batch changed on this side
+    // either, which is the whole difficulty.
+    let second = ask_again(&mut s.a);
+    assert!(
+        second.iter().any(|entry| matches!(
+            &entry,
+            OutboxEntry {
+                payload: SyncPayload::RowBatchCreated { row, .. }
+                    | SyncPayload::RowBatchNeeded { row, .. },
+                ..
+            } if row.batch_id == batch_id
+        )),
+        "a second `Missing` for the same batch sent nothing. The fate was already stored, so \
+         the inbound arm treated the request as an unchanged duplicate and dropped it — but \
+         the peer is not restating a fact, it is asking again for something it still does \
+         not have. The row, its history and its batch row index are all present on this \
+         node; nothing is missing except the answer. Got {second:?}"
     );
 }
 

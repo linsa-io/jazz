@@ -241,6 +241,106 @@ fn rc_sealed_direct_batch_replays_row_and_seal_after_offline_write() {
     );
 }
 
+/// A write made while the server was down must survive being told it is `Missing`.
+///
+/// This is the production shape, and it is not the one the repeated-`Missing` gate covers.
+/// A direct write committed with no server attached settles at the local tier and retires
+/// its own submission and batch record (`retire_settled_batch`), keeping only the row
+/// index. Its ticket back into `pending_batch_ids_needing_reconciliation` is then the
+/// unsettled `DurableDirect{Local}` fate — which is exactly what an inbound `Missing`
+/// overwrites, because `merged_with` ends in `_ => incoming.clone()`.
+///
+/// So the peer's request to send the batch again is what makes the batch unsendable: after
+/// it, `fate_needs_settlement_at` says `Missing` needs nothing, the batch leaves the pending
+/// set, and no reconnect ever offers it again. The client keeps the row, its history and its
+/// index, and answers nothing.
+///
+/// MEASURED 2026-08-20: the sync server was restarted under a writing client; one presence
+/// batch never arrived; the server asked 397 times in 13 minutes; presence stayed dead
+/// through a socket reconnect and an app restart, and only deleting the store cleared it.
+#[test]
+fn rc_a_missing_fate_does_not_strand_a_batch_written_while_offline() {
+    let schema = test_schema();
+    // No server yet: this is the write that lands while the socket is down.
+    let mut core = create_runtime_with_storage_and_sync_manager(
+        schema.clone(),
+        "missing-fate-offline-commit-test",
+        MemoryStorage::new(),
+        SyncManager::new(),
+    );
+
+    let ((row_id, _values), batch_id) = core
+        .insert("users", user_insert_values(ObjectId::new(), "Alice"), None)
+        .expect("offline write");
+    core.batched_tick();
+    core.immediate_tick();
+
+    // Settled at the local tier and retired: the shape the production store showed.
+    assert!(
+        core.storage()
+            .load_sealed_batch_submission(batch_id)
+            .unwrap()
+            .is_none(),
+        "fixture precondition: an offline direct commit retires its submission"
+    );
+
+    let server_id = ServerId::new();
+    core.add_server(server_id);
+    core.batched_tick();
+    let first_offer = core.sync_sender().take();
+    assert!(
+        first_offer.iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                payload: SyncPayload::RowBatchCreated { row, .. }
+                    | SyncPayload::RowBatchNeeded { row, .. },
+                ..
+            } if row.row_id == row_id && row.batch_id == batch_id
+        )),
+        "fixture precondition: connecting must re-offer the offline write, else this gates \
+         nothing — got {first_offer:?}"
+    );
+
+    // The server did not receive it and says so.
+    core.park_sync_message(InboxEntry {
+        source: Source::Server(server_id),
+        payload: SyncPayload::BatchFate {
+            fate: crate::batch_fate::BatchFate::Missing { batch_id },
+        },
+    });
+    core.batched_tick();
+    core.sync_sender().take();
+
+    // Whatever that answer did or did not achieve, the next connection must still offer the
+    // batch: nothing about it became durable, and this node still holds every byte of it.
+    let storage = core.into_storage();
+    let mut restarted = create_runtime_with_storage_and_sync_manager(
+        schema,
+        "missing-fate-offline-commit-test",
+        storage,
+        SyncManager::new(),
+    );
+    let next_server = ServerId::new();
+    restarted.add_server(next_server);
+    restarted.batched_tick();
+    let second_offer = restarted.sync_sender().take();
+
+    assert!(
+        second_offer.iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                payload: SyncPayload::RowBatchCreated { row, .. }
+                    | SyncPayload::RowBatchNeeded { row, .. },
+                ..
+            } if row.row_id == row_id && row.batch_id == batch_id
+        )),
+        "a batch the peer asked for is now unreachable. Being told `Missing` overwrote the \
+         unsettled fate that put this batch in the reconnect offer set, and `Missing` itself \
+         needs no settlement — so the request to resend is what made resending impossible. \
+         The row, its history and its batch row index are all still here. Got {second_offer:?}"
+    );
+}
+
 #[test]
 fn rc_stored_missing_fate_replays_seal_and_rows_after_restart() {
     // A live `Missing` fate triggers an immediate retransmit, but if the app
@@ -272,12 +372,19 @@ fn rc_stored_missing_fate_replays_seal_and_rows_after_restart() {
     });
     core.batched_tick();
     core.sync_sender().take();
-    assert_eq!(
-        core.storage()
-            .load_authoritative_batch_fate(batch_id)
-            .unwrap(),
-        Some(crate::batch_fate::BatchFate::Missing { batch_id }),
-        "the restart path must read back a stored Missing fate"
+    // `Missing` is an instruction to resend, not a state to remember, so nothing stores it
+    // — and crucially it no longer overwrites what is underneath. What must survive the
+    // restart is the batch's own unsettled fate: that is what carries it back into the
+    // reconnect offer set. Storing `Missing` here used to erase exactly that, which is how
+    // a peer's request to resend became the reason resending was impossible.
+    assert!(
+        !matches!(
+            core.storage()
+                .load_authoritative_batch_fate(batch_id)
+                .unwrap(),
+            Some(crate::batch_fate::BatchFate::Missing { .. })
+        ),
+        "a Missing answer must not be persisted over the batch's own fate"
     );
 
     let storage = core.into_storage();

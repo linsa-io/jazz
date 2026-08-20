@@ -239,6 +239,33 @@ impl SyncManager {
         storage: &mut H,
         fate: &BatchFate,
     ) -> Result<(BatchFate, bool), crate::storage::StorageError> {
+        // `Missing` is not a fact about a batch, it is an instruction: "I do not have this,
+        // send it again". Storing it does two kinds of damage.
+        //
+        // It makes a repeat look like a duplicate, so the peer is answered once and never
+        // again — and because the suppressor is on disk, that silence survives the socket
+        // reconnecting and the app restarting.
+        //
+        // Worse, it OVERWRITES the fate underneath it (`merged_with` ends in
+        // `_ => incoming.clone()`), and for a write committed while no server was attached
+        // that fate — an unsettled `DurableDirect` at the local tier — is the batch's only
+        // ticket into `pending_batch_ids_needing_reconciliation`. `Missing` needs no
+        // settlement, so the batch leaves the offer set for good: the request to resend is
+        // what makes resending impossible.
+        //
+        // Production 2026-08-20: the sync server was restarted under a writing client, one
+        // presence batch never arrived, the server asked 397 times in 13 minutes, and the
+        // client answered none of them while holding the row, its history and its batch row
+        // index throughout. Presence stayed dead through a reconnect and a restart; only
+        // deleting the client's store cleared it.
+        //
+        // Reported as changed so the caller always acts on it. The comment at
+        // `try_accept_completed_sealed_batch_from_client` already said a stored `Missing`
+        // "would wrongly outlive the arrival of the rows"; this is that intent, enforced.
+        if matches!(fate, BatchFate::Missing { .. }) {
+            return Ok((fate.clone(), true));
+        }
+
         let previous = storage.load_authoritative_batch_fate(fate.batch_id())?;
         let merged = match previous.as_ref() {
             Some(existing) => existing.merged_with(fate),

@@ -394,7 +394,14 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
 
     fn apply_received_batch_fate(&mut self, fate: crate::batch_fate::BatchFate) {
         let batch_id = fate.batch_id();
-        if let Err(error) = self.storage.upsert_authoritative_batch_fate(&fate) {
+        // Same reason as `SyncManager::persist_authoritative_batch_fate`, and this is the
+        // write that actually reached the disk in production: it is unconditional and it
+        // bypasses `merged_with` entirely, so it also clobbers a stored `Rejected` that the
+        // merge is written to keep. `Missing` is an instruction to resend, not a state to
+        // remember.
+        if !matches!(fate, crate::batch_fate::BatchFate::Missing { .. })
+            && let Err(error) = self.storage.upsert_authoritative_batch_fate(&fate)
+        {
             tracing::warn!(
                 ?batch_id,
                 %error,

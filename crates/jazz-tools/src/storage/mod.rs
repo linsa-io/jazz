@@ -5069,6 +5069,119 @@ mod store_probe {
     /// "Submissions are deleted once the runtime no longer needs the original
     /// seal/member list" — so this probe measures whether that holds in a real store,
     /// and how much of the sweep is re-read every tick only to be discarded.
+    /// Where does a presence heartbeat land, and where is it read from?
+    ///
+    /// `users` carries the presence stamp, and the row is split across schema generations:
+    /// one `__row_locator` entry names ONE origin hash, so a row alive on N generations has
+    /// N raw-table families and the ladder recovers the other N-1 on every read. If the
+    /// writer's generation and the reader's differ, a heartbeat updates a copy nobody reads
+    /// — presence freezes while a single-generation table like typing keeps working.
+    ///
+    /// Prints, per branch, how fresh the newest users row is.
+    #[test]
+    #[ignore]
+    fn probe_users_presence_across_generations() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+
+        let mut branches: Vec<String> = storage
+            .scan_raw_table_headers()
+            .expect("scan raw table headers")
+            .into_iter()
+            .filter_map(|(name, _)| {
+                let rest = name.strip_prefix("rowtable:visible:users:")?;
+                Some(format!("dev-{}-main", &rest[..12.min(rest.len())]))
+            })
+            .collect();
+        branches.sort();
+        branches.dedup();
+
+        for branch in &branches {
+            let rows = storage
+                .scan_visible_region("users", branch)
+                .unwrap_or_default();
+            let mut per_row: Vec<(String, u64)> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.row_id.to_string()[..8].to_string(),
+                        row.row_provenance().updated_at,
+                    )
+                })
+                .collect();
+            per_row.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+            let newest = per_row.first().map(|(_, at)| *at).unwrap_or(0);
+            println!("branch {branch}: {} visible users rows", rows.len());
+            println!("  newest updated_at = {newest}");
+            for (row, at) in per_row.iter().take(4) {
+                println!("    {row} {at}");
+            }
+        }
+    }
+
+    /// Does the server hold a FATE for a batch whose row it never applied?
+    ///
+    /// If it does, the deadlock is explained: the client was told the batch was durable, so
+    /// it retired its own copy and can no longer answer the `Missing` request the server is
+    /// now making. Nobody has the row, and every later write on that chain parents from a
+    /// batch that will never arrive.
+    ///
+    /// `JAZZ_PROBE_BATCH_HEX` is the batch id; `JAZZ_PROBE_ROW_HEX` the row it belonged to.
+    #[test]
+    #[ignore]
+    fn probe_orphaned_fate_without_row() {
+        let path = std::env::var("JAZZ_PROBE_PATH").expect("set JAZZ_PROBE_PATH");
+        let batch_hex = std::env::var("JAZZ_PROBE_BATCH_HEX").expect("set JAZZ_PROBE_BATCH_HEX");
+        let row_hex = std::env::var("JAZZ_PROBE_ROW_HEX").expect("set JAZZ_PROBE_ROW_HEX");
+        let storage =
+            RocksDBStorage::open(&path, 64 * 1024 * 1024).expect("open copied rocksdb store");
+
+        let bytes = hex::decode(&batch_hex).expect("batch hex");
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes);
+        let batch_id = crate::row_histories::BatchId(id);
+
+        println!("batch {batch_hex}");
+        println!(
+            "  authoritative fate : {:?}",
+            storage.load_authoritative_batch_fate(batch_id)
+        );
+        println!(
+            "  sealed submission  : {}",
+            storage
+                .load_sealed_batch_submission(batch_id)
+                .ok()
+                .flatten()
+                .is_some()
+        );
+        println!(
+            "  local batch record : {}",
+            storage
+                .load_local_batch_record(batch_id)
+                .ok()
+                .flatten()
+                .is_some()
+        );
+
+        // Is the row version itself anywhere in this row's history?
+        let uuid = uuid::Uuid::parse_str(&row_hex).expect("row hex");
+        let row_id = crate::object::ObjectId::from_uuid(uuid);
+        for (name, _) in storage.scan_raw_table_headers().expect("headers") {
+            if !name.contains("history") || !name.contains(":users:") {
+                continue;
+            }
+            let keys = storage
+                .raw_table_scan_prefix_keys(&name, &row_hex.replace('-', ""))
+                .unwrap_or_default();
+            let has_batch = keys.iter().any(|k| k.ends_with(&batch_hex));
+            println!(
+                "  {name}: {} versions of this row, holds the batch: {has_batch}",
+                keys.len()
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn probe_recovery_sweep_rocksdb() {
