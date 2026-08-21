@@ -1618,8 +1618,13 @@ pub trait Storage {
             }
         }
 
+        // Same rule as `row_histories::branch_frontier`: a delivered snapshot that lost its
+        // ancestry in transit is not a row creation and must not stand as its own tip.
+        let dominator = crate::row_histories::elided_snapshot_dominator(branch_rows.iter());
+
         let mut tips: Vec<_> = branch_rows
             .into_iter()
+            .filter(|row| !crate::row_histories::superseded_by_snapshot(row, dominator))
             .map(|row| row.batch_id())
             .filter(|batch_id| !non_tips.contains(batch_id))
             .collect();

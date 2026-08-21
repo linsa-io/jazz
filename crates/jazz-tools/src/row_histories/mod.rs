@@ -41,11 +41,16 @@ pub use fastpath::{
 pub use fastpath::{HistoryFastpathMode, force_history_fastpath};
 pub(crate) use mutations::{ApplyRowBatchWithContext, apply_row_batch_with_context};
 pub use mutations::{apply_row_batch, patch_row_batch_state};
-pub(crate) use resolution::visible_row_preview_from_history_rows;
+pub(crate) use resolution::{
+    elided_snapshot_dominator, superseded_by_snapshot, visible_row_preview_from_history_rows,
+};
 pub use types::{
     ApplyRowBatchResult, BatchId, HistoryScan, QueryRowBatch, RowHistoryError, RowMetadata,
     RowState, RowVisibilityChange, StoredRowBatch, VisibleRowEntry,
 };
+
+#[cfg(test)]
+mod elided_snapshot_tests;
 
 #[cfg(test)]
 mod tests {

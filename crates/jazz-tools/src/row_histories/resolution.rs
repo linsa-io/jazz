@@ -368,6 +368,10 @@ pub(super) fn build_computed_visible_preview(
     //   sole frontier tip, or a batch naming every tip as parent) provably
     //   dominates EVERY tier set the moment it enters one — which is what
     //   `fastpath::in_place_tier_pointer` / `carried_tier_pointer` exploit.
+    // A parentless row has no ancestors, so causal domination cannot reach it either: the
+    // tier-filtered arm needs the same rule as the unfiltered one, or a delivered snapshot
+    // stays a tier tip for exactly the reasons it stays a plain tip.
+    let snapshot_dominator = elided_snapshot_dominator(visible_rows.iter().copied());
     let mut frontier: Vec<_> = if required_tier.is_some() {
         let full_map: HashMap<BatchId, &StoredRowBatch> = history_rows
             .iter()
@@ -378,6 +382,7 @@ pub(super) fn build_computed_visible_preview(
             .iter()
             .copied()
             .filter(|row| !dominated.contains(&row.batch_id()))
+            .filter(|row| !superseded_by_snapshot(row, snapshot_dominator))
             .collect()
     } else {
         let mut non_tips = std::collections::BTreeSet::new();
@@ -390,6 +395,7 @@ pub(super) fn build_computed_visible_preview(
             .iter()
             .copied()
             .filter(|row| !non_tips.contains(&row.batch_id()))
+            .filter(|row| !superseded_by_snapshot(row, snapshot_dominator))
             .collect()
     };
     frontier.sort_by_key(|row| (row.updated_at, row.batch_id()));
@@ -559,6 +565,49 @@ pub(super) fn latest_visible_version_for_tier(
         .map(StoredRowBatch::batch_id)
 }
 
+/// The batch that supersedes every other parentless visible row, when the row's parentless
+/// set contains at least one delivered snapshot.
+///
+/// `parents == []` carries two different meanings. It means "this is the row's creation", and
+/// it means "my ancestry was elided in transit" — `sync_manager::sync_logic::scope_delivery_row`
+/// clears `parents` on every visible row before it goes to a client. The frontier rule below
+/// reads the second as the first, so a delivered snapshot supersedes nothing and every arrival
+/// is a fresh branch. Measured in a real client store: one `users` row holding 460 history
+/// batches and a 460-wide frontier.
+///
+/// The two meanings are distinguishable without any help from the sender.
+/// `RowProvenance::for_insert` sets `created_at == updated_at` (`metadata.rs:135-143`);
+/// `for_update` copies `created_at` verbatim and takes a fresh `updated_at`
+/// (`metadata.rs:145-152`); and `MonotonicClock::reserve_timestamp` guarantees every
+/// reservation is strictly greater than the last (`sync_manager/clock.rs:14-28`). So a visible
+/// row with `parents.is_empty() && created_at != updated_at` provably is not a creation.
+///
+/// Given one such row, the parentless set is states of a single lineage rather than concurrent
+/// branches, and the newest by `(updated_at, batch_id)` — the same total order the LWW arm
+/// already uses to pick a winner — supersedes the rest. Rows that kept their ancestry are not
+/// touched: they are resolved by the ancestry, exactly as before.
+///
+/// Both failure directions are safe. Two writes inside one clock tick leave `created_at ==
+/// updated_at` on an update, so the row is not recognised and the frontier stays as wide as it
+/// is today. And a parentless set of genuine creations contains no snapshot at all, so genuine
+/// concurrent inserts still merge.
+pub(crate) fn elided_snapshot_dominator<'a>(
+    visible_rows: impl Iterator<Item = &'a StoredRowBatch> + Clone,
+) -> Option<BatchId> {
+    let parentless = || visible_rows.clone().filter(|row| row.parents.is_empty());
+    if !parentless().any(|row| row.created_at != row.updated_at) {
+        return None;
+    }
+    parentless()
+        .max_by_key(|row| (row.updated_at, row.batch_id()))
+        .map(StoredRowBatch::batch_id)
+}
+
+/// Whether this row is a parentless visible row that `dominator` supersedes.
+pub(crate) fn superseded_by_snapshot(row: &StoredRowBatch, dominator: Option<BatchId>) -> bool {
+    dominator.is_some_and(|winner| row.parents.is_empty() && row.batch_id() != winner)
+}
+
 pub(super) fn branch_frontier(history_rows: &[StoredRowBatch]) -> Vec<BatchId> {
     let mut non_tips = std::collections::BTreeSet::new();
     for row in history_rows.iter().filter(|row| row.state.is_visible()) {
@@ -567,9 +616,13 @@ pub(super) fn branch_frontier(history_rows: &[StoredRowBatch]) -> Vec<BatchId> {
         }
     }
 
+    let dominator =
+        elided_snapshot_dominator(history_rows.iter().filter(|row| row.state.is_visible()));
+
     let mut tips: Vec<_> = history_rows
         .iter()
         .filter(|row| row.state.is_visible())
+        .filter(|row| !superseded_by_snapshot(row, dominator))
         .map(StoredRowBatch::batch_id)
         .filter(|batch_id| !non_tips.contains(batch_id))
         .collect();

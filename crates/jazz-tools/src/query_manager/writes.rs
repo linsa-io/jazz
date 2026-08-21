@@ -688,8 +688,14 @@ impl QueryManager {
             for row in &branch_rows {
                 non_tips.extend(row.parents.iter().copied());
             }
+            // Same rule as `row_histories::branch_frontier`. A local write names every tip as
+            // its parents, so leaving delivered snapshots standing here would author a merge
+            // over states that were never concurrent.
+            let dominator =
+                crate::row_histories::elided_snapshot_dominator(branch_rows.iter().copied());
             let mut tips = branch_rows
                 .into_iter()
+                .filter(|row| !crate::row_histories::superseded_by_snapshot(row, dominator))
                 .filter(|row| !non_tips.contains(&row.batch_id()))
                 .map(StoredRowBatch::batch_id)
                 .collect::<Vec<_>>();

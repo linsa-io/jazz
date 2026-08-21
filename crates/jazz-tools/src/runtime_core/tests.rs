@@ -2184,6 +2184,7 @@ mod cross_generation_differential;
 mod cross_generation_local_write;
 mod cross_generation_policy;
 mod delivery_confirmation;
+mod delivery_convergence_differential;
 mod fk_remove_error;
 mod incremental_scan;
 mod install_transport_tests;
