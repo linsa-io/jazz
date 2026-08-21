@@ -469,11 +469,13 @@ fn run_seed(seed: u64) {
         // their ancestry stripped. Collapsing either of those would destroy a real write. What
         // must never happen is ACCUMULATION — one more tip for every delivery, unbounded, which
         // is the defect: measured in a real client store at 460 tips on one `users` row.
-        // One un-superseded tip per author, plus one authority snapshot that no local write
-        // has named yet. Measured across these six seeds: 4 with the rule armed, 23 with it
-        // disarmed — and the field reached 460, because without the rule the count is not
-        // bounded by anything at all.
-        let author_bound = peers.len() + 2;
+        // One un-superseded tip per author, plus one authority snapshot that no local write has
+        // named yet, plus a tip of headroom. Measured across these six seeds: peak 4 with the
+        // rule armed, 23 with it disarmed; the field reached 460, because without the rule
+        // nothing bounds the count at all. The headroom is deliberate — a bound sitting exactly
+        // on the observed peak is not a gate, it is a coincidence waiting for the next seed —
+        // and it costs nothing here, since the value it must separate is five times larger.
+        let author_bound = peers.len() + 3;
         for (row_id, _, _, _) in &server_view {
             let branch = server_branch.clone();
             let server_tips = tip_count(&mut server, *row_id, &branch);
