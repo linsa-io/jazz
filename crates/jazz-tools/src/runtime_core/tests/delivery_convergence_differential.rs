@@ -1,44 +1,45 @@
 //! Randomized differential: after any stream of deliveries, every node that holds a row must
-//! hold the SAME row.
+//! hold the SAME row, and no node may accumulate frontier tips.
 //!
-//! `SyncManager::scope_delivery_row` used to clear `parents` on every visible row before it
-//! went out. The receiver therefore saw each arrival with no parents at all, and a batch with
-//! no parents is a frontier ROOT — so every delivered update presented itself as the start of
-//! a new history rather than a continuation of the one the receiver already held.
+//! `SyncManager::scope_delivery_row` clears `parents` on every visible row before it goes out
+//! to a client, and it still does — this fix changed no wire format. What changed is the
+//! receiver's reading of the result. The frontier rule is "a visible row is a non-tip iff some
+//! visible row names it as a parent", so a parentless arrival named nobody, superseded nothing,
+//! and stood as its own branch. Tips accumulated one per delivery: measured in a real client
+//! store at 460 on a single `users` row.
 //!
-//! The cost of that was measured (~8,256 storage reads and ~17.6MB per arrival at history
-//! depth 8000, because the O(1) apply fast path is unreachable when nothing connects the
-//! arrival to what is already there). But cost is the mild half. The severe half is that a
-//! receiver which cannot relate an arrival to its own history does not converge: concurrent
-//! tips accumulate instead of collapsing (the field showed rows carrying ~460 of them),
-//! counters get summed rather than superseded, a soft delete has nothing to supersede it so
-//! it becomes permanent, and restore cannot land. That is silent data corruption on the
-//! receiving side, which no cost metric would ever have caught.
+//! `parents == []` was carrying two meanings — "this is the row's creation" and "my ancestry
+//! was elided in transit" — and `row_histories::resolution::elided_snapshot_dominator` now
+//! separates them by provenance: `for_insert` sets `created_at == updated_at`, `for_update`
+//! copies `created_at` verbatim, and the clock never repeats, so a parentless row with
+//! `created_at != updated_at` is provably not a creation. Equal `created_at` marks one lineage,
+//! and within a lineage the newest snapshot supersedes the rest.
 //!
-//! The fix stamps the row's OWN parents, gated on the per-peer delivered-frontier cursor
-//! proving the receiver holds every one of them. Gating is the whole safety argument: the
-//! cursor prunes as it advances and is documented to only ever UNDER-claim, so the failure
-//! direction is "we declined to stamp a parent the receiver actually had" (slow, correct),
-//! never "we named a parent the receiver lacks" (a dangling reference).
+//! Hand-written gates pin the sequences we already thought of; this exists for the rest. Two
+//! properties are asserted after every operation, once the network has gone quiet:
 //!
-//! Hand-written gates pin the sequences we already thought of. This oracle exists for the
-//! rest. Two properties are asserted after every operation, once the network has gone quiet:
+//! * **Convergence** — every node's visible `docs` set is identical, per column.
+//! * **Width** — no node exceeds one un-superseded tip per author. This is the one that can
+//!   tell the fix from its absence: every column here is LWW, and the merged preview of N
+//!   parentless roots is already byte-equal to the newest of them, so the value assertions stay
+//!   green either way. Measured: peak width 4 with the rule armed, 23 with it disarmed.
 //!
-//! * **Convergence** — every node's visible `docs` set is byte-identical, per column. Not
-//!   "the same ids": the same OWNER, BODY and HITS, because a summed counter and a lost
-//!   update both keep the id and change only what it holds.
-//! * **Intent** — that shared set equals a model of what the operations meant. Convergence
-//!   alone is satisfied by every node being equally wrong, which is exactly what a
-//!   permanently-stuck soft delete looks like from the inside.
-//!
-//! The network is deliberately hostile within the bounds the transport actually permits: it
-//! reorders, it delays across operations, and it duplicates. Ordering defects do not show up
-//! on a network that delivers in order, and this one is an ordering defect.
+//! The network is deliberately hostile within what the transport permits: it reorders, delays
+//! across operations, and duplicates. Ordering defects do not show up on a network that
+//! delivers in order, and this one is an ordering defect.
 //!
 //! Backend: `SqliteStorage`, not `MemoryStorage`, and not by preference. `MemoryStorage`
 //! overrides the visible-row reads and answers from live maps, so on it an arrival never
-//! travels the storage path whose fast-path miss is the defect. Defect 27 was invisible to
-//! the memory backend for exactly this reason; this oracle would be theatre on it.
+//! travels the storage path whose fast-path miss is the defect. Defect 27 was invisible to the
+//! memory backend for exactly this reason.
+//!
+//! Two known blind spots, both worth closing before this oracle is trusted alone. Every column
+//! is strategy-less, so the model is LWW and collapsing a frontier to its `(updated_at,
+//! batch_id)` maximum is what LWW says should happen — the oracle can therefore see
+//! accumulation but not OVER-collapse; a `Counter` or `GSet` column and a matching model arm
+//! would fix that. And delete/restore are excluded from the alphabet (see
+//! `a_deleted_row_never_reaches_a_subscribed_peer`), so the delete-winner corruption is outside
+//! the generated space.
 
 use super::*;
 use crate::storage::SqliteStorage;
