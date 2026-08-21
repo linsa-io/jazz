@@ -848,11 +848,6 @@ fn visible_read_work_is_flat_in_history_depth() {
 /// `users` 2b1452ba at depth 11956 with one tip. The cost is not history depth; it is being
 /// the receiver.
 #[test]
-#[ignore = "open defect: delivery strips parents, so every arriving version is a frontier \
-            root and the O(1) apply path is unreachable on the receiving side. Measured \
-            here at 8256 reads and 17.6 MB per delivery at depth 8000 — 1.03 reads and \
-            2307 bytes per stored version, on every message that arrives. Un-ignore with \
-            the fix. Also slow (~100 s) for exactly the reason it is red."]
 fn delivered_apply_work_is_flat_in_history_depth() {
     let _lock = measure_lock();
     let mut hot = HotRow::new();

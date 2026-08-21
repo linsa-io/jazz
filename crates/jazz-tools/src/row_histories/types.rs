@@ -412,6 +412,15 @@ pub struct VisibleRowEntry {
     pub merge_artifacts: Option<Vec<u8>>,
 }
 
+/// The batch that supersedes the rest of its lineage's parentless rows, and the lineage it
+/// speaks for. Carrying `created_at` alongside the id is what keeps the rule inside one
+/// lineage instead of across all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotDominator {
+    pub(crate) batch_id: BatchId,
+    pub(crate) created_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ComputedVisiblePreview {
     pub(super) row: StoredRowBatch,

@@ -1618,13 +1618,22 @@ pub trait Storage {
             }
         }
 
-        // Same rule as `row_histories::branch_frontier`: a delivered snapshot that lost its
-        // ancestry in transit is not a row creation and must not stand as its own tip.
-        let dominator = crate::row_histories::elided_snapshot_dominator(branch_rows.iter());
+        // Same rule as `row_histories::branch_frontier` — but note this scan, unlike the other
+        // three tip computations, does NOT pre-filter to visible rows. That was harmless while
+        // non-visible rows only ever ADDED to `non_tips`; it is not harmless for a rule that
+        // REMOVES a tip. A `Rejected` batch is a parent-stripped delivered copy stored with a
+        // non-visible state, so without this filter it could both arm the rule and win it, and
+        // delete the row's real visible tip in favour of itself.
+        let dominator = crate::row_histories::elided_snapshot_dominator(
+            branch_rows.iter().filter(|row| row.state.is_visible()),
+        );
 
         let mut tips: Vec<_> = branch_rows
             .into_iter()
-            .filter(|row| !crate::row_histories::superseded_by_snapshot(row, dominator))
+            .filter(|row| {
+                !row.state.is_visible()
+                    || !crate::row_histories::superseded_by_snapshot(row, dominator)
+            })
             .map(|row| row.batch_id())
             .filter(|batch_id| !non_tips.contains(batch_id))
             .collect();

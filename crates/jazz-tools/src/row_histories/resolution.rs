@@ -31,6 +31,7 @@ use crate::row_format::{EncodingError, encode_row, encode_value_with_type};
 use crate::sync_manager::DurabilityTier;
 
 use super::codecs::{flat_user_values, malformed, tier_satisfies};
+use super::types::SnapshotDominator;
 use super::types::{BatchId, ComputedVisiblePreview, StoredRowBatch, VisibleRowEntry};
 
 pub(super) fn visible_rows_for_tier(
@@ -582,10 +583,12 @@ pub(super) fn latest_visible_version_for_tier(
 /// reservation is strictly greater than the last (`sync_manager/clock.rs:14-28`). So a visible
 /// row with `parents.is_empty() && created_at != updated_at` provably is not a creation.
 ///
-/// Given one such row, the parentless set is states of a single lineage rather than concurrent
-/// branches, and the newest by `(updated_at, batch_id)` — the same total order the LWW arm
-/// already uses to pick a winner — supersedes the rest. Rows that kept their ancestry are not
-/// touched: they are resolved by the ancestry, exactly as before.
+/// The dominator is the newest SNAPSHOT by `(updated_at, batch_id)` — the same total order the
+/// LWW arm already uses to pick a winner — and it supersedes only parentless rows sharing its
+/// `created_at`. That field is the lineage id: `for_update` copies it verbatim down the whole
+/// chain, so equal `created_at` means "states of one lineage", which is exactly the evidence
+/// the rule needs. Rows that kept their ancestry are not touched: they are resolved by the
+/// ancestry, exactly as before.
 ///
 /// Both failure directions are safe. Two writes inside one clock tick leave `created_at ==
 /// updated_at` on an update, so the row is not recognised and the frontier stays as wide as it
@@ -593,19 +596,37 @@ pub(super) fn latest_visible_version_for_tier(
 /// concurrent inserts still merge.
 pub(crate) fn elided_snapshot_dominator<'a>(
     visible_rows: impl Iterator<Item = &'a StoredRowBatch> + Clone,
-) -> Option<BatchId> {
-    let parentless = || visible_rows.clone().filter(|row| row.parents.is_empty());
-    if !parentless().any(|row| row.created_at != row.updated_at) {
-        return None;
-    }
-    parentless()
+) -> Option<SnapshotDominator> {
+    visible_rows
+        .filter(|row| row.parents.is_empty() && row.created_at != row.updated_at)
         .max_by_key(|row| (row.updated_at, row.batch_id()))
-        .map(StoredRowBatch::batch_id)
+        .map(|row| SnapshotDominator {
+            batch_id: row.batch_id(),
+            created_at: row.created_at,
+        })
 }
 
-/// Whether this row is a parentless visible row that `dominator` supersedes.
-pub(crate) fn superseded_by_snapshot(row: &StoredRowBatch, dominator: Option<BatchId>) -> bool {
-    dominator.is_some_and(|winner| row.parents.is_empty() && row.batch_id() != winner)
+/// Whether this row is a parentless visible row of the dominator's lineage that it supersedes.
+///
+/// Both conjuncts are load-bearing. Without `parents.is_empty()` the rule would reach a row
+/// resolved by its own ancestry — including a local write, which the authority can never name
+/// back at the writer and which must stay a tip. Without the `created_at` match it would reach
+/// a row of a DIFFERENT lineage, and that is not a display choice: `branch_frontier` feeds
+/// straight into the parent set of the next local write
+/// (`query_manager::writes::load_branch_tip_ids`), so dropping a row from the frontier is an
+/// assertion to the authority that the surviving batch subsumes it. A receiver holding only
+/// stripped snapshots has no evidence for that across lineages — two devices' clocks are
+/// unrelated, so an ordinary skew would otherwise let a genuine creation supersede a branch it
+/// never descended from and leave the AUTHORITY permanently forked.
+pub(crate) fn superseded_by_snapshot(
+    row: &StoredRowBatch,
+    dominator: Option<SnapshotDominator>,
+) -> bool {
+    dominator.is_some_and(|winner| {
+        row.parents.is_empty()
+            && row.created_at == winner.created_at
+            && row.batch_id() != winner.batch_id
+    })
 }
 
 pub(super) fn branch_frontier(history_rows: &[StoredRowBatch]) -> Vec<BatchId> {

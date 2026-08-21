@@ -210,7 +210,9 @@ pub(super) fn try_serial_fastpath_entry(
     // (order-insensitive, duplicates rejected). Not `len() == 1` — set
     // equality also admits an explicit merge-commit naming every current tip,
     // after which the frontier is trivially `{row}`.
-    if !parents_cover_frontier_exactly(&row.parents, &previous.branch_frontier) {
+    if !parents_cover_frontier_exactly(&row.parents, &previous.branch_frontier)
+        && !snapshot_dominates_frontier(row, previous)
+    {
         return None;
     }
     // Never-forked precondition: a historically forked-then-linearised row can
@@ -265,6 +267,48 @@ pub(super) fn try_serial_fastpath_entry(
     })
 }
 
+/// The second admission arm: a delivered snapshot dominating a frontier that is itself one
+/// delivered snapshot.
+///
+/// `parents_cover_frontier_exactly` refuses empty parents outright, on the reading that a
+/// parentless row over an existing entry is a concurrent root insert. That reading is the
+/// overloaded meaning `elided_snapshot_dominator` disambiguates: a visible row with
+/// `parents.is_empty() && created_at != updated_at` provably is not a creation, it is a batch
+/// whose ancestry the sender stripped on delivery.
+///
+/// Without this arm the frontier rule fixes correctness and leaves the cost defect exactly
+/// where it was: every delivered arrival still misses the fast path, still loads the whole
+/// branch history, and still pays O(depth). Measured on the depth-flatness harness before this
+/// arm existed: 377,750 reads at depth 500 against 4,127,750 at depth 8000, and 6.36GB of
+/// allocations — for a row whose frontier had already collapsed to a single tip.
+///
+/// The admission is deliberately narrow. The incoming row must be an elided snapshot; the
+/// previous frontier must be exactly one batch and that batch must be the entry's own current
+/// row (so its parents are known here without a history read); that tip must itself be
+/// parentless, so the new rule really does supersede it rather than the ancestry doing it; and
+/// the incoming row must be strictly newer under `(updated_at, batch_id)`, the same total order
+/// the dominator uses. Under those conditions the full rebuild provably yields
+/// `frontier == [row]` — a one-element frontier short-circuits the merge and returns the tip
+/// itself — which is what this path then writes.
+fn snapshot_dominates_frontier(row: &StoredRowBatch, previous: &VisibleRowEntry) -> bool {
+    let old_tip = &previous.current_row;
+    // The whole visible set must be reachable from the entry alone, or this cannot decide
+    // without a history read. A frontier of width one that IS the entry's current row gives
+    // exactly that: any visible row carrying parents would force a non-parentless tip through
+    // the finite DAG, so a parentless sole tip proves every visible row is parentless.
+    if previous.branch_frontier.len() != 1
+        || previous.branch_frontier[0] != old_tip.batch_id()
+        || !old_tip.parents.is_empty()
+    {
+        return false;
+    }
+    // Decided by the SAME helpers the full rebuild uses, rather than a second copy of the rule
+    // that could drift away from it.
+    let dominator = super::resolution::elided_snapshot_dominator([row, old_tip].into_iter());
+    dominator.is_some_and(|winner| winner.batch_id == row.batch_id())
+        && super::resolution::superseded_by_snapshot(old_tip, dominator)
+}
+
 fn parents_cover_frontier_exactly(parents: &[BatchId], frontier: &[BatchId]) -> bool {
     // Empty parents over an existing entry would be a concurrent root insert
     // (and `frontier` of a live entry is never empty) — never a domination.
@@ -282,6 +326,13 @@ fn parents_cover_frontier_exactly(parents: &[BatchId], frontier: &[BatchId]) -> 
 }
 
 /// Carry one tier sidecar pointer across a domination event, or decline.
+///
+/// NOTE on the premise below: it is written for the frontier-coverage caller, where
+/// `C.parents` equals the whole unfiltered visible frontier. The second admission arm
+/// (`snapshot_dominates_frontier`) reaches this with `C.parents` EMPTY, so "every visible row
+/// is a proper ancestor of C" is false there and the conclusion holds by a different argument:
+/// on that arm every visible row is parentless and of one lineage, and C is the lineage's
+/// newest, so C dominates the visible set — and therefore every tier subset of it — directly.
 ///
 /// `Some(pointer)` is proven byte-equal to what the full rebuild
 /// (`VisibleRowEntry::rebuild_with_descriptor` →

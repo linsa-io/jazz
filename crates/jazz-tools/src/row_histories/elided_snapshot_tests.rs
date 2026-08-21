@@ -185,3 +185,103 @@ fn a_parented_history_is_left_alone() {
          exists so the new rule cannot be written in a way that also rewrites the healthy case."
     );
 }
+
+/// Lineage, not recency. This is the case that makes the `created_at` conjunct load-bearing.
+///
+/// `branch_frontier` is not a display choice: `query_manager::writes::load_branch_tip_ids`
+/// feeds it straight into the parent set of the next local write. Dropping a row from it is
+/// therefore an assertion to the authority that the surviving batch subsumes the dropped one —
+/// and a receiver holding only stripped snapshots has no evidence for that ACROSS lineages.
+/// Device clocks are unrelated, so a creation authored on a fast-running clock can carry a
+/// larger `updated_at` than a snapshot of an entirely different lineage. Superseding it there
+/// would make the next local write name only the wrong parent, and the AUTHORITY — not the
+/// device — ends up permanently forked.
+#[test]
+fn a_snapshot_never_supersedes_another_lineage() {
+    let row_id = ObjectId::new();
+    // A creation from a device whose clock runs ahead: newest by `updated_at`, and a genuine
+    // creation of its own lineage.
+    let skewed = creation(row_id, CREATED_AT + 10_000, "from a fast clock");
+    // A snapshot of a different lineage entirely: same row id, different `created_at`.
+    let mut other_lineage = elided_snapshot(row_id, CREATED_AT + 1, "elsewhere");
+    other_lineage.created_at = CREATED_AT + 5_000;
+
+    let tips = branch_frontier(&[skewed, other_lineage]);
+
+    assert_eq!(
+        tips.len(),
+        2,
+        "these two rows share no lineage — their `created_at` differs, and `for_update` copies \
+         that field verbatim down a chain, so differing values mean neither descends from the \
+         other. Collapsing them would have the receiver tell the authority that one subsumes \
+         the other on no evidence at all, and ordinary clock skew between two devices is enough \
+         to reach it."
+    );
+}
+
+/// The tiebreak is not decoration: two replicas resolving the same set must pick the same
+/// winner, and `updated_at` alone does not decide it.
+#[test]
+fn a_tie_on_updated_at_is_broken_by_batch_id() {
+    let row_id = ObjectId::new();
+    let a = elided_snapshot(row_id, CREATED_AT + 7, "a");
+    let b = elided_snapshot(row_id, CREATED_AT + 7, "b");
+    let expected = a.batch_id().max(b.batch_id());
+
+    assert_eq!(
+        branch_frontier(&[a, b]),
+        vec![expected],
+        "two snapshots stamped in the same clock tick must still resolve to one tip, and to the \
+         SAME one on every replica. A rule ordering by `updated_at` alone leaves the choice to \
+         iteration order, and two replicas would then disagree about the frontier while \
+         agreeing about every value."
+    );
+}
+
+/// A non-visible batch must neither arm the rule nor win it.
+///
+/// `Rejected` is the dangerous one: a rejected row is a parent-stripped delivered copy stored
+/// with a non-visible state, so it looks exactly like a snapshot on every field the rule reads.
+/// While the rule only ADDED to `non_tips` this was harmless; a rule that REMOVES a tip can
+/// delete a live row in favour of a rejected one.
+#[test]
+fn a_rejected_batch_neither_arms_the_rule_nor_wins_it() {
+    let row_id = ObjectId::new();
+    let mut rejected = elided_snapshot(row_id, CREATED_AT + 9_000, "rejected");
+    rejected.state = RowState::Rejected;
+    let live_one = creation(row_id, CREATED_AT, "live one");
+    let live_two = creation(row_id, CREATED_AT + 1, "live two");
+
+    let tips = branch_frontier(&[rejected, live_one, live_two]);
+
+    assert_eq!(
+        tips.len(),
+        2,
+        "the only row here that looks like a snapshot is rejected, so nothing arms the rule and \
+         both live creations stay tips. If a rejected batch can arm it, it also wins it — it is \
+         the newest — and a live tip is deleted in favour of a batch the authority refused."
+    );
+}
+
+/// The tier-filtered arm needs the rule for the same reason the unfiltered one does: a
+/// parentless row has no ancestors, so causal domination cannot reach it either.
+#[test]
+fn the_tier_filtered_frontier_collapses_snapshots_too() {
+    let row_id = ObjectId::new();
+    let rows: Vec<_> = (1..=6)
+        .map(|step| elided_snapshot(row_id, CREATED_AT + step, &format!("v{step}")))
+        .collect();
+    let newest = rows.last().expect("fixture has rows").batch_id();
+
+    let preview =
+        build_computed_visible_preview(&descriptor(), &rows, Some(DurabilityTier::GlobalServer))
+            .expect("preview should build")
+            .expect("visible rows produce a preview");
+
+    assert_eq!(
+        preview.row.batch_id(),
+        newest,
+        "a tier read of a row whose snapshots all satisfy the tier must resolve to the newest of \
+         them, not merge six states of one lineage as if they were concurrent."
+    );
+}
